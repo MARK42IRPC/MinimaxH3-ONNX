@@ -157,6 +157,18 @@ main { min-width: 0; padding-bottom: 40px; }
 .download-actions { justify-content: flex-start; }
 .download-actions span { color: var(--muted); font-size: 11px; }
 
+.preset-list { display: grid; gap: 10px; margin-bottom: 14px; }
+.preset-row { display: grid; grid-template-columns: minmax(280px, 1.5fr) minmax(300px, 1fr) 128px; gap: 20px; align-items: center; padding: 17px 18px; border: 1px solid var(--line); background: var(--surface); }
+.preset-copy { min-width: 0; }
+.preset-copy > strong { display: block; font-size: 14px; }
+.preset-copy p { margin: 5px 0 9px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.preset-sources { display: grid; gap: 3px; color: var(--muted); font: 10px/1.45 Consolas, monospace; }
+.preset-sources span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preset-row dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0; }
+.preset-row dl div { padding: 2px 12px; border-left: 1px solid var(--line); }
+.preset-row dt { color: var(--muted); font-size: 10px; }
+.preset-row dd { margin: 5px 0 0; font: 12px Consolas, monospace; }
+
 .table-wrap { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); }
 table { width: 100%; min-width: 900px; border-collapse: collapse; table-layout: fixed; }
 th, td { height: 58px; padding: 0 14px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
@@ -289,6 +301,8 @@ select {
   .prompt-field, .advanced-fields { grid-column: 1 / -1; }
   .profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .download-list { grid-template-columns: 1fr; }
+  .preset-row { grid-template-columns: 1fr; gap: 13px; }
+  .preset-row dl div:first-child { border-left: 0; padding-left: 0; }
 }
 
 @media (max-width: 560px) {
@@ -296,7 +310,7 @@ select {
   .brand h1 { font-size: 14px; }
   .brand p { max-width: 180px; }
   .top-actions > span:not(.health-dot) { display: none; }
-  .sidebar { top: 64px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); overflow-x: hidden; }
+  .sidebar { top: 64px; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); overflow-x: hidden; }
   .nav-item { display: flex; justify-content: center; width: 100%; min-width: 0; padding: 0 4px; }
   .nav-item span { display: none; }
   .telemetry { grid-template-columns: 1fr; }

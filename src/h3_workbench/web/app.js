@@ -1,4 +1,4 @@
-const state = { system: null, models: [], components: [], jobs: [], profiles: [] };
+const state = { system: null, models: [], components: [], exportPresets: [], jobs: [], profiles: [] };
 let toastTimer = null;
 
 const $ = (selector) => document.querySelector(selector);
@@ -144,6 +144,21 @@ function renderDownloadComponents() {
   }).join("");
   const incomplete = state.components.filter((item) => item.status !== "ready").length;
   $("#downloadSummary").textContent = `${incomplete} 个组件需要处理 / ${state.components.length} 个已登记`;
+}
+
+function renderExportPresets() {
+  const list = $("#exportPresetList");
+  if (!list) return;
+  list.innerHTML = state.exportPresets.map((preset) => {
+    const assets = [preset.source, preset.lora, preset.support].filter(Boolean);
+    const sources = assets.map((asset) => `<span title="${asset.repo_id}/${asset.path}">${asset.repo_id} · ${asset.path}</span>`).join("");
+    return `<article class="preset-row">
+      <div class="preset-copy"><strong>${preset.label}</strong><p>${preset.description}</p><div class="preset-sources">${sources}</div></div>
+      <dl><div><dt>下载</dt><dd>${formatBytes(preset.download_size_bytes)}</dd></div><div><dt>预计 ONNX</dt><dd>${formatBytes(preset.output_size_bytes)}</dd></div><div><dt>空间需求</dt><dd>${formatBytes(preset.required_space_bytes)}</dd></div></dl>
+      <button class="command-button preset-export-button" data-preset="${preset.id}" type="button">下载并切片</button>
+    </article>`;
+  }).join("");
+  $$(".preset-export-button").forEach((button) => button.addEventListener("click", () => startPresetExport(button.dataset.preset)));
 }
 
 function renderSystem() {
@@ -379,15 +394,17 @@ async function loadJobs() {
 async function refresh() {
   $("#refreshButton").disabled = true;
   try {
-    const [system, models, components, jobs, profiles] = await Promise.all([api("/api/system"), api("/api/models"), api("/api/model-components"), api("/api/jobs"), api("/api/profiles")]);
+    const [system, models, components, exportPresets, jobs, profiles] = await Promise.all([api("/api/system"), api("/api/models"), api("/api/model-components"), api("/api/export-presets"), api("/api/jobs"), api("/api/profiles")]);
     state.system = system;
     state.models = models;
     state.components = components.components || [];
+    state.exportPresets = exportPresets.presets || [];
     state.jobs = jobs;
     state.profiles = profiles;
     renderSystem();
     renderModels();
     renderDownloadComponents();
+    renderExportPresets();
     renderJobs();
     renderProfiles();
   } catch (error) {
@@ -411,6 +428,17 @@ async function downloadSelectedModels() {
   } catch (error) { showToast(error.message, true); } finally { button.disabled = false; }
 }
 
+async function startPresetExport(presetId) {
+  const button = $(`.preset-export-button[data-preset="${presetId}"]`);
+  button.disabled = true;
+  try {
+    await api("/api/jobs/download-export", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ preset_id: presetId }) });
+    showToast("原模型下载与切片任务已加入队列");
+    switchTab("jobs");
+    await loadJobs();
+  } catch (error) { showToast(error.message, true); } finally { button.disabled = false; }
+}
+
 $$('.nav-item').forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.tab)));
 $("#refreshButton").addEventListener("click", refresh);
 $("#checkModelsButton").addEventListener("click", refresh);
@@ -423,7 +451,7 @@ $("#stepsInput").addEventListener("input", renderProfiles);
 $("#temporalMode").addEventListener("change", renderProfiles);
 $("#queryChunkSelect").addEventListener("change", renderProfiles);
 const initialTab = window.location.hash.slice(1);
-if (["models", "inference", "jobs", "system"].includes(initialTab)) switchTab(initialTab);
+if (["models", "export", "inference", "jobs", "system"].includes(initialTab)) switchTab(initialTab);
 refresh();
 let jobsPollActive = false;
 setInterval(async () => {

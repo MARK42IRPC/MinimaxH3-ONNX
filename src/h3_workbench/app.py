@@ -22,6 +22,7 @@ from h3_workbench.profiles import GENERATION_PROFILES
 from h3_workbench.shard_cache import default_l2_cache_bytes, default_prefetch_depth
 from h3_workbench.tokenizer import tokenizer_files_ready
 from h3_workbench.model_catalog import MODELSCOPE_REPO, GITHUB_REPO, all_component_status
+from h3_workbench.source_catalog import EXPORT_PRESETS
 
 settings = Settings.from_env()
 manager = JobManager(settings.workspace, settings.output_dir)
@@ -149,6 +150,23 @@ class ModelDownloadRequest(BaseModel):
 def create_download(request: ModelDownloadRequest) -> dict[str, object]:
     try:
         return manager.create_download(request.components).to_dict()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/export-presets")
+def export_presets() -> dict[str, object]:
+    return {"official_repo": "Comfy-Org/MiniMax-H3", "turbo_repo": "larryvrh/MiniMax-H3-Turbo-Lora", "presets": [item.to_dict() for item in EXPORT_PRESETS]}
+
+
+class PresetExportRequest(BaseModel):
+    preset_id: str = Field(min_length=1, max_length=64)
+
+
+@app.post("/api/jobs/download-export", status_code=202)
+def create_preset_export(request: PresetExportRequest) -> dict[str, object]:
+    try:
+        return manager.create_preset_export(request.preset_id).to_dict()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

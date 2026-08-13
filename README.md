@@ -18,6 +18,8 @@ The FL2VA Transformer is split into input projections, two token-refiner Attenti
 
 On Windows, run `install.bat` once. It creates the Python 3.11 environment and installs the locked dependencies.
 
+The WebUI's `切片` page can reproduce the validated package directly from ModelScope. It exposes only the tested Comfy-Org source variants. The Turbo v4 preset also downloads Larryvrh's `minimax_h3_turbo_v4_step600_ema.safetensors` and the validated `h3_silu_temb_grid.safetensors` support file before exporting the complete 259/259 LoRA path.
+
 ```powershell
 uv sync --extra dev --no-editable
 uv run h3-workbench --host 127.0.0.1 --port 7860

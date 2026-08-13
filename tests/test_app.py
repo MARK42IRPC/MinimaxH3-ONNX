@@ -29,6 +29,26 @@ def test_download_rejects_unknown_component() -> None:
     assert response.status_code == 400
 
 
+def test_export_presets_only_expose_validated_variants() -> None:
+    response = TestClient(app).get("/api/export-presets")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["official_repo"] == "Comfy-Org/MiniMax-H3"
+    assert {item["id"] for item in payload["presets"]} == {
+        "audio_vae", "video_vae", "qwen", "fl2va_streaming", "fl2va_turbo_v4"
+    }
+    turbo = next(item for item in payload["presets"] if item["id"] == "fl2va_turbo_v4")
+    assert turbo["lora"]["path"] == "minimax_h3_turbo_v4_step600_ema.safetensors"
+    assert turbo["support"]["path"] == "export_support/h3_silu_temb_grid.safetensors"
+
+
+def test_preset_export_rejects_unknown_variant() -> None:
+    response = TestClient(app).post("/api/jobs/download-export", json={"preset_id": "untested"})
+
+    assert response.status_code == 400
+
+
 def test_system_info_reports_pagefile_capacity() -> None:
     response = TestClient(app).get("/api/system")
 

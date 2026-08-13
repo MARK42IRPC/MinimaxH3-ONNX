@@ -4,6 +4,7 @@ import gc
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -32,6 +33,8 @@ from h3_workbench.performance_monitor import PerformanceMonitor
 from h3_workbench.profiles import PROFILE_360P_17F, GenerationProfile
 from h3_workbench.tokenizer import encode_prompt
 from h3_workbench.model_catalog import MODELSCOPE_REPO, component_by_id
+from h3_workbench.model_registry import inspect_checkpoint
+from h3_workbench.source_catalog import ExportPreset, SourceAsset, export_preset
 
 
 def _complete_main_model(directory: Path) -> bool:
@@ -124,6 +127,139 @@ class JobManager:
             self._jobs[job.id] = job
         self._executor.submit(self._run_download, job.id, components)
         return job
+
+    def create_download_export(
+        self,
+        repo_id: str,
+        source_file: str,
+        component: str,
+        output_dir: str,
+        blocks: str = "all",
+        lora_file: str | None = None,
+        lora_strength: float = 1.0,
+    ) -> Job:
+        repo_id = repo_id.strip()
+        source_file = source_file.strip().replace("\\", "/")
+        if not repo_id or "/" not in repo_id or any(part in repo_id for part in ("..", " ")):
+            raise ValueError("ModelScope repo must use the owner/name format")
+        if not source_file or source_file.startswith("/") or ".." in Path(source_file).parts:
+            raise ValueError("Source file must be a relative ModelScope path")
+        if component not in {"audio_vae", "video_vae", "fl2va_transformer", "text_encoder"}:
+            raise ValueError("Unsupported export component")
+        relative_output = Path(output_dir)
+        if relative_output.is_absolute() or ".." in relative_output.parts:
+            raise ValueError("Output directory must stay inside the workspace")
+        if blocks != "all" and not blocks.replace(",", "").isdigit():
+            raise ValueError("Blocks must be 'all' or a comma-separated list")
+        if not 0.0 <= lora_strength <= 2.0:
+            raise ValueError("LoRA strength must be between 0 and 2")
+        job = Job(id=uuid.uuid4().hex[:12], model_id=repo_id, kind="download_export")
+        with self._lock:
+            self._jobs[job.id] = job
+        self._executor.submit(
+            self._run_download_export,
+            job.id,
+            repo_id,
+            source_file,
+            component,
+            self.workspace / relative_output,
+            blocks,
+            lora_file,
+            lora_strength,
+        )
+        return job
+
+    def create_preset_export(self, preset_id: str) -> Job:
+        preset = export_preset(preset_id)
+        free_bytes = shutil.disk_usage(self.workspace).free
+        required = preset.download_size_bytes + preset.output_size_bytes
+        if free_bytes < required:
+            raise ValueError(f"Insufficient disk space: need about {required / 1024**3:.1f} GiB, available {free_bytes / 1024**3:.1f} GiB")
+        job = Job(id=uuid.uuid4().hex[:12], model_id=preset.label, kind="download_export")
+        job.output_dir = str(self.workspace / preset.output_dir)
+        with self._lock:
+            self._jobs[job.id] = job
+        self._executor.submit(self._run_preset_export, job.id, preset)
+        return job
+
+    def _download_source_asset(self, job_id: str, asset: SourceAsset, label: str) -> Path:
+        repo_root = self.workspace / ".h3-workbench" / "sources" / asset.repo_id.replace("/", "--")
+        destination = repo_root / asset.path
+        if destination.is_file() and destination.stat().st_size == asset.size_bytes:
+            return destination
+        repo_root.mkdir(parents=True, exist_ok=True)
+        self._update(job_id, message=f"Downloading {label}", activity={"phase": "download", "module": label, "operation": asset.path})
+        executable = Path(sys.executable).with_name("modelscope.exe" if os.name == "nt" else "modelscope")
+        command = [str(executable), "download", asset.repo_id, asset.path, "--repo-type", "model", "--local-dir", str(repo_root), "--max-workers", "4"]
+        result = subprocess.run(command, cwd=self.workspace, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        if result.returncode != 0 or not destination.is_file():
+            detail = (result.stderr or result.stdout or "ModelScope download failed").strip()[-2000:]
+            raise RuntimeError(f"{label}: {detail or 'downloaded file not found'}")
+        if destination.stat().st_size != asset.size_bytes:
+            raise RuntimeError(f"{label}: unexpected file size {destination.stat().st_size}, expected {asset.size_bytes}")
+        return destination
+
+    def _run_preset_export(self, job_id: str, preset: ExportPreset) -> None:
+        try:
+            self._update(job_id, status="running", started_at=_now(), progress=0.01, message="Preparing verified export preset", activity={"phase": "download", "module": preset.label, "operation": "Checking source files"})
+            source = self._download_source_asset(job_id, preset.source, "Original checkpoint")
+            lora_path = self._download_source_asset(job_id, preset.lora, "Turbo v4 LoRA") if preset.lora else None
+            if preset.support:
+                support_path = self._download_source_asset(job_id, preset.support, "Turbo timestep grid")
+                if lora_path is None:
+                    raise RuntimeError("Turbo support file requires a LoRA checkpoint")
+                colocated = lora_path.with_name("h3_silu_temb_grid.safetensors")
+                if not colocated.is_file() or colocated.stat().st_size != support_path.stat().st_size:
+                    shutil.copy2(support_path, colocated)
+            record = inspect_checkpoint(source, source.parent)
+            if record.component != preset.component:
+                raise RuntimeError(f"Downloaded file is classified as {record.component}, not {preset.component}")
+            destination = self.workspace / preset.output_dir
+            self._update(job_id, progress=0.12, message="Source files ready; exporting ONNX shards", activity={"phase": "export", "module": preset.label, "operation": "Starting sharded export"})
+            def report(progress: float, message: str) -> None:
+                self._update(job_id, progress=0.12 + progress * 0.88, message=message, activity={"phase": "export", "module": preset.label, "operation": message})
+            exported = export_checkpoint(source, destination, preset.blocks, report, lora_path, 1.0)
+            self._update(job_id, status="completed", progress=1.0, message="Verified preset export completed", activity={"phase": "completed", "module": preset.label, "operation": "ONNX validation passed"}, finished_at=_now(), result={"preset": preset.id, "source": str(source), "output": str(destination), "export": exported})
+        except Exception as exc:  # noqa: BLE001 - preserve pipeline failure in the job record
+            self._update(job_id, status="failed", message=str(exc), activity={"phase": "failed", "module": preset.label, "operation": str(exc)}, finished_at=_now(), error="".join(traceback.format_exception(exc)))
+
+    def _run_download_export(
+        self,
+        job_id: str,
+        repo_id: str,
+        source_file: str,
+        component: str,
+        destination: Path,
+        blocks: str,
+        lora_file: str | None,
+        lora_strength: float,
+    ) -> None:
+        source = self.workspace / Path(source_file).name
+        try:
+            self._update(job_id, status="running", started_at=_now(), message="Downloading original checkpoint", progress=0.02, activity={"phase": "download", "module": "ModelScope", "operation": source_file})
+            source.parent.mkdir(parents=True, exist_ok=True)
+            modelscope_executable = Path(sys.executable).with_name("modelscope.exe" if os.name == "nt" else "modelscope")
+            command = [str(modelscope_executable), "download", repo_id, source_file, "--repo-type", "model", "--local-dir", str(self.workspace), "--max-workers", "4"]
+            result = subprocess.run(command, cwd=self.workspace, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            if result.returncode != 0 or not source.is_file():
+                detail = (result.stderr or result.stdout or "ModelScope download failed").strip()[-2000:]
+                raise RuntimeError(detail or "Downloaded checkpoint was not found")
+            record = inspect_checkpoint(source, self.workspace)
+            if record.component != component:
+                raise RuntimeError(f"Downloaded file is classified as {record.component}, not {component}")
+            self._update(job_id, progress=0.12, message="Original checkpoint ready; exporting shards", activity={"phase": "export", "module": source.name, "operation": "Checkpoint inspected"})
+            def report(progress: float, message: str) -> None:
+                self._update(job_id, progress=0.12 + progress * 0.88, message=message, activity={"phase": "export", "module": source.name, "operation": message})
+            lora_path = None
+            if lora_file:
+                candidate = (self.workspace / lora_file).resolve()
+                if self.workspace not in candidate.parents or not candidate.is_file():
+                    raise ValueError("LoRA path must point to an existing file inside the workspace")
+                lora_path = candidate
+            exported = export_checkpoint(source, destination, blocks, report, lora_path, lora_strength)
+            self._update(job_id, status="completed", progress=1.0, message="Download, sharded export, and validation completed", activity={"phase": "completed", "module": source.name, "operation": "Export completed"}, finished_at=_now(), result={"source": str(source), "output": str(destination), "export": exported})
+        except Exception as exc:  # noqa: BLE001 - preserve pipeline failure in the job record
+            self._update(job_id, status="failed", message=str(exc), activity={"phase": "failed", "module": component, "operation": str(exc)}, finished_at=_now(), error="".join(traceback.format_exception(exc)))
 
     def _run_download(self, job_id: str, components: list[Any]) -> None:
         try:

@@ -25,9 +25,10 @@
   <div class="layout">
     <nav class="sidebar" aria-label="工作台导航">
       <button class="nav-item active" data-tab="models"><span>01</span>模型</button>
-      <button class="nav-item" data-tab="inference"><span>02</span>生成</button>
-      <button class="nav-item" data-tab="jobs"><span>03</span>任务</button>
-      <button class="nav-item" data-tab="system"><span>04</span>系统</button>
+      <button class="nav-item" data-tab="export"><span>02</span>切片</button>
+      <button class="nav-item" data-tab="inference"><span>03</span>生成</button>
+      <button class="nav-item" data-tab="jobs"><span>04</span>任务</button>
+      <button class="nav-item" data-tab="system"><span>05</span>系统</button>
       <div class="sidebar-footer">
         <span>ONNX Opset 20</span>
         <span>CPU 验证</span>
@@ -73,6 +74,19 @@
           </table>
           <div class="empty-state hidden" id="modelsEmpty">未发现 Safetensors 模型</div>
         </div>
+      </section>
+
+      <section class="tab-panel" id="exportPanel">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">SOURCE TO ONNX</span>
+            <h2>下载原模型并自主切片</h2>
+            <p class="section-note">仅提供本项目实测成功的版本；任务会依次下载、检查、分片导出并验证 ONNX。</p>
+          </div>
+          <span class="count">ModelScope 断点下载</span>
+        </div>
+        <div class="preset-list" id="exportPresetList"></div>
+        <div class="runtime-warning">原始权重受 MiniMax H3 Community License Agreement 约束。开始前请确认目标磁盘具有“下载文件 + ONNX 产物”所需空间。</div>
       </section>
 
       <section class="tab-panel" id="inferencePanel">
