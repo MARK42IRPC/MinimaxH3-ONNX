@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "minimax-h3-edge-workbench"
+version = "0.1.0"
+description = "Local MiniMax H3 model inventory, sharded ONNX export, validation, and WebUI"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "fastapi==0.134.0",
+  "ml-dtypes==0.5.4",
+  "modelscope-hub==0.2.0",
+  "numpy==2.4.2",
+  "onnx==1.21.0",
+  "onnxruntime-gpu==1.23.2",
+  "onnxscript==0.6.2",
+  "psutil==7.2.2",
+  "safetensors==0.8.0",
+  "torch==2.10.0",
+  "transformers==5.15.0",
+  "uvicorn[standard]==0.41.0",
+  "nvidia-cublas-cu12==12.9.2.10; platform_system == 'Windows'",
+  "nvidia-cuda-nvrtc-cu12==12.9.86; platform_system == 'Windows'",
+  "nvidia-cudnn-cu12==9.24.0.43; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx==0.28.1",
+  "pytest==9.0.2",
+  "ruff==0.15.1",
+]
+
+[project.scripts]
+h3-workbench = "h3_workbench.__main__:main"
+h3-infer = "h3_workbench.inference_cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/h3_workbench"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.uv]
+environments = ["sys_platform == 'win32'"]
+
+[[tool.uv.index]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true

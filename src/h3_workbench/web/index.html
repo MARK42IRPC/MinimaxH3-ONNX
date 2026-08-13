@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MiniMax H3 Edge Workbench</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">H3</span>
+      <div>
+        <h1>MiniMax H3 Edge Workbench</h1>
+        <p id="workspacePath">正在读取工作区</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <span class="health-dot" id="healthDot"></span>
+      <span id="healthText">连接中</span>
+      <button class="icon-button" id="refreshButton" title="刷新" aria-label="刷新">↻</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="sidebar" aria-label="工作台导航">
+      <button class="nav-item active" data-tab="models"><span>01</span>模型</button>
+      <button class="nav-item" data-tab="inference"><span>02</span>生成</button>
+      <button class="nav-item" data-tab="jobs"><span>03</span>任务</button>
+      <button class="nav-item" data-tab="system"><span>04</span>系统</button>
+      <div class="sidebar-footer">
+        <span>ONNX Opset 20</span>
+        <span>CPU 验证</span>
+      </div>
+    </nav>
+
+    <main>
+      <section class="telemetry" aria-label="系统资源">
+        <div><span>GPU</span><strong id="gpuName">--</strong></div>
+        <div><span>显存</span><strong id="gpuMemory">--</strong></div>
+        <div><span>可用内存</span><strong id="ramAvailable">--</strong></div>
+        <div><span>执行后端</span><strong id="providerName">--</strong></div>
+      </section>
+
+      <section class="tab-panel active" id="modelsPanel">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">MODEL INVENTORY</span>
+            <h2>本地模型</h2>
+            <p class="section-note">配套模型仓库：<a href="https://www.modelscope.cn/models/Mark42IRPC/Minimax-H3-int8-fl2va-onnx-50CLIPS" target="_blank" rel="noreferrer">ModelScope</a> · <a href="https://github.com/MARK42IRPC/MinimaxH3-ONNX" target="_blank" rel="noreferrer">GitHub 项目</a></p>
+          </div>
+          <span class="count" id="modelCount">0 个组件</span>
+        </div>
+        <div class="download-panel">
+          <div class="download-heading"><div><strong>模型完整性与下载</strong><span>按需选择组件，下载支持断点续传</span></div><button class="secondary-button" id="checkModelsButton" type="button">重新检查</button></div>
+          <div class="download-list" id="downloadList"></div>
+          <div class="download-actions"><button class="command-button" id="downloadModelsButton" type="button">下载选中组件</button><span id="downloadSummary">--</span></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>文件</th>
+                <th>组件</th>
+                <th>精度</th>
+                <th>大小</th>
+                <th>张量</th>
+                <th>导出范围</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="modelsBody"></tbody>
+          </table>
+          <div class="empty-state hidden" id="modelsEmpty">未发现 Safetensors 模型</div>
+        </div>
+      </section>
+
+      <section class="tab-panel" id="inferencePanel">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">GENERATION</span>
+            <h2>对话生成</h2>
+          </div>
+          <span class="count" id="inferenceProvider">--</span>
+        </div>
+        <form class="inference-form" id="inferenceForm">
+          <label class="prompt-field">Prompt<textarea id="promptInput" rows="5" placeholder="描述画面、动作、镜头与声音" autocomplete="off"></textarea></label>
+          <label>时序模式<select id="temporalMode"><option value="segmented" selected>低显存分段</option><option value="native">整体长序列</option></select></label>
+          <label>时长（秒）<input id="durationInput" type="number" value="0.7" min="0.1" max="15" step="0.1"></label>
+          <label>采样步数<input id="stepsInput" type="number" value="4" min="1" max="50" step="1"></label>
+          <label>Query 块<select id="queryChunkSelect"><option>64</option><option>128</option><option selected>256</option><option>512</option></select></label>
+          <label>L1 预取<select id="l1PrefetchSelect"><option value="0">关闭</option><option value="1">1 片</option><option value="2" selected>2 片</option><option value="3">3 片</option><option value="4">4 片</option></select></label>
+          <label>Seed<input id="seedInput" type="number" value="1" step="1"></label>
+          <label>宽度<input id="widthInput" type="number" value="640" min="128" max="1024" step="16"></label>
+          <label>高度<input id="heightInput" type="number" value="360" min="128" max="1024" step="8"></label>
+          <button class="command-button" type="submit" id="generateButton">开始生成</button>
+          <details class="advanced-fields">
+            <summary>高级输入</summary>
+            <label class="token-field">Token IDs<input id="tokenIdsInput" placeholder="1,42,1000,151935" autocomplete="off"></label>
+          </details>
+        </form>
+        <dl class="profile-grid" id="profileGrid"></dl>
+        <div class="runtime-warning hidden" id="runtimeWarning"></div>
+      </section>
+
+      <section class="tab-panel" id="jobsPanel">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">JOB QUEUE</span>
+            <h2>任务</h2>
+          </div>
+          <span class="count" id="jobCount">0 个任务</span>
+        </div>
+        <div class="jobs-list" id="jobsList"></div>
+        <div class="empty-state" id="jobsEmpty">暂无任务</div>
+      </section>
+
+      <section class="tab-panel" id="systemPanel">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">RUNTIME</span>
+            <h2>运行环境</h2>
+          </div>
+        </div>
+        <dl class="system-grid" id="systemGrid"></dl>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>
