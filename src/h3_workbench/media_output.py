@@ -98,30 +98,56 @@ def _decode_video_vae_blocks_persistent(
     from h3_workbench.video_vae_persistent import (
         PERSISTENT_VIDEO_VAE_TOPOLOGY,
         load_video_vae_block_weights,
+        preload_video_vae_block_weights,
     )
+    from h3_workbench.device_profile import selected_device_index
 
     session = None
+    ram_cache = preload_video_vae_block_weights(directory, range(block_count))
     hidden_devices: list[ort.OrtValue] = []
     rotary_devices: list[ort.OrtValue] = []
     try:
         session = runner.session(directory / PERSISTENT_VIDEO_VAE_TOPOLOGY)  # type: ignore[attr-defined]
-        hidden_devices = [ort.OrtValue.ortvalue_from_numpy(value, "cuda", 0) for value in hidden_tiles]
-        rotary_devices = [ort.OrtValue.ortvalue_from_numpy(value, "cuda", 0) for value in rotary_tiles]
+        device_index = selected_device_index()
+        hidden_devices = [ort.OrtValue.ortvalue_from_numpy(value, "cuda", device_index) for value in hidden_tiles]
+        rotary_devices = [ort.OrtValue.ortvalue_from_numpy(value, "cuda", device_index) for value in rotary_tiles]
         shapes = [value.shape for value in hidden_tiles]
         dtypes = [value.dtype for value in hidden_tiles]
         hidden_tiles.clear()
         rotary_tiles.clear()
 
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-vae-weight-prefetch") as executor:
+        if callback is not None and ram_cache is not None:
+            callback(
+                {
+                    "module": "Video VAE",
+                    "operation": "Weights preloaded to host RAM",
+                    "ram_cache_bytes": ram_cache.bytes,
+                    "ram_cache_load_seconds": round(ram_cache.load_seconds, 3),
+                    "blocks": block_count,
+                }
+            )
+        if ram_cache is not None:
+            block_iterator = ((ram_cache.get(index), None) for index in range(block_count))
+        else:
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-vae-weight-prefetch")
             pending = executor.submit(load_video_vae_block_weights, directory, 0)
-            for index in range(block_count):
-                loaded = pending.result()
+            block_iterator = (
+                (
+                    pending.result(),
+                    executor.submit(load_video_vae_block_weights, directory, index + 1)
+                    if index + 1 < block_count
+                    else None,
+                )
+                for index in range(block_count)
+            )
+        try:
+            for index, (loaded, next_pending) in enumerate(block_iterator):
                 weight_devices: dict[str, ort.OrtValue] = {}
-                if index + 1 < block_count:
-                    pending = executor.submit(load_video_vae_block_weights, directory, index + 1)
+                if next_pending is not None:
+                    pending = next_pending
                 try:
                     weight_devices = {
-                        name: ort.OrtValue.ortvalue_from_numpy(value, "cuda", 0)
+                        name: ort.OrtValue.ortvalue_from_numpy(value, "cuda", device_index)
                         for name, value in loaded.feeds().items()
                     }
                     for tile_index in range(len(hidden_devices)):
@@ -134,11 +160,15 @@ def _decode_video_vae_blocks_persistent(
                                     "total": block_count,
                                     "tile": tile_index + 1,
                                     "tiles": len(hidden_devices),
-                                    "weight_load_seconds": round(loaded.load_seconds, 3),
+                                    "weight_load_seconds": round(
+                                        0.0 if ram_cache is not None else loaded.load_seconds,
+                                        3,
+                                    ),
+                                    "ram_cache": ram_cache is not None,
                                 }
                             )
                         output = ort.OrtValue.ortvalue_from_shape_and_type(
-                            shapes[tile_index], dtypes[tile_index], "cuda", 0
+                            shapes[tile_index], dtypes[tile_index], "cuda", device_index
                         )
                         binding = None
                         try:
@@ -157,14 +187,20 @@ def _decode_video_vae_blocks_persistent(
                             _release_io_binding(binding)
                             binding = None
                 finally:
-                    loaded.close()
+                    if ram_cache is None:
+                        loaded.close()
                     weight_devices.clear()
+        finally:
+            if ram_cache is None:
+                executor.shutdown(wait=True)
         return [value.numpy() for value in hidden_devices]
     finally:
         hidden_devices.clear()
         rotary_devices.clear()
         session = None
         gc.collect()
+        if ram_cache is not None:
+            ram_cache.close()
 
 
 def decode_video_latents_onnx(

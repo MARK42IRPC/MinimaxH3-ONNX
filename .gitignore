@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .h3-workbench/
+compiled_cache.db
 .claude/
 outputs/
 exported/

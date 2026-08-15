@@ -21,6 +21,7 @@ import onnxruntime as ort
 import psutil
 from onnx import TensorProto, helper, numpy_helper
 
+from h3_workbench.device_profile import selected_device_index
 from h3_workbench.inference_runtime import ORTGraphRunner
 
 
@@ -28,6 +29,10 @@ _INPUT_HIDDEN = "hidden_states"
 _INPUT_ROTARY = "rotary_table"
 _OUTPUT_HIDDEN = "hidden_states_out"
 _CUDA_PROVIDER = "CUDAExecutionProvider"
+
+
+def _resolve_device_id(device_id: int | None) -> int:
+    return selected_device_index() if device_id is None else int(device_id)
 
 
 class JsonlLogger:
@@ -433,8 +438,9 @@ def run_io_binding(
     warmup: int,
     repeats: int,
     device_type: str = "cuda",
-    device_id: int = 0,
+    device_id: int | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
+    device_id = _resolve_device_id(device_id)
     hidden = feeds[_INPUT_HIDDEN]
     rotary = feeds[_INPUT_ROTARY]
     setup_started = time.perf_counter()
@@ -483,8 +489,9 @@ def run_persistent_io_binding(
     warmup: int,
     repeats: int,
     device_type: str = "cuda",
-    device_id: int = 0,
+    device_id: int | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
+    device_id = _resolve_device_id(device_id)
     hidden = activation_feeds[_INPUT_HIDDEN]
     rotary = activation_feeds[_INPUT_ROTARY]
     binding = session.io_binding()
@@ -613,6 +620,8 @@ def run(args: argparse.Namespace) -> int:
     persistent_weights: dict[str, np.ndarray] | None = None
     process = psutil.Process()
     try:
+        if args.device_id is None:
+            args.device_id = selected_device_index()
         _validate_args(args)
         c_free_gib = _c_drive_free_gib()
         if c_free_gib is not None and c_free_gib < args.min_c_free_gib:
@@ -912,7 +921,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--seed", type=int, default=11)
-    parser.add_argument("--device-id", type=int, default=0)
+    parser.add_argument(
+        "--device-id",
+        type=int,
+        default=None,
+        help="CUDA device index; defaults to H3_CUDA_DEVICE selection",
+    )
     parser.add_argument("--persistent-topology", action="store_true")
     parser.add_argument(
         "--schema-blocks",

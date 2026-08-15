@@ -21,7 +21,7 @@ _registry_dir: Path | None = None
 _lock = threading.Lock()
 _last_read_at = 0.0
 _last_read_total = 0
-_own_records: dict[str, int] = {}
+_own_records: dict[str, tuple[int, str | None]] = {}
 
 
 def configure_reservations(directory: Path) -> None:
@@ -59,12 +59,12 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def acquire_reservation(token: str, reserved_bytes: int) -> bool:
+def acquire_reservation(token: str, reserved_bytes: int, device: str | None = None) -> bool:
     path = _reservation_path(token)
     if path is None or reserved_bytes <= 0:
         return False
     with _lock:
-        _own_records[token] = int(reserved_bytes)
+        _own_records[token] = (int(reserved_bytes), device)
     return refresh_reservation(token)
 
 
@@ -73,13 +73,16 @@ def refresh_reservation(token: str) -> bool:
     if path is None:
         return False
     with _lock:
-        reserved_bytes = _own_records.get(token)
-    if reserved_bytes is None:
+        record = _own_records.get(token)
+    if record is None:
         return False
-    record = {"pid": os.getpid(), "bytes": int(reserved_bytes), "updated_at": time.time()}
+    reserved_bytes, device = record
+    payload = {"pid": os.getpid(), "bytes": int(reserved_bytes), "updated_at": time.time()}
+    if device is not None:
+        payload["device"] = device
     try:
         temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(record), encoding="utf-8")
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
         os.replace(temporary, path)
         return True
     except OSError:
@@ -98,12 +101,15 @@ def release_reservation(token: str) -> None:
         pass
 
 
-def other_reserved_bytes(ttl_seconds: float = RESERVATION_TTL_SECONDS) -> int:
+def other_reserved_bytes(
+    ttl_seconds: float = RESERVATION_TTL_SECONDS,
+    device: str | None = None,
+) -> int:
     """Sum reservations of alive, recently refreshed foreign processes."""
     global _last_read_at, _last_read_total
     now = time.monotonic()
     with _lock:
-        if now - _last_read_at < _READ_TTL_SECONDS:
+        if device is None and now - _last_read_at < _READ_TTL_SECONDS:
             return _last_read_total
         directory = _registry_dir
         own_pid = os.getpid()
@@ -121,6 +127,11 @@ def other_reserved_bytes(ttl_seconds: float = RESERVATION_TTL_SECONDS) -> int:
                         continue
                     if pid == own_pid:
                         continue
+                    record_device = raw.get("device")
+                    # Old records predate per-device reservations. Count them
+                    # conservatively for every selected device.
+                    if device is not None and record_device not in (None, "default", device):
+                        continue
                     if not _pid_alive(pid):
                         continue
                     if wall_clock - updated_at > ttl_seconds:
@@ -128,6 +139,7 @@ def other_reserved_bytes(ttl_seconds: float = RESERVATION_TTL_SECONDS) -> int:
                     total += reserved
             except OSError:
                 total = 0
-        _last_read_at = now
-        _last_read_total = total
+        if device is None:
+            _last_read_at = now
+            _last_read_total = total
         return total

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-import subprocess
+import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from h3_workbench.device_profile import probe_device_profiles, select_device_profile
 from h3_workbench.profiles import GenerationProfile
 
 MIB = 1024**2
@@ -21,9 +22,22 @@ class MemorySnapshot:
     total_bytes: int
     free_bytes: int
     device: str
+    index: int = -1
+    uuid: str | None = None
+    compute_capability: str | None = None
+    driver: str | None = None
+    tier: str = "cpu"
 
-    def to_dict(self) -> dict[str, int | str]:
-        return asdict(self)
+    @property
+    def device_key(self) -> str | None:
+        if self.index < 0:
+            return None
+        return self.uuid or f"index:{self.index}"
+
+    def to_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["device_key"] = self.device_key
+        return result
 
 
 @dataclass(frozen=True)
@@ -53,32 +67,42 @@ class ShardBatch:
 _PROBE_TTL_SECONDS = 2.0
 _last_probe_at = 0.0
 _last_probe_snapshot: MemorySnapshot | None = None
+_last_probe_selector: str | None = None
 
 
-def probe_gpu_memory() -> MemorySnapshot:
-    """nvidia-smi subprocess with a short TTL for scheduler hot paths."""
-    global _last_probe_at, _last_probe_snapshot
+def probe_gpu_memory(device_index: int | None = None) -> MemorySnapshot:
+    """Return the selected device's live memory and compatibility identity."""
+    global _last_probe_at, _last_probe_snapshot, _last_probe_selector
     now = time.monotonic()
-    if _last_probe_snapshot is not None and now - _last_probe_at < _PROBE_TTL_SECONDS:
+    selector = str(device_index) if device_index is not None else os.environ.get("H3_CUDA_DEVICE", "0")
+    if (
+        device_index is None
+        and _last_probe_snapshot is not None
+        and _last_probe_selector == selector
+        and now - _last_probe_at < _PROBE_TTL_SECONDS
+    ):
         return _last_probe_snapshot
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=name,memory.total,memory.free",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            check=True,
-            text=True,
-            timeout=5,
-        )
-        name, total_mib, free_mib = [part.strip() for part in result.stdout.splitlines()[0].split(",")]
-        snapshot = MemorySnapshot("cuda", int(total_mib) * MIB, int(free_mib) * MIB, name)
-    except (OSError, ValueError, subprocess.SubprocessError, IndexError):
-        snapshot = MemorySnapshot("cpu", 0, 0, "CPU")
-    _last_probe_at = now
-    _last_probe_snapshot = snapshot
+    profiles = probe_device_profiles()
+    snapshot_profile = select_device_profile(
+        profiles,
+        selector=str(device_index) if device_index is not None else None,
+    )
+    runtime_memory_available = snapshot_profile.provider == "cuda"
+    snapshot = MemorySnapshot(
+        snapshot_profile.provider,
+        snapshot_profile.total_bytes if runtime_memory_available else 0,
+        snapshot_profile.free_bytes if runtime_memory_available else 0,
+        snapshot_profile.name,
+        snapshot_profile.index,
+        snapshot_profile.uuid,
+        snapshot_profile.compute_capability,
+        snapshot_profile.driver,
+        snapshot_profile.tier,
+    )
+    if device_index is None:
+        _last_probe_at = now
+        _last_probe_snapshot = snapshot
+        _last_probe_selector = selector
     return snapshot
 
 

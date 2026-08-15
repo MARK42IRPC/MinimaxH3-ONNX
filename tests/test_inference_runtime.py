@@ -19,6 +19,7 @@ from h3_workbench.inference_runtime import (
     time_shift_sigma,
     streamed_attention,
     select_fl2va_chunk_sizes,
+    select_attention_query_chunk,
     sample_latents,
     unpack_audio,
     unpatchify_video,
@@ -136,6 +137,14 @@ def test_fl2va_chunk_sizes_follow_available_vram() -> None:
     assert select_fl2va_chunk_sizes(int(2.5 * gib)) == {"qkv": 1024, "attention_output": 1024, "mlp": 256}
     assert select_fl2va_chunk_sizes(2 * gib) == {"qkv": 512, "attention_output": 512, "mlp": 256}
     assert select_fl2va_chunk_sizes(3 * gib, dynamic=False) == {"qkv": 256, "attention_output": 256, "mlp": 256}
+
+
+def test_attention_query_chunk_scales_with_live_vram_and_respects_cap() -> None:
+    gib = 1024**3
+    assert select_attention_query_chunk(512, 1190, 2 * gib) == 512
+    assert select_attention_query_chunk(512, 1190, 800 * 1024**2) == 256
+    assert select_attention_query_chunk(256, 1190, 2 * gib) == 256
+    assert select_attention_query_chunk(512, 1190, 0) == 256
 
 
 def test_host_prefetch_budget_preserves_commit_reserve(monkeypatch) -> None:

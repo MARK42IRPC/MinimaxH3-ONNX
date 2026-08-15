@@ -243,6 +243,43 @@ def test_persistent_runtime_prefetches_graph_kinds_in_parallel(
     runtime.close()
 
 
+def test_cuda_runtime_reuses_selected_host_ram_weights_across_steps(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source.onnx"
+    expected = _external_model(source)
+    topology = tmp_path / PERSISTENT_TOPOLOGIES["mlp"]
+    build_persistent_topology(source, topology)
+    monkeypatch.setenv("H3_PINNED_WEIGHTS", "0")
+    monkeypatch.setenv("H3_WEIGHT_RAM_CACHE_GIB", "1")
+    monkeypatch.setenv("H3_WEIGHT_RAM_RESERVE_GIB", "8")
+
+    class Runner:
+        provider = "CUDAExecutionProvider"
+
+    runtime = PersistentWeightRuntime(
+        tmp_path,
+        Runner(),
+        {"main_block_00_mlp": source},
+        prefetch_depth=1,
+    )
+    assert runtime.device_metrics["persistent_ram_cache_enabled"] is True
+    assert runtime.prime_ram_cache()["ram_cache_scheduled"] == 1
+
+    first = runtime.weights("main_block_00_mlp")
+    np.testing.assert_array_equal(first[0]["weight"], expected)
+    assert first[5] is True
+    runtime.release("main_block_00_mlp")
+
+    second = runtime.weights("main_block_00_mlp")
+    assert second[5] is False
+    assert second[6] == 0.0
+    assert runtime.device_metrics["persistent_ram_cache_hits"] >= 1
+    runtime.release("main_block_00_mlp")
+    runtime.close()
+
+
 def test_loaded_weights_preserves_inline_scalar_rank(tmp_path: Path) -> None:
     scalar = numpy_helper.from_array(np.asarray(0, dtype=np.int64), "scalar")
     graph = helper.make_graph(

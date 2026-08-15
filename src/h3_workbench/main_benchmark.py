@@ -116,7 +116,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-latents", type=Path)
     parser.add_argument("--sigma-index", type=int, default=0)
     parser.add_argument("--text-tokens", type=int, default=192)
-    parser.add_argument("--attention-query-chunk", type=int, default=256)
+    parser.add_argument("--attention-query-chunk", type=int, default=512)
     parser.add_argument("--l1-prefetch-shards", type=int, default=2)
     parser.add_argument(
         "--velocity-only",

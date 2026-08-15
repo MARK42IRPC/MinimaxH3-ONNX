@@ -35,7 +35,7 @@ class ScheduleMainRuntime:
         directory: Path,
         runner: Any,
         profile: GenerationProfile = PROFILE_360P_17F,
-        attention_query_chunk: int = 128,
+        attention_query_chunk: int = 512,
         activity_callback: Callable[[dict[str, object]], None] | None = None,
         l1_prefetch_shards: int = 2,
         turbo_adapter: Any | None = None,
@@ -54,6 +54,9 @@ class ScheduleMainRuntime:
         self._capture_graph = os.environ.get("H3_CAPTURE_GRAPH")
         capture_path = os.environ.get("H3_CAPTURE_GRAPH_PATH")
         self._capture_graph_path = Path(capture_path).resolve() if capture_path else None
+        requested_sdpa_backend = os.environ.get("H3_SDPA_BACKEND", "auto").strip().lower()
+        if requested_sdpa_backend not in {"auto", "torch", "ort"}:
+            raise ValueError("H3_SDPA_BACKEND must be one of: auto, torch, ort")
         self._device_hidden = (
             getattr(runner, "provider", "CPUExecutionProvider") == "CUDAExecutionProvider"
             and not getattr(runner, "low_vram_mode", False)
@@ -83,7 +86,10 @@ class ScheduleMainRuntime:
             "sdpa_runs": 0,
             "sdpa_seconds": 0.0,
             "device_sdpa_runs": 0,
+            "attention_chunk_downgrades": 0,
         }
+        self._attention_chunks: dict[int, int] = {}
+        self._attention_chunk_free_bytes = 0
         schedule_path = self.directory / "schedule.json"
         if not schedule_path.is_file():
             raise RuntimeError(f"Main model requires {SCHEDULE_FORMAT}: missing {schedule_path}")
@@ -125,9 +131,28 @@ class ScheduleMainRuntime:
             )
             if persistent.enabled:
                 self._persistent_weights = persistent
+                # Start host-RAM working-set loading as soon as the runtime is
+                # created. On the normal path this overlaps prompt encoding or
+                # the preceding segment instead of delaying the first graph.
+                prime = getattr(persistent, "prime_ram_cache", None)
+                self._ram_cache_prime = (
+                    prime()
+                    if callable(prime)
+                    else {
+                        "ram_cache_enabled": False,
+                        "ram_cache_budget_bytes": 0,
+                        "ram_cache_scheduled": 0,
+                    }
+                )
             elif self._turbo_adapter is not None:
                 persistent.close()
                 raise RuntimeError("Turbo LoRA adapter has no usable persistent topologies")
+        if not hasattr(self, "_ram_cache_prime"):
+            self._ram_cache_prime = {
+                "ram_cache_enabled": False,
+                "ram_cache_budget_bytes": 0,
+                "ram_cache_scheduled": 0,
+            }
         self.steps_by_phase = {
             phase: [step for step in self.schedule["steps"] if step["phase"] == phase]
             for phase in ("preamble", "denoise")
@@ -147,20 +172,52 @@ class ScheduleMainRuntime:
             else int(hints["vram_24gib"] if total_bytes >= 12 * (1 << 30) else hints["vram_4gib"])
         )
         self._ort_streamed_attention: Any | None = None
-        if getattr(runner, "provider", "CPUExecutionProvider") == "CUDAExecutionProvider":
+        cuda_provider = (
+            getattr(runner, "provider", "CPUExecutionProvider") == "CUDAExecutionProvider"
+        )
+        self._sdpa_backend = "numpy"
+        if cuda_provider:
             import torch
 
-            if not torch.cuda.is_available():
+            torch_cuda_ready = torch.cuda.is_available()
+            if requested_sdpa_backend == "torch" and not torch_cuda_ready:
+                raise ValueError("H3_SDPA_BACKEND=torch requires a CUDA-enabled PyTorch")
+            use_torch = torch_cuda_ready and (
+                requested_sdpa_backend == "torch"
+                or (
+                    requested_sdpa_backend == "auto"
+                    and not getattr(runner, "low_vram_mode", False)
+                )
+            )
+            if use_torch:
+                self._sdpa_backend = "torch"
+            else:
                 from h3_workbench.inference_runtime import ORTStreamingAttention
 
                 self._ort_streamed_attention = ORTStreamingAttention(self.directory, runner)
+                self._sdpa_backend = "ort"
         self._device_sdpa = bool(
             self._ort_streamed_attention is not None
             and os.environ.get("H3_DEVICE_SDPA", "0") == "1"
         )
+        recycle_setting = os.environ.get("H3_RECYCLE_PERSISTENT_SESSIONS", "auto").strip().lower()
+        if recycle_setting not in {"auto", "0", "1"}:
+            raise ValueError("H3_RECYCLE_PERSISTENT_SESSIONS must be auto, 0, or 1")
+        recycle_sequence_threshold = max(
+            1,
+            int(os.environ.get("H3_RECYCLE_SESSION_SEQUENCE_THRESHOLD", "2048")),
+        )
         self._recycle_persistent_sessions = bool(
             getattr(runner, "provider", "CPUExecutionProvider") == "CUDAExecutionProvider"
-            and getattr(runner, "low_vram_mode", False)
+            and (
+                recycle_setting == "1"
+                or (
+                    recycle_setting == "auto"
+                    and getattr(runner, "low_vram_mode", False)
+                    and not self._device_hidden
+                    and profile.sequence_tokens > recycle_sequence_threshold
+                )
+            )
         )
 
     def report_activity(self, module: str, operation: str, **details: object) -> None:
@@ -244,6 +301,7 @@ class ScheduleMainRuntime:
             "resident_sessions": len(self._sessions),
             "session_limit": self._session_limit,
             "device_resident_hidden": self._device_hidden,
+            "persistent_session_recycle": self._recycle_persistent_sessions,
             "persistent_pinned_weights": bool(
                 self._persistent_weights is not None
                 and self._persistent_weights.pinned_enabled
@@ -264,7 +322,12 @@ class ScheduleMainRuntime:
                 else 0
             ),
             "sdpa_seconds": round(float(self._metrics["sdpa_seconds"]), 3),
+            "sdpa_backend": self._sdpa_backend,
             "device_sdpa": self._device_sdpa,
+            "attention_query_chunk_max": self.attention_query_chunk,
+            "attention_query_chunk_counts": dict(sorted(self._attention_chunks.items())),
+            "attention_chunk_downgrades": self._metrics["attention_chunk_downgrades"],
+            "attention_chunk_last_free_bytes": self._attention_chunk_free_bytes,
             **(
                 {
                     "turbo_adapter_active": True,
@@ -304,7 +367,11 @@ class ScheduleMainRuntime:
             self._session(shard["id"])
             regular_warmed += 1
             warmed += 1
-        return {"warmed_sessions": warmed, "elapsed_seconds": round(time.perf_counter() - started, 3)}
+        return {
+            **self._ram_cache_prime,
+            "warmed_sessions": warmed,
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
 
     @staticmethod
     def _read(binding: dict[str, str], external: dict, constants: dict, buffers: dict) -> Any:
@@ -411,6 +478,17 @@ class ScheduleMainRuntime:
         binding = session.io_binding()
         for argument in arguments:
             value = feeds[argument.name]
+            expected_dtype = _ORT_DTYPES.get(argument.type)
+            actual_dtype = None
+            if isinstance(value, ort.OrtValue):
+                actual_dtype = _ORT_DTYPES.get(value.data_type())
+            elif hasattr(value, "dtype"):
+                actual_dtype = np.dtype(value.dtype)
+            if expected_dtype is not None and actual_dtype is not None and actual_dtype != expected_dtype:
+                raise TypeError(
+                    f"I/O binding dtype mismatch for {argument.name!r}: "
+                    f"expected {np.dtype(expected_dtype)}, got {actual_dtype}"
+                )
             if hasattr(value, "bind_input"):
                 value.bind_input(binding, argument.name)
             elif isinstance(value, ort.OrtValue):
@@ -424,7 +502,9 @@ class ScheduleMainRuntime:
         for name in output_names:
             binding.bind_output(name, "cuda" if device_output else "cpu")
         try:
+            binding.synchronize_inputs()
             session.run_with_iobinding(binding)
+            binding.synchronize_outputs()
             outputs = binding.get_outputs()
             if device_output:
                 return list(outputs)
@@ -686,15 +766,27 @@ class ScheduleMainRuntime:
                 ).astype(np.float32, copy=False)
             }
         elif op == "sdpa":
-            from h3_workbench.inference_runtime import streamed_attention
+            from h3_workbench.inference_runtime import select_attention_query_chunk, streamed_attention
+            from h3_workbench.memory_planner import probe_gpu_memory
 
             started = time.perf_counter()
             packed = values["qkv_packed"]
+            packed_shape = packed.shape() if isinstance(packed, ort.OrtValue) else np.asarray(packed).shape
+            snapshot = probe_gpu_memory()
+            query_chunk = select_attention_query_chunk(
+                self.attention_query_chunk,
+                int(packed_shape[0]),
+                snapshot.free_bytes,
+            )
+            self._attention_chunks[query_chunk] = self._attention_chunks.get(query_chunk, 0) + 1
+            self._attention_chunk_free_bytes = snapshot.free_bytes
+            if query_chunk < self.attention_query_chunk:
+                self._metrics["attention_chunk_downgrades"] += 1
             outputs = {
                 "attended": (
                     self._ort_streamed_attention(
                         packed if isinstance(packed, ort.OrtValue) else np.asarray(packed),
-                        self.attention_query_chunk,
+                        query_chunk,
                         output_dtype=np.float32,
                     )
                     if self._ort_streamed_attention is not None
@@ -702,7 +794,7 @@ class ScheduleMainRuntime:
                         np.asarray(packed),
                         getattr(self.runner, "provider", "CPUExecutionProvider")
                         == "CUDAExecutionProvider",
-                        self.attention_query_chunk,
+                        query_chunk,
                     )
                 )
             }

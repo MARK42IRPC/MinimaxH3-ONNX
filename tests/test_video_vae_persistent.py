@@ -15,6 +15,7 @@ from h3_workbench.video_vae_persistent import (
     build_persistent_video_vae_topology,
     load_persistent_video_vae_manifest,
     load_video_vae_block_weights,
+    preload_video_vae_block_weights,
     persistent_video_vae_ready,
     persistent_video_vae_schema,
     validate_video_vae_block_schemas,
@@ -103,6 +104,21 @@ def test_block_weight_loader_is_suitable_for_threadpool_prefetch(tmp_path: Path)
         assert item.load_seconds >= 0
         item.close()
         assert not item.feeds()
+
+
+def test_video_vae_ram_cache_loads_each_block_once(tmp_path: Path, monkeypatch) -> None:
+    _product(tmp_path, {0: (1.0, "Add"), 1: (2.0, "Add")})
+    build_persistent_video_vae_topology(tmp_path, validate_blocks=None)
+    monkeypatch.setenv("H3_VIDEO_VAE_RAM_CACHE", "1")
+
+    cache = preload_video_vae_block_weights(tmp_path, (0, 1))
+
+    assert cache is not None
+    assert cache.bytes == 32
+    np.testing.assert_array_equal(cache.get(0).feeds()["block.bias"], np.ones(4, dtype=np.float32))
+    np.testing.assert_array_equal(cache.get(1).feeds()["block.bias"], np.full(4, 2.0, dtype=np.float32))
+    cache.close()
+    assert not cache._weights
 
 
 def test_schema_validation_rejects_a_different_block_topology(tmp_path: Path) -> None:

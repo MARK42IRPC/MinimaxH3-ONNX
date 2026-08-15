@@ -72,7 +72,11 @@ def resolve_main_model_directory(
 ) -> Path | None:
     """Resolve a validated main product by capability instead of a legacy folder name."""
     candidates: list[Path] = []
-    for root in (output_root.resolve(), (workspace / "exported").resolve()):
+    for root in (
+        output_root.resolve(),
+        (workspace / "exported").resolve(),
+        workspace.resolve(),
+    ):
         if not root.is_dir():
             continue
         candidates.extend(path for path in root.iterdir() if path.is_dir())
@@ -354,11 +358,14 @@ class JobManager:
         height: int,
         duration_seconds: float,
         temporal_mode: str = "segmented",
-        attention_query_chunk: int = 256,
+        attention_query_chunk: int = 512,
         l1_prefetch_shards: int = 2,
+        use_acceleration_lora: bool = False,
     ) -> Job:
         if not 1 <= steps <= 50:
             raise ValueError("Inference steps must be from 1 to 50")
+        if use_acceleration_lora and not 4 <= steps <= 8:
+            raise ValueError("Turbo v4 acceleration LoRA supports 4-8 sampling steps")
         if not token_ids and not prompt:
             raise ValueError("Provide either prompt or token IDs")
         if not 128 <= width <= 1024 or not 128 <= height <= 1024:
@@ -398,6 +405,7 @@ class JobManager:
             attention_query_chunk,
             l1_prefetch_shards,
             destination,
+            use_acceleration_lora,
         )
         return job
 
@@ -483,6 +491,7 @@ class JobManager:
         attention_query_chunk: int,
         l1_prefetch_shards: int,
         destination: Path,
+        use_acceleration_lora: bool,
     ) -> None:
         self._update(
             job_id,
@@ -498,6 +507,7 @@ class JobManager:
         warmup_executor: ThreadPoolExecutor | None = None
         warmup_future: Any | None = None
         warm_runtime: H3MainRuntime | None = None
+        task_runtime: H3MainRuntime | None = None
         active_runtime: H3MainRuntime | None = None
         reservation_token = f"{os.getpid()}-{job_id}"
         heartbeat_stop = threading.Event()
@@ -523,7 +533,7 @@ class JobManager:
             qwen_dir = resolve_qwen_directory(self.output_root)
             base_main_dir = resolve_main_model_directory(self.workspace, self.output_root, accelerated=False)
             base_ready = base_main_dir is not None
-            use_acceleration = 4 <= steps <= 8
+            use_acceleration = use_acceleration_lora
             if not base_ready:
                 raise RuntimeError(
                     "No validated FL2VA streaming Base model is installed. "
@@ -595,7 +605,7 @@ class JobManager:
             if provider_name == "CUDAExecutionProvider":
                 snapshot = probe_gpu_memory()
                 requested = max(0, snapshot.free_bytes - 768 * 1024**2 - profile.attention_workspace_bytes)
-                if acquire_reservation(reservation_token, requested):
+                if acquire_reservation(reservation_token, requested, device=snapshot.device_key):
                     reservation_active = True
 
                     def reservation_heartbeat() -> None:
@@ -716,20 +726,24 @@ class JobManager:
                         return
                     self._update(job_id, progress=progress, message=f"{module}: {operation}", activity=details)
 
-                if warm_runtime is not None:
-                    active_runtime = warm_runtime
-                    warm_runtime = None
-                    active_runtime.activity_callback = report_main
-                else:
-                    active_runtime = H3MainRuntime(
-                        main_dir,
-                        runner,
-                        profile,
-                        attention_query_chunk,
-                        report_main,
-                        l1_prefetch_shards,
-                        turbo_adapter=new_turbo_adapter(),
-                    )
+                if task_runtime is None:
+                    if warm_runtime is not None:
+                        task_runtime = warm_runtime
+                        warm_runtime = None
+                    else:
+                        task_runtime = H3MainRuntime(
+                            main_dir,
+                            runner,
+                            profile,
+                            attention_query_chunk,
+                            report_main,
+                            l1_prefetch_shards,
+                            turbo_adapter=new_turbo_adapter(),
+                        )
+                # Keep the persistent host-RAM working set alive across
+                # segmented clips while changing only the progress callback.
+                task_runtime.activity_callback = report_main
+                active_runtime = task_runtime
                 try:
                     video, audio = sample_latents(
                         active_runtime,
@@ -757,9 +771,10 @@ class JobManager:
                     )
                     if active_runtime.audio_fallback_reason is not None:
                         audio_warnings.append(active_runtime.audio_fallback_reason)
-                    main_runtime_metrics.append(active_runtime.metrics())
+                    segment_metrics = active_runtime.metrics()
+                    segment_metrics["segment"] = segment + 1
+                    main_runtime_metrics.append(segment_metrics)
                 finally:
-                    active_runtime.close()
                     active_runtime = None
                 gc.collect()
                 if torch.cuda.is_available():
@@ -912,10 +927,13 @@ class JobManager:
                 "runtime": {
                     "provider": provider_name,
                     "main_variant": TURBO_ADAPTER_VARIANT if use_acceleration else "base",
+                    "use_acceleration_lora": use_acceleration,
                     "attention_query_chunk": attention_query_chunk,
                     "l1_prefetch_shards": l1_prefetch_shards,
                     "l2_cache_gib": os.environ.get("H3_L2_CACHE_GIB"),
                     "prefetch_shards": os.environ.get("H3_PREFETCH_SHARDS"),
+                    "weight_ram_cache": os.environ.get("H3_WEIGHT_RAM_CACHE", "auto"),
+                    "weight_ram_cache_gib": os.environ.get("H3_WEIGHT_RAM_CACHE_GIB"),
                     "segments": main_runtime_metrics,
                 },
                 "models": {
@@ -962,6 +980,7 @@ class JobManager:
                     "prompt": prompt,
                     "token_ids": token_ids,
                     "main_variant": TURBO_ADAPTER_VARIANT if use_acceleration else "base",
+                    "use_acceleration_lora": use_acceleration,
                     "profile": profile.to_dict(),
                     "steps": steps,
                     "seed": seed,
@@ -992,6 +1011,10 @@ class JobManager:
                 warmup_executor.shutdown(wait=True, cancel_futures=True)
             if active_runtime is not None:
                 active_runtime.close()
+                active_runtime = None
+            if task_runtime is not None:
+                task_runtime.close()
+                task_runtime = None
             if warm_runtime is not None:
                 warm_runtime.close()
             _close_qwen_runtime_weights(qwen)

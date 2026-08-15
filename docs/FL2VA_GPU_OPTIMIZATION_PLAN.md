@@ -486,3 +486,172 @@ current block processes all tiles. A typical 360p 2x2 tile set provides about
 weights occupy device memory; the next block remains in host memory. The new
 path activates only when its topology manifest passes the ready check and can
 be disabled with `H3_VIDEO_VAE_PERSISTENT=0`.
+
+## 2026-08-15 GPU Toolchain And Six-Point Gate
+
+The Windows GPU development path is now reproducible with CUDA Toolkit 12.6,
+Visual Studio 2022 Community, CuPy 14.1.1, CUTLASS 4.2, and `cuda-python`
+12.9.7. Python packages use the Tsinghua mirror. `cuda-python` remains below
+version 13 because CUTLASS 4.2 is incompatible with its changed API. CUDA
+source, compiler temporary files, and copied CUTLASS headers use
+`C:\ProgramData\h3-workbench\cuda-cache`; NVRTC and nvcc fail on parts of the
+toolchain when their temporary path contains the current non-ASCII user name.
+
+TensorRT is a separate optional dependency. ONNX Runtime 1.23.2 requires the
+TensorRT 10 ABI, so the extra is pinned to 10.9.0.34. TensorRT packages alone
+use the explicit NVIDIA package index through the system proxy; all other
+Python packages continue to use the Tsinghua mirror. A missing TensorRT runtime
+does not block the main GPU extra or silently turn a TensorRT result into a
+CUDA result.
+
+The six optimization points reached these gates:
+
+1. Persistent weights use reusable pinned host buffers and a non-blocking CUDA
+   upload stream. `cudaMemcpyAsync` is submitted during prefetch, the pinned
+   lease remains alive until the consumer synchronizes, and metrics separate
+   total upload span from foreground upload wait. Device admission checks live
+   free VRAM against the next shard, in-flight bytes, one device slot, and a
+   384 MiB reserve. A real 4 GiB run admitted 66 of 150 graphs but increased
+   graph time and exposed unsafe interaction with device-resident activations,
+   so automatic device upload retains a 6 GiB minimum. It remains available on
+   4 GiB only through the explicit `H3_DEVICE_WEIGHT_PREFETCH=1` experiment.
+2. QKV, Attention output, and MLP already reuse one persistent topology session
+   per graph kind. A caller-owned non-blocking compute stream was accepted by
+   ORT and reported `has_user_compute_stream=1`, but a real multi-session
+   schedule exited in native code immediately after its first QKV graph. It is
+   therefore opt-in through `H3_UNIFIED_CUDA_STREAM=1`, not a default. Combining
+   all three graphs into one topology is
+   rejected for now: streaming SDPA is an intentional lifetime boundary, and
+   a 13,371-token native sequence cannot keep the complete intermediate state
+   inside the 4 GiB device without losing the low-memory guarantee.
+3. CUDA Graph passed the fixed-shape, stable-device-address Block 00 gate. Five
+   warm runs had a 4.09 ms replay median versus 4.72 ms for ordinary CUDA, a
+   13.3% reduction. Capture is therefore available to experiments but is not
+   enabled on the dynamic production path; changing weight and activation
+   pointers invalidate the graph contract.
+4. Streaming SDPA selects 512, 384, 256, 128, 64, or 32 query rows from current
+   free VRAM before every block. The user value is a hard upper bound, a
+   512 MiB device reserve is retained, and selected sizes plus downgrade counts
+   are persisted in task metrics.
+5. An NVRTC kernel now fuses FP8 E4M3 conversion, scale application, optional
+   LoRA `B @ A`, optional transpose, and FP16 output. Base and LoRA-transposed
+   smoke tests matched the NumPy FP16 reference elementwise. Ampere compute
+   capability 8.6 has no native FP8 Tensor Core path, so the useful design is
+   fused software conversion followed by FP16 Tensor Core GEMM. This kernel is
+   an experimental adapter primitive until a source FP8 topology needs it; the
+   current published main model already stores its accepted scaled weights as
+   FP16.
+6. A native CUTLASS FP16 TensorOp DLL is compiled and hash-cached through nvcc
+   and Visual Studio. The GA107-safe kernel uses a 64x64x32 tile and two stages
+   to remain below the laptop GPU's per-block shared-memory limit. A
+   128x256x128 GEMM matched the FP32-accumulated FP16 reference with maximum
+   absolute difference `2.4414e-4`. The backend benchmark rejects ORT CPU
+   fallback and measures TensorRT FP16 and FP32 engines separately.
+
+For the validated scaled-FP16 Block 00, ordinary CUDA and CUDA Graph both had
+relative L2 `2.867e-4` against the stored reference and finite output. The
+large maximum absolute error (`104.90625`) is attached to very large activation
+magnitudes and is not a CUDA Graph difference; both backends produced the same
+error metrics. End-to-end promotion still requires a same-task A/B because the
+single-block 13.3% graph replay gain does not include storage and weight upload
+stalls.
+
+TensorRT 10.9 was then measured on the same Block 00. The FP16 engine produced
+non-finite output and failed the numerical gate. The FP32 engine was finite,
+but relative L2 rose to `2.613e-3`, versus `2.867e-4` for CUDA, and its 4.68 ms
+warm median only narrowly beat ordinary CUDA while remaining slower than the
+4.23 ms CUDA Graph replay. TensorRT session plus first-run engine construction
+took about 40 seconds and sampled approximately 1.37 GiB VRAM, around 430 MiB
+above the CUDA sessions. TensorRT therefore remains an installed, optional
+benchmark backend and is rejected for the production main-model path.
+
+The same cf4 one-step benchmark also rejected two aggressive 4 GiB runtime
+combinations. A unified caller stream exited in native code after the first QKV
+graph. Retaining all three persistent topology sessions and device activations
+then exited at the Attention Output to MLP handoff, with and without device
+weight upload. The accepted policy separates session and activation lifetime:
+sequences up to 2,048 tokens retain the three topology sessions while returning
+block activations through host memory; larger sequences recycle sessions to
+preserve the long-context VRAM reserve. The cf4 one-step result was 38.770 s,
+with elementwise-identical video/audio, 2,878 MiB peak VRAM, three persistent
+session builds, and 18.232 s graph time. This is 11.9% faster than the 44.003 s
+historical repeat and within 2.1% of the 37.975 s best run. Device activations,
+unified streams, and automatic 4 GiB weight upload remain disabled by default.
+
+A final validation with no experimental environment overrides confirmed the
+adaptive policy as the production default. It completed in 41.833 s with
+finite, elementwise-identical video and audio output, 2,878 MiB peak VRAM,
+three persistent session builds, 18.838 s graph time, 2.235 s foreground
+weight wait, and 17.014 s streaming SDPA time. This is 4.9% faster than the
+44.003 s historical repeat, 10.2% slower than the 37.975 s historical best,
+54.2% faster than the 91.271 s CPU-optimized run, and 60.9% faster than the
+107.091 s early scaled-FP16 path. The retained-session experiment above shows
+the remaining short-sequence opportunity; the accepted default restores most
+of the regression without weakening long-sequence VRAM safety.
+
+## 2026-08-15 CUDA Torch SDPA Gate
+
+The CUDA PyTorch wheel was installed as `torch 2.10.0+cu126` and the schedule
+runtime was given an explicit `H3_SDPA_BACKEND=auto|torch|ort` selector. The
+historical `36d8d47f53d7` geometry was replayed with the published scaled-FP16
+model: 352x360, 17 requested frames, segmented mode, 1,190 sequence tokens,
+seed 1, four steps, and query chunk 256. The benchmark used zero text states
+and excluded Qwen, Video VAE, audio VAE, and MP4 encoding.
+
+The one-step gate selected the requested backend and kept both outputs finite.
+ORT completed in 42.725 s with 17.968 s of SDPA; Torch completed in 44.852 s
+with 20.506 s of SDPA. A reverse-order repeat kept Torch at 44.803 s average,
+while ORT averaged 47.294 s because one run incurred a storage/runtime stall.
+Torch used about 2,607 MiB peak VRAM versus ORT's 2,877 MiB, but its one-step
+video/audio relative L2 error against ORT was 2.106e-3 / 1.308e-3.
+
+The complete four-step gate is the production decision: ORT finished in
+170.399 s with 82.411 s of SDPA, while Torch finished in 185.743 s with
+88.589 s of SDPA. Both remained finite, but final Torch video/audio relative
+L2 error reached 4.370e-2 / 2.765e-2, increasing at each checkpoint. On the
+4 GiB RTX 3050, `auto` therefore keeps ORT for low-VRAM devices; Torch remains
+available as an explicit experimental override and as the automatic candidate
+for higher-VRAM devices. The measured peak VRAM was 2,880 MiB for ORT and
+2,633 MiB for Torch.
+
+## 2026-08-15 Host RAM Working-Set Gate
+
+The long Video VAE decode trace showed that the decoder's 36 embedded-weight
+blocks were being read one block at a time. The complete validated working set
+is 4.502 GiB on the current product, while the host reported about 23 GiB of
+available memory. The decoder now preloads all blocks into host RAM when the
+working set fits with a 6 GiB system reserve, then reuses those arrays for every
+CUDA tile. `H3_VIDEO_VAE_RAM_CACHE=0` restores streaming and
+`H3_VIDEO_VAE_RAM_CACHE=1` forces the cache for an explicit experiment.
+
+The main FL2VA ONNX product is 37.93 GiB and cannot be made fully resident on
+the current 32 GiB host without paging. Its bounded persistent-weight and L2
+read-ahead paths therefore remain memory-budgeted; only a full-working-set
+cache is promoted automatically on hosts where it genuinely fits.
+
+## 2026-08-15 Task-Level Host Weight Hot Set
+
+The previous L2 path warmed files in the Windows page cache, but persistent
+weights were still copied from those files into a temporary host buffer on each
+sampling step. The new CUDA path plans a stable host-RAM hot set when the
+persistent topology is created. It loads selected QKV, Attention output, and
+MLP arrays once in the background, reuses them across denoising steps, and
+keeps the same runtime alive across segmented clips in one task. The cache is
+host-only on purpose; the existing VRAM admission policy still controls device
+weight upload.
+
+Auto mode budgets current available RAM minus a 12 GiB safety reserve and a
+2 GiB L2 reserve. It caches complete weight entries in schedule order until
+the budget is consumed, so the 32 GiB workstation gets a bounded hot set while
+64 GiB-class hosts can approach the full 37.93 GiB working set. `H3_WEIGHT_RAM_CACHE=0`
+disables the feature and `H3_WEIGHT_RAM_CACHE_GIB` caps its budget. The runtime
+metrics now report candidate/resident bytes, resident entries, cache hits, and
+load seconds.
+
+L2 read-ahead now has a resizable budget. When host available memory drops, it
+evicts the oldest mmap entries and reports budget adjustments and pressure
+evictions. When the weight hot set is active, automatic L2 read-ahead is capped
+at 2 GiB so page warming cannot consume the memory reserved for ORT sessions,
+activations, and the next uncached graph. This addresses the observed failure
+mode where SSD activity became low but available RAM approached zero and GPU
+gaps grew instead of shrinking.

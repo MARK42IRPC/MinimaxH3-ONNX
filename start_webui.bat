@@ -3,8 +3,6 @@ setlocal
 
 cd /d "%~dp0"
 set "PYTHONPATH=%CD%\src"
-set "H3_CPU_AFFINITY=0xFF"
-set "H3_CPU_PRIORITY=AboveNormal"
 set "H3_VALIDATE_FINITE=1"
 set "WEBUI_EXE=%CD%\.venv\Scripts\h3-workbench.exe"
 

@@ -8,11 +8,13 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
 import onnx
+import psutil
 from onnx import TensorProto, helper, numpy_helper
 
 
@@ -82,6 +84,73 @@ class LoadedVideoVAEBlockWeights:
 
     def close(self) -> None:
         self.arrays.clear()
+
+
+class VideoVAEWeightCache:
+    """Keep the complete decoder block working set in host RAM when it fits."""
+
+    def __init__(self, weights: dict[int, LoadedVideoVAEBlockWeights], load_seconds: float) -> None:
+        self._weights = weights
+        self.load_seconds = load_seconds
+        self.bytes = sum(item.total_bytes for item in weights.values())
+
+    def get(self, block: int) -> LoadedVideoVAEBlockWeights:
+        return self._weights[block]
+
+    def close(self) -> None:
+        for item in self._weights.values():
+            item.close()
+        self._weights.clear()
+
+
+def video_vae_ram_cache_budget_bytes(directory: Path, block_count: int) -> int:
+    """Return a safe full-cache budget, or zero when the working set should stream."""
+    setting = os.environ.get("H3_VIDEO_VAE_RAM_CACHE", "auto").strip().lower()
+    if setting not in {"auto", "0", "1", "true", "false", "on", "off", "yes", "no"}:
+        raise ValueError("H3_VIDEO_VAE_RAM_CACHE must be auto, 0, or 1")
+    if setting in {"0", "false", "off", "no"}:
+        return 0
+    manifest = load_persistent_video_vae_manifest(directory)
+    required_bytes = int(manifest["weight_bytes"]) * max(0, int(block_count))
+    if setting in {"1", "true", "on", "yes"}:
+        return required_bytes
+    try:
+        reserve_gib = max(1.0, float(os.environ.get("H3_VIDEO_VAE_RAM_RESERVE_GIB", "6")))
+    except ValueError:
+        reserve_gib = 6.0
+    available = int(psutil.virtual_memory().available)
+    return required_bytes if available >= required_bytes + int(reserve_gib * 1024**3) else 0
+
+
+def preload_video_vae_block_weights(directory: Path, blocks: Iterable[int]) -> VideoVAEWeightCache | None:
+    """Load all decoder block weights once so tile decoding never rereads the SSD."""
+    requested = tuple(int(block) for block in blocks)
+    budget = video_vae_ram_cache_budget_bytes(directory, len(requested))
+    if budget <= 0 or not requested:
+        return None
+    try:
+        workers = max(1, min(4, int(os.environ.get("H3_VIDEO_VAE_RAM_WORKERS", "2"))))
+    except ValueError:
+        workers = 2
+    started = time.perf_counter()
+    loaded: dict[int, LoadedVideoVAEBlockWeights] = {}
+    try:
+        with ThreadPoolExecutor(max_workers=min(workers, len(requested)), thread_name_prefix="video-vae-ram-cache") as executor:
+            for item in executor.map(lambda block: load_video_vae_block_weights(directory, block), requested):
+                loaded[item.block] = item
+    except MemoryError:
+        for item in loaded.values():
+            item.close()
+        if os.environ.get("H3_VIDEO_VAE_RAM_CACHE", "auto").strip().lower() == "auto":
+            return None
+        raise
+    cache = VideoVAEWeightCache(loaded, time.perf_counter() - started)
+    if cache.bytes > budget:
+        cache.close()
+        raise RuntimeError(
+            f"Video VAE RAM cache exceeded its budget: {cache.bytes} > {budget} bytes"
+        )
+    return cache
 
 
 def _value_shape(value: onnx.ValueInfoProto) -> list[int | str | None]:

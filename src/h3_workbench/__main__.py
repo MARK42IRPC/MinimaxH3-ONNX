@@ -21,12 +21,20 @@ def main() -> None:
     if platform.system() == "Windows":
         process = psutil.Process()
         affinity = os.environ.get("H3_CPU_AFFINITY")
-        if affinity:
-            mask = int(affinity, 0)
-            process.cpu_affinity([index for index in range(os.cpu_count() or 1) if mask & (1 << index)])
+        if affinity and affinity.strip().lower() not in {"auto", "none", "off"}:
+            try:
+                mask = int(affinity, 0)
+                selected = [index for index in range(os.cpu_count() or 1) if mask & (1 << index)]
+                if selected:
+                    process.cpu_affinity(selected)
+            except (ValueError, OSError, psutil.Error):
+                pass
         priority = os.environ.get("H3_CPU_PRIORITY")
         if priority == "AboveNormal":
-            process.nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS)
+            try:
+                process.nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS)
+            except (OSError, psutil.Error):
+                pass
     uvicorn.run("h3_workbench.app:app", host=args.host, port=args.port, reload=args.reload)
 
 

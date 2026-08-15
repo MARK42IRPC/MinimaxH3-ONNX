@@ -23,9 +23,19 @@ def registry(tmp_path, monkeypatch):
     monkeypatch.setattr(vr, "_last_read_total", 0)
 
 
-def _write_entry(directory, token: str, pid: int, reserved_bytes: int, updated_at: float | None = None) -> None:
+def _write_entry(
+    directory,
+    token: str,
+    pid: int,
+    reserved_bytes: int,
+    updated_at: float | None = None,
+    device: str | None = None,
+) -> None:
+    payload = {"pid": pid, "bytes": reserved_bytes, "updated_at": updated_at or time.time()}
+    if device is not None:
+        payload["device"] = device
     (directory / f"{token}.json").write_text(
-        json.dumps({"pid": pid, "bytes": reserved_bytes, "updated_at": updated_at or time.time()}),
+        json.dumps(payload),
         encoding="utf-8",
     )
 
@@ -63,6 +73,18 @@ def test_alive_foreign_process_is_counted(registry, monkeypatch) -> None:
         _write_entry(registry, "foreign", process.pid, 5 * 1024**3)
         _flush(monkeypatch)
         assert vr.other_reserved_bytes() == 5 * 1024**3
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+
+
+def test_foreign_reservations_are_scoped_to_the_selected_device(registry, monkeypatch) -> None:
+    process = _sleeping_process()
+    try:
+        _write_entry(registry, "gpu-a", process.pid, 5 * 1024**3, device="GPU-a")
+        _flush(monkeypatch)
+        assert vr.other_reserved_bytes(device="GPU-a") == 5 * 1024**3
+        assert vr.other_reserved_bytes(device="GPU-b") == 0
     finally:
         process.terminate()
         process.wait(timeout=10)

@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from h3_workbench.profiles import PROFILE_360P_17F
 from h3_workbench.schedule_runtime import ScheduleMainRuntime
 
 
@@ -259,6 +260,8 @@ def test_iobinding_preserves_scalar_input_rank() -> None:
             self.shapes = {}
             self.inputs_cleared = False
             self.outputs_cleared = False
+            self.inputs_synchronized = False
+            self.outputs_synchronized = False
 
         def bind_cpu_input(self, name, value):
             self.shapes[name] = value.shape
@@ -268,6 +271,12 @@ def test_iobinding_preserves_scalar_input_rank() -> None:
 
         def get_outputs(self):
             return []
+
+        def synchronize_inputs(self):
+            self.inputs_synchronized = True
+
+        def synchronize_outputs(self):
+            self.outputs_synchronized = True
 
         def clear_binding_inputs(self):
             self.inputs_cleared = True
@@ -297,6 +306,8 @@ def test_iobinding_preserves_scalar_input_rank() -> None:
     )
 
     assert session.binding.shapes["scalar"] == ()
+    assert session.binding.inputs_synchronized
+    assert session.binding.outputs_synchronized
     assert session.binding.inputs_cleared
     assert session.binding.outputs_cleared
 
@@ -312,10 +323,133 @@ def test_low_vram_runtime_disables_device_resident_hidden(tmp_path: Path, monkey
         provider = "CUDAExecutionProvider"
         low_vram_mode = True
 
-    runtime = ScheduleMainRuntime(tmp_path, Runner())
+    runtime = ScheduleMainRuntime(
+        tmp_path,
+        Runner(),
+        profile=PROFILE_360P_17F.with_frame_count(120),
+    )
 
     assert runtime._device_hidden is False
     assert runtime._recycle_persistent_sessions is True
+    runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("requested", "torch_ready", "low_vram", "expected"),
+    (
+        ("auto", True, True, "ort"),
+        ("auto", True, False, "torch"),
+        ("torch", True, True, "torch"),
+        ("auto", False, True, "ort"),
+        ("ort", True, True, "ort"),
+    ),
+)
+def test_cuda_runtime_selects_requested_sdpa_backend(
+    tmp_path: Path,
+    monkeypatch,
+    requested: str,
+    torch_ready: bool,
+    low_vram: bool,
+    expected: str,
+) -> None:
+    (tmp_path / "schedule.json").write_text(json.dumps(_schedule()), encoding="utf-8")
+    monkeypatch.setattr(
+        "h3_workbench.schedule_runtime.validate_runtime_schedule",
+        lambda schedule, directory: None,
+    )
+    monkeypatch.setenv("H3_PERSISTENT_WEIGHTS", "0")
+    monkeypatch.setenv("H3_SDPA_BACKEND", requested)
+    monkeypatch.setattr("torch.cuda.is_available", lambda: torch_ready)
+
+    class StreamingAttention:
+        def __init__(self, directory, runner) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        "h3_workbench.inference_runtime.ORTStreamingAttention",
+        StreamingAttention,
+    )
+
+    class Runner(_Runner):
+        provider = "CUDAExecutionProvider"
+        low_vram_mode = low_vram
+
+    runtime = ScheduleMainRuntime(tmp_path, Runner())
+
+    assert runtime.metrics()["sdpa_backend"] == expected
+    assert (runtime._ort_streamed_attention is not None) is (expected == "ort")
+    runtime.close()
+
+
+def test_cuda_runtime_rejects_unavailable_requested_torch_sdpa(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    (tmp_path / "schedule.json").write_text(json.dumps(_schedule()), encoding="utf-8")
+    monkeypatch.setattr(
+        "h3_workbench.schedule_runtime.validate_runtime_schedule",
+        lambda schedule, directory: None,
+    )
+    monkeypatch.setenv("H3_PERSISTENT_WEIGHTS", "0")
+    monkeypatch.setenv("H3_SDPA_BACKEND", "torch")
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+
+    class Runner(_Runner):
+        provider = "CUDAExecutionProvider"
+        low_vram_mode = True
+
+    with pytest.raises(ValueError, match="CUDA-enabled PyTorch"):
+        ScheduleMainRuntime(tmp_path, Runner())
+
+
+def test_runtime_rejects_invalid_sdpa_backend(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("H3_SDPA_BACKEND", "invalid")
+
+    with pytest.raises(ValueError, match="auto, torch, ort"):
+        ScheduleMainRuntime(tmp_path, _Runner())
+
+
+def test_low_vram_runtime_retains_topologies_but_not_activations_for_short_sequences(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    (tmp_path / "schedule.json").write_text(json.dumps(_schedule()), encoding="utf-8")
+    monkeypatch.setattr(
+        "h3_workbench.schedule_runtime.validate_runtime_schedule",
+        lambda schedule, directory: None,
+    )
+
+    class Runner(_Runner):
+        provider = "CUDAExecutionProvider"
+        low_vram_mode = True
+
+    runtime = ScheduleMainRuntime(tmp_path, Runner(), profile=PROFILE_360P_17F.resized(352, 360))
+
+    assert runtime._device_hidden is False
+    assert runtime._recycle_persistent_sessions is False
+    runtime.close()
+
+
+def test_persistent_session_recycling_can_be_disabled_independently(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "schedule.json").write_text(json.dumps(_schedule()), encoding="utf-8")
+    monkeypatch.setattr(
+        "h3_workbench.schedule_runtime.validate_runtime_schedule",
+        lambda schedule, directory: None,
+    )
+    monkeypatch.setenv("H3_DEVICE_RESIDENT_HIDDEN", "0")
+    monkeypatch.setenv("H3_RECYCLE_PERSISTENT_SESSIONS", "0")
+
+    class Runner(_Runner):
+        provider = "CUDAExecutionProvider"
+        low_vram_mode = True
+
+    runtime = ScheduleMainRuntime(tmp_path, Runner())
+
+    assert runtime._device_hidden is False
+    assert runtime._recycle_persistent_sessions is False
     runtime.close()
 
 

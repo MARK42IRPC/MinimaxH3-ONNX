@@ -110,7 +110,8 @@ def test_webui_contains_live_job_elapsed_timer() -> None:
     assert "job-progress-value" in response.text
     assert "/performance" in response.text
     assert "Turbo v4 动态 LoRA" in response.text
-    assert "不会静默回退" in response.text
+    assert "手动开启" in response.text
+    assert "use_acceleration_lora" in response.text
     assert "Turbo v4 尚未就绪，将使用流式基座模型" not in response.text
 
 
@@ -228,6 +229,71 @@ def test_generation_profiles() -> None:
     assert profile["acceleration_active"] is False
 
 
+def test_models_endpoint_exposes_validated_sliced_product(monkeypatch, tmp_path) -> None:
+    from h3_workbench import app as app_module
+
+    product = tmp_path / "exported" / "sliced_main"
+    product.mkdir(parents=True)
+    (product / "schedule.json").write_text("{}", encoding="utf-8")
+    (product / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "h3-workbench-onnx-v2",
+                "component": "fl2va_transformer",
+                "validation_passed": True,
+                "build_complete": True,
+                "schedule_format": "h3-schedule-v2",
+                "schedule": "schedule.json",
+                "blocks": list(range(50)),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        app_module,
+        "settings",
+        replace(
+            app_module.settings,
+            workspace=tmp_path,
+            output_dir=tmp_path / "onnx_models",
+            state_dir=tmp_path / ".h3-workbench",
+        ),
+    )
+
+    response = TestClient(app_module.app).get("/api/models")
+
+    assert response.status_code == 200
+    product_record = next(item for item in response.json() if item["id"] == "exported/sliced_main")
+    assert product_record["record_type"] == "product"
+    assert product_record["ready"] is True
+    assert product_record["export_supported"] is False
+
+
+def test_main_model_resolver_accepts_workspace_root_product(tmp_path) -> None:
+    from h3_workbench.jobs import resolve_main_model_directory
+
+    product = tmp_path / "sliced_main"
+    product.mkdir()
+    (product / "schedule.json").write_text("{}", encoding="utf-8")
+    (product / "manifest.json").write_text(
+        json.dumps(
+            {
+                "component": "fl2va_transformer",
+                "validation_passed": True,
+                "build_complete": True,
+                "schedule_format": "h3-schedule-v2",
+                "schedule": "schedule.json",
+                "blocks": list(range(50)),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = resolve_main_model_directory(tmp_path, tmp_path / "onnx_models", accelerated=False)
+
+    assert resolved == product.resolve()
+
+
 def test_generation_profile_detects_turbo_capability(monkeypatch, tmp_path) -> None:
     from h3_workbench import app as app_module
 
@@ -290,9 +356,21 @@ def test_prompt_inference_request_accepts_dynamic_resolution() -> None:
     assert request.height == 288
     assert request.duration_seconds == 15
     assert request.steps == 1
+    assert request.use_acceleration_lora is False
     assert request.temporal_mode == "native"
     assert request.attention_query_chunk == 64
     assert request.l1_prefetch_shards == 3
+
+
+def test_inference_request_accepts_explicit_acceleration_lora() -> None:
+    request = InferenceRequest(prompt="snowfall", steps=4, use_acceleration_lora=True)
+
+    assert request.use_acceleration_lora is True
+
+
+def test_inference_request_rejects_acceleration_lora_outside_supported_steps() -> None:
+    with pytest.raises(ValidationError, match="supports 4-8"):
+        InferenceRequest(prompt="snowfall", steps=3, use_acceleration_lora=True)
 
 
 @pytest.mark.parametrize(

@@ -39,6 +39,21 @@ def test_prefetch_cache_keeps_a_bounded_rolling_window(tmp_path: Path) -> None:
     assert rolled["l2_staged_bytes"] == 40
 
 
+def test_prefetch_cache_can_shrink_budget_without_replacing_the_worker(tmp_path: Path) -> None:
+    first = _make_graph(tmp_path, "first.onnx", b"a" * 16)
+    second = _make_graph(tmp_path, "second.onnx", b"b" * 16)
+
+    with ShardPrefetchCache(budget_bytes=40, prefetch_depth=2) as cache:
+        cache.stage([first, second])
+        cache.wait(first)
+        cache.set_budget(20)
+        snapshot = cache.snapshot()
+
+    assert snapshot["l2_budget_bytes"] == 20
+    assert snapshot["l2_staged_bytes"] <= 20
+    assert snapshot["l2_pressure_evictions"] >= 1
+
+
 def test_graph_files_discovers_multiple_external_weight_files(tmp_path: Path) -> None:
     first = tmp_path / "first.data"
     second = tmp_path / "second.data"

@@ -6,6 +6,7 @@ import json
 import math
 import os
 import sys
+from typing import Any
 import time
 from collections.abc import Callable
 from collections.abc import Iterator
@@ -19,6 +20,7 @@ import torch
 import torch.nn.functional as torch_functional
 
 from h3_workbench.acceleration import shifted_flow_sigmas
+from h3_workbench.device_profile import selected_device_index
 from h3_workbench.fl2va_runtime_graphs import (
     fp16_attention_output_ready,
     is_attention_output_graph,
@@ -226,6 +228,32 @@ def streamed_attention(packed: np.ndarray, use_cuda: bool, query_chunk_tokens: i
         if device.type == "cuda" and os.environ.get("H3_SDPA_EMPTY_CACHE", "0") == "1":
             torch.cuda.empty_cache()
     return output
+
+
+def select_attention_query_chunk(
+    requested_max: int,
+    sequence_tokens: int,
+    free_vram_bytes: int,
+    *,
+    heads: int = 56,
+    head_dim: int = 128,
+    reserve_bytes: int = 512 * 1024**2,
+) -> int:
+    """Select the largest safe SDPA query tile under the caller's quality-neutral cap."""
+    if requested_max not in {32, 64, 128, 256, 384, 512}:
+        raise ValueError("Attention query chunk must be one of 32, 64, 128, 256, 384, or 512")
+    candidates = [item for item in (512, 384, 256, 128, 64, 32) if item <= requested_max]
+    if free_vram_bytes <= 0 or sequence_tokens <= 0:
+        return min(requested_max, 256)
+    # Scores and normalized probabilities dominate the temporary allocation.
+    # Keep a fixed ORT/WDDM reserve and budget both matrices conservatively.
+    fixed_workspace = 96 * 1024**2
+    bytes_per_query = sequence_tokens * heads * 8 + heads * head_dim * 6
+    usable = max(0, free_vram_bytes - reserve_bytes)
+    for candidate in candidates:
+        if usable >= fixed_workspace + candidate * bytes_per_query:
+            return candidate
+    return 32
 
 
 def _ensure_streamed_sdpa_graph(path: Path) -> Path:
@@ -481,11 +509,12 @@ class ORTStreamingAttention:
         head_width = rows.shape[2] // 3
         if head_width != 128:
             raise ValueError(f"Expected 128-wide Q/K/V heads, got {head_width}")
+        device_index = selected_device_index()
         key, key_scale = self._normalize(rows[:, :, head_width : 2 * head_width].transpose(1, 0, 2)[None])
-        key_value = ort.OrtValue.ortvalue_from_numpy(key, "cuda", 0)
+        key_value = ort.OrtValue.ortvalue_from_numpy(key, "cuda", device_index)
         del key
         value, value_scale = self._normalize(rows[:, :, 2 * head_width :].transpose(1, 0, 2)[None])
-        value_value = ort.OrtValue.ortvalue_from_numpy(value, "cuda", 0)
+        value_value = ort.OrtValue.ortvalue_from_numpy(value, "cuda", device_index)
         del value
         output = np.empty((rows.shape[0], 56 * head_width), dtype=np.float32)
         try:
@@ -493,7 +522,9 @@ class ORTStreamingAttention:
                 stop = min(start + query_chunk_tokens, rows.shape[0])
                 query, query_scale = self._normalize(rows[start:stop, :, :head_width].transpose(1, 0, 2)[None])
                 io_binding = session.io_binding()
-                io_binding.bind_ortvalue_input("query", ort.OrtValue.ortvalue_from_numpy(query, "cuda", 0))
+                io_binding.bind_ortvalue_input(
+                    "query", ort.OrtValue.ortvalue_from_numpy(query, "cuda", device_index)
+                )
                 io_binding.bind_ortvalue_input("key", key_value)
                 io_binding.bind_ortvalue_input("value", value_value)
                 io_binding.bind_cpu_input(
@@ -593,6 +624,7 @@ class ORTGraphRunner:
     ):
         providers = ort.get_available_providers()
         self.provider = "CUDAExecutionProvider" if prefer_cuda and "CUDAExecutionProvider" in providers else "CPUExecutionProvider"
+        self.device_index = selected_device_index() if self.provider == "CUDAExecutionProvider" else -1
         if prefetch_depth is None:
             prefetch_depth = default_prefetch_depth()
         self.shard_cache = ShardPrefetchCache(l2_cache_bytes, prefetch_depth)
@@ -604,12 +636,26 @@ class ORTGraphRunner:
         self._session_cache_budget = 0
         self._session_cache_hits = 0
         self._session_cache_misses = 0
+        self._cuda_compute_stream: Any | None = None
+        self.cuda_unified_stream_enabled = False
+        self.cuda_unified_stream_reason: str | None = None
         default_threads = 1 if self.provider == "CUDAExecutionProvider" else 0
         self.ort_cpu_threads = max(0, int(os.environ.get("H3_ORT_CPU_THREADS", default_threads)))
         default_spinning = "0" if self.provider == "CUDAExecutionProvider" else "1"
         self.ort_allow_spinning = os.environ.get("H3_ORT_ALLOW_SPINNING", default_spinning) != "0"
         if self.provider == "CUDAExecutionProvider":
             _preload_cuda_dlls()
+            if os.environ.get("H3_UNIFIED_CUDA_STREAM", "0") == "1":
+                try:
+                    from h3_workbench.gpu_toolchain import prepare_cuda_environment
+
+                    prepare_cuda_environment()
+                    import cupy as cp
+
+                    self._cuda_compute_stream = cp.cuda.Stream(non_blocking=True)
+                    self.cuda_unified_stream_enabled = True
+                except Exception as exc:  # noqa: BLE001 - optional GPU extra has a safe ORT fallback
+                    self.cuda_unified_stream_reason = str(exc)
         try:
             total_vram = probe_gpu_memory().total_bytes
         except Exception:
@@ -663,7 +709,20 @@ class ORTGraphRunner:
         options.add_session_config_entry("session.inter_op.allow_spinning", spinning)
         provider_options = [{}]
         if self.provider == "CUDAExecutionProvider":
-            provider_options = [{"arena_extend_strategy": "kSameAsRequested", "cudnn_conv_use_max_workspace": "0"}]
+            cuda_options = {
+                "arena_extend_strategy": "kSameAsRequested",
+                "cudnn_conv_use_max_workspace": "0",
+                "device_id": str(self.device_index),
+            }
+            if self._cuda_compute_stream is not None:
+                cuda_options.update(
+                    {
+                        "user_compute_stream": str(self._cuda_compute_stream.ptr),
+                        "use_ep_level_unified_stream": "1",
+                        "do_copy_in_default_stream": "1",
+                    }
+                )
+            provider_options = [cuda_options]
         session = ort.InferenceSession(
             serialized_model if serialized_model is not None else str(path),
             sess_options=options,
@@ -1001,12 +1060,17 @@ class ORTGraphRunner:
             "session_cache_budget": self._session_cache_budget,
             "session_cache_hits": self._session_cache_hits,
             "session_cache_misses": self._session_cache_misses,
+            "cuda_unified_stream": self.cuda_unified_stream_enabled,
         }
 
     def close(self) -> None:
         self.shard_cache.close()
         self._session_cache.clear()
         self._session_cache_bytes = 0
+        stream = getattr(self, "_cuda_compute_stream", None)
+        self._cuda_compute_stream = None
+        if stream is not None:
+            stream.synchronize()
 
 
 class QwenTextRuntime:
@@ -1188,7 +1252,7 @@ class QwenTextRuntime:
             )
 
         snapshot = probe_gpu_memory()
-        effective_free = max(0, snapshot.free_bytes - other_reserved_bytes())
+        effective_free = max(0, snapshot.free_bytes - other_reserved_bytes(device=snapshot.device_key))
         prefetch_budget = max(0, effective_free - 768 * 1024**2)
         host_budget = host_prefetch_budget_bytes()
         if host_budget is not None:
@@ -1354,7 +1418,7 @@ class _FineGraphRuntime:
         if self.runner.provider != "CUDAExecutionProvider":
             return {"skipped": "provider"}
         snapshot = probe_gpu_memory()
-        effective_free = max(0, snapshot.free_bytes - other_reserved_bytes())
+        effective_free = max(0, snapshot.free_bytes - other_reserved_bytes(device=snapshot.device_key))
         if effective_free < HIGH_VRAM_THRESHOLD_BYTES and setting is not True:
             return {"skipped": "vram", "vram_free_bytes": snapshot.free_bytes}
         reserve = (
@@ -1432,7 +1496,7 @@ class _FineGraphRuntime:
         latest_vram_free = snapshot.free_bytes
         # Concurrent workbench processes reserve VRAM through a shared
         # registry; plan against what this process may actually claim.
-        effective_free = max(0, snapshot.free_bytes - other_reserved_bytes())
+        effective_free = max(0, snapshot.free_bytes - other_reserved_bytes(device=snapshot.device_key))
         self.chunk_sizes = select_fl2va_chunk_sizes(effective_free, self.dynamic_chunks)
         shards = main_model_shards(self.directory)
         batches = plan_shard_batches(shards, self.profile, effective_free) if effective_free else []
@@ -1565,7 +1629,11 @@ class _FineGraphRuntime:
             nonlocal latest_vram_free
             current_snapshot = probe_gpu_memory()
             latest_vram_free = current_snapshot.free_bytes
-            current_free = max(0, current_snapshot.free_bytes - other_reserved_bytes())
+            current_free = max(
+                0,
+                current_snapshot.free_bytes
+                - other_reserved_bytes(device=current_snapshot.device_key),
+            )
             usable = max(1, current_free - 768 * 1024**2 - attention_reserve)
             max_sessions = (
                 scaled_streaming_max_sessions(self.l1_prefetch_shards, current_free)

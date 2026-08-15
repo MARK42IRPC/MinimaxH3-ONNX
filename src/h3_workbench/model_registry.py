@@ -21,6 +21,8 @@ class ModelRecord:
     tensor_count: int
     metadata: dict[str, Any]
     export_supported: bool
+    record_type: str = "source"
+    ready: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -97,6 +99,63 @@ def inspect_checkpoint(path: Path, workspace: Path) -> ModelRecord:
     )
 
 
+def _directory_size(path: Path) -> int:
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def _validated_product(path: Path, workspace: Path) -> ModelRecord | None:
+    manifest_path = path / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if manifest.get("validation_passed") is not True:
+        return None
+
+    component = str(manifest.get("component", ""))
+    if component not in {"audio_vae", "video_vae", "text_encoder", "fl2va_transformer", "ref2va_transformer"}:
+        return None
+    if component in {"fl2va_transformer", "ref2va_transformer"}:
+        schedule = path / str(manifest.get("schedule", ""))
+        if (
+            manifest.get("build_complete") is not True
+            or manifest.get("schedule_format") != "h3-schedule-v2"
+            or len(manifest.get("blocks", [])) != 50
+            or not schedule.is_file()
+        ):
+            return None
+    elif manifest.get("build_complete") is False:
+        return None
+
+    relative = path.relative_to(workspace).as_posix()
+    blocks = manifest.get("blocks")
+    tensor_count = len(blocks) if isinstance(blocks, list) else len(manifest.get("graphs", []))
+    dtype = str(
+        manifest.get("activation_dtype")
+        or manifest.get("dtype")
+        or manifest.get("source_quantization")
+        or "ONNX"
+    )
+    metadata = {
+        key: manifest[key]
+        for key in ("format", "component", "conversion", "source", "schedule_format")
+        if key in manifest
+    }
+    return ModelRecord(
+        id=relative,
+        name=path.name,
+        path=str(path),
+        component=component,
+        dtype=dtype,
+        size_bytes=_directory_size(path),
+        tensor_count=tensor_count,
+        metadata=metadata,
+        export_supported=False,
+        record_type="product",
+        ready=True,
+    )
+
+
 def scan_models(workspace: Path) -> list[ModelRecord]:
     records: list[ModelRecord] = []
     for path in workspace.glob("*.safetensors"):
@@ -104,4 +163,17 @@ def scan_models(workspace: Path) -> list[ModelRecord]:
             records.append(inspect_checkpoint(path.resolve(), workspace))
         except (OSError, ValueError, json.JSONDecodeError):
             continue
+    product_roots = (workspace, workspace / "exported", workspace / "onnx_models")
+    seen_products: set[Path] = set()
+    for root in product_roots:
+        if not root.is_dir():
+            continue
+        for path in root.iterdir():
+            resolved = path.resolve()
+            if not path.is_dir() or resolved in seen_products:
+                continue
+            seen_products.add(resolved)
+            product = _validated_product(path, workspace)
+            if product is not None:
+                records.append(product)
     return sorted(records, key=lambda item: item.name.lower())

@@ -57,3 +57,46 @@ def test_classifies_acceleration_lora_from_metadata(tmp_path: Path) -> None:
 
     assert record.component == "acceleration_lora"
     assert record.export_supported is False
+
+
+def test_scans_validated_sliced_product_directory(tmp_path: Path) -> None:
+    product = tmp_path / "exported" / "minimax_h3_fl2va_scaled_fp16_tensor_core_v3"
+    product.mkdir(parents=True)
+    (product / "schedule.json").write_text("{}", encoding="utf-8")
+    (product / "shard_000.onnx").write_bytes(b"onnx")
+    (product / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "h3-workbench-onnx-v2",
+                "component": "fl2va_transformer",
+                "validation_passed": True,
+                "build_complete": True,
+                "schedule_format": "h3-schedule-v2",
+                "schedule": "schedule.json",
+                "blocks": list(range(50)),
+                "activation_dtype": "fp32_residual_scaled_fp16_mlp",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    records = scan_models(tmp_path)
+
+    assert len(records) == 1
+    assert records[0].record_type == "product"
+    assert records[0].ready is True
+    assert records[0].id == "exported/minimax_h3_fl2va_scaled_fp16_tensor_core_v3"
+    assert records[0].component == "fl2va_transformer"
+    assert records[0].tensor_count == 50
+    assert records[0].export_supported is False
+
+
+def test_ignores_unvalidated_sliced_product_directory(tmp_path: Path) -> None:
+    product = tmp_path / "onnx_models" / "partial"
+    product.mkdir(parents=True)
+    (product / "manifest.json").write_text(
+        json.dumps({"component": "fl2va_transformer", "validation_passed": False}),
+        encoding="utf-8",
+    )
+
+    assert scan_models(tmp_path) == []

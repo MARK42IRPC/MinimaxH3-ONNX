@@ -87,7 +87,9 @@ class ShardPrefetchCache:
     """Bounded SSD-to-RAM read-ahead backed by the operating system page cache."""
 
     def __init__(self, budget_bytes: int | None = None, prefetch_depth: int = DEFAULT_PREFETCH_DEPTH):
-        self.budget_bytes = default_l2_cache_bytes() if budget_bytes is None else max(0, budget_bytes)
+        self._auto_budget = budget_bytes is None
+        self._budget_cap = default_l2_cache_bytes() if budget_bytes is None else max(0, budget_bytes)
+        self.budget_bytes = self._budget_cap
         self.prefetch_depth = max(1, prefetch_depth)
         self._entries: OrderedDict[Path, _CacheEntry] = OrderedDict()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="h3-shard-prefetch")
@@ -96,6 +98,15 @@ class ShardPrefetchCache:
         self._hits = 0
         self._waits = 0
         self._wait_seconds = 0.0
+        self._budget_adjustments = 0
+        self._pressure_evictions = 0
+        try:
+            self._memory_reserve_bytes = max(
+                1 * GIB,
+                int(float(os.environ.get("H3_L2_CACHE_RESERVE_GIB", "8")) * GIB),
+            )
+        except ValueError:
+            self._memory_reserve_bytes = 8 * GIB
 
     @staticmethod
     def _warm(path: Path) -> list[_MappedFile]:
@@ -119,14 +130,17 @@ class ShardPrefetchCache:
             raise
 
     def stage(self, paths: list[Path]) -> None:
-        if self.budget_bytes <= 0:
+        with self._lock:
+            self._refresh_budget_locked()
+            budget_bytes = self.budget_bytes
+        if budget_bytes <= 0:
             return
         desired: list[tuple[Path, int]] = []
         desired_bytes = 0
         for raw_path in paths[: self.prefetch_depth]:
             path = raw_path.resolve()
             size = graph_storage_bytes(path)
-            if desired and desired_bytes + size > self.budget_bytes:
+            if desired and desired_bytes + size > budget_bytes:
                 break
             desired.append((path, size))
             desired_bytes += size
@@ -144,6 +158,36 @@ class ShardPrefetchCache:
                     continue
                 future = self._executor.submit(self._warm, path)
                 self._entries[path] = _CacheEntry(path, size, future)
+
+    def set_budget(self, budget_bytes: int) -> None:
+        """Lower or raise the active budget while retaining the cache object."""
+        with self._lock:
+            target = max(0, int(budget_bytes))
+            if self._auto_budget:
+                self._budget_cap = min(self._budget_cap, target)
+                target = min(self.budget_bytes, self._budget_cap)
+            else:
+                self._budget_cap = target
+            if target == self.budget_bytes:
+                return
+            self.budget_bytes = target
+            self._budget_adjustments += 1
+            while self._entries and sum(item.size_bytes for item in self._entries.values()) > target:
+                self._pressure_evictions += 1
+                self._remove_locked(next(iter(self._entries)))
+
+    def _refresh_budget_locked(self) -> None:
+        if not self._auto_budget:
+            return
+        available = int(psutil.virtual_memory().available)
+        target = min(self._budget_cap, max(0, available - self._memory_reserve_bytes))
+        if target >= self.budget_bytes:
+            return
+        self.budget_bytes = target
+        self._budget_adjustments += 1
+        while self._entries and sum(item.size_bytes for item in self._entries.values()) > target:
+            self._pressure_evictions += 1
+            self._remove_locked(next(iter(self._entries)))
 
     def wait(self, path: Path) -> None:
         if self.budget_bytes <= 0:
@@ -189,6 +233,9 @@ class ShardPrefetchCache:
                 "l2_hits": self._hits,
                 "l2_waits": self._waits,
                 "l2_wait_seconds": round(self._wait_seconds, 3),
+                "l2_budget_cap_bytes": self._budget_cap,
+                "l2_budget_adjustments": self._budget_adjustments,
+                "l2_pressure_evictions": self._pressure_evictions,
             }
 
     def _remove_locked(self, path: Path) -> None:

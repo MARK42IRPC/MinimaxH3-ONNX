@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import platform
-import subprocess
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -19,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
 from h3_workbench.config import Settings
+from h3_workbench.device_profile import probe_device_profiles, select_device_profile
 from h3_workbench.jobs import JobManager, resolve_main_model_directory
 from h3_workbench.memory_planner import main_model_shards, plan_shard_batches, probe_gpu_memory
 from h3_workbench.model_registry import scan_models
@@ -81,38 +81,25 @@ def _runtime_adapter_ready(directory: Path, base_model_directory: Path | None = 
 
 
 def _gpu_info() -> dict[str, object]:
-    if torch.cuda.is_available():
-        props = torch.cuda.get_device_properties(0)
-        return {
-            "available": True,
-            "name": props.name,
-            "memory_bytes": props.total_memory,
-            "cuda": torch.version.cuda,
-        }
     try:
-        flags = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=name,memory.total,driver_version",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            check=True,
-            creationflags=flags,
-            text=True,
-            timeout=3,
-        )
-        name, memory_mb, driver = [part.strip() for part in result.stdout.splitlines()[0].split(",")]
+        profiles = probe_device_profiles(refresh=True)
+        selected = select_device_profile(profiles)
         return {
-            "available": True,
-            "name": name,
-            "memory_bytes": int(memory_mb) * 1024 * 1024,
-            "driver": driver,
-            "cuda": None,
+            "available": selected.provider == "cuda",
+            "name": selected.name,
+            "memory_bytes": selected.total_bytes,
+            "free_bytes": selected.free_bytes,
+            "driver": selected.driver,
+            "cuda": (
+                selected.cuda_runtime or str(torch.version.cuda)
+                if torch.cuda.is_available()
+                else selected.cuda_runtime
+            ),
+            "selected": selected.to_dict(),
+            "devices": [item.to_dict() for item in profiles],
         }
-    except (OSError, ValueError, subprocess.SubprocessError, IndexError):
-        return {"available": False}
+    except ValueError as exc:
+        return {"available": False, "reason": str(exc), "devices": []}
 
 
 class ExportRequest(BaseModel):
@@ -124,12 +111,13 @@ class InferenceRequest(BaseModel):
     token_ids: list[int] | None = None
     prompt: str | None = None
     steps: int = Field(default=4, ge=1, le=50)
+    use_acceleration_lora: bool = False
     seed: int = 1
     width: int = Field(default=640, ge=128, le=1024)
     height: int = Field(default=360, ge=128, le=1024)
     duration_seconds: float = Field(default=17 / 24, gt=0, le=15)
     temporal_mode: Literal["native", "segmented"] = "segmented"
-    attention_query_chunk: int = Field(default=256, ge=32, le=512)
+    attention_query_chunk: int = Field(default=512, ge=32, le=512)
     l1_prefetch_shards: int = Field(default=2, ge=0, le=4)
 
     @model_validator(mode="after")
@@ -140,6 +128,8 @@ class InferenceRequest(BaseModel):
             raise ValueError("token_ids must contain at most 192 items")
         if self.prompt is not None and len(self.prompt) > 4000:
             raise ValueError("prompt must contain at most 4000 characters")
+        if self.use_acceleration_lora and not 4 <= self.steps <= 8:
+            raise ValueError("Turbo v4 acceleration LoRA supports 4-8 sampling steps")
         if self.attention_query_chunk not in {32, 64, 128, 256, 512}:
             raise ValueError("attention_query_chunk must be one of 32, 64, 128, 256, or 512")
         return self
@@ -452,6 +442,7 @@ def create_inference(request: InferenceRequest) -> dict[str, object]:
             request.temporal_mode,
             request.attention_query_chunk,
             request.l1_prefetch_shards,
+            use_acceleration_lora=request.use_acceleration_lora,
         ).to_dict()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -465,6 +456,7 @@ def health() -> dict[str, str]:
 @app.get("/api/profiles")
 def generation_profiles() -> list[dict[str, object]]:
     snapshot = probe_gpu_memory()
+    device_profiles = probe_device_profiles()
     providers = ort.get_available_providers()
     main_directory = resolve_main_model_directory(settings.workspace, settings.output_dir, accelerated=False)
     turbo_preset = next(item for item in EXPORT_PRESETS if item.id == "fl2va_turbo_v4")
@@ -500,6 +492,8 @@ def generation_profiles() -> list[dict[str, object]]:
                 **profile.to_dict(),
                 "memory": snapshot.to_dict(),
                 "cuda_provider_available": "CUDAExecutionProvider" in providers,
+                "device": snapshot.to_dict(),
+                "device_profiles": [item.to_dict() for item in device_profiles],
                 "qwen_ready": qwen_ready,
                 "main_ready": main_ready,
                 "acceleration_ready": acceleration_ready,

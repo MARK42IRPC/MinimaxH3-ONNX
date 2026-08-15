@@ -15,7 +15,11 @@ from typing import Any
 
 import numpy as np
 import onnx
+import psutil
 from onnx import TensorProto, helper, numpy_helper
+
+from h3_workbench.device_profile import selected_device_index
+from h3_workbench.shard_cache import GIB, graph_storage_bytes
 
 
 PERSISTENT_TOPOLOGIES = {
@@ -23,6 +27,40 @@ PERSISTENT_TOPOLOGIES = {
     "mlp": "runtime_persistent_scaled_mlp.onnx",
     "attention_output": "runtime_persistent_scaled_attention_output.onnx",
 }
+
+RAM_CACHE_KINDS = ("attention_qkv", "attention_output", "mlp")
+
+
+def host_weight_ram_cache_budget_bytes() -> int:
+    """Return a safe host-RAM budget for persistent CUDA weights.
+
+    The model is larger than the current 32 GiB workstation, so auto mode
+    deliberately leaves room for ORT sessions, activations, the L2 read-ahead
+    window, and the rest of Windows. An explicit size is still clamped by the
+    same safety reserve to avoid turning a tuning variable into swap pressure.
+    """
+    setting = os.environ.get("H3_WEIGHT_RAM_CACHE", "auto").strip().lower()
+    if setting not in {"auto", "0", "1", "true", "false", "on", "off", "yes", "no"}:
+        raise ValueError("H3_WEIGHT_RAM_CACHE must be auto, 0, or 1")
+    if setting in {"0", "false", "off", "no"}:
+        return 0
+    available = int(psutil.virtual_memory().available)
+    try:
+        reserve_gib = max(8.0, float(os.environ.get("H3_WEIGHT_RAM_RESERVE_GIB", "12")))
+    except ValueError:
+        reserve_gib = 12.0
+    try:
+        l2_reserve_gib = max(1.0, float(os.environ.get("H3_WEIGHT_L2_RESERVE_GIB", "2")))
+    except ValueError:
+        l2_reserve_gib = 2.0
+    safe_budget = max(0, available - int((reserve_gib + l2_reserve_gib) * GIB))
+    override = os.environ.get("H3_WEIGHT_RAM_CACHE_GIB")
+    if override:
+        try:
+            return min(safe_budget, max(0, int(float(override) * GIB)))
+        except ValueError:
+            pass
+    return safe_budget
 
 
 def device_prefetch_admitted(
@@ -269,7 +307,30 @@ class DeviceWeightFeed:
         self.shape = shape
 
     def bind_input(self, binding: Any, name: str) -> None:
-        binding.bind_input(name, "cuda", 0, self.dtype, self.shape, self.pointer)
+        binding.bind_input(name, "cuda", selected_device_index(), self.dtype, self.shape, self.pointer)
+
+
+class _CudaUploadStream:
+    def __init__(self, cuda_runtime: Any) -> None:
+        self.cuda_runtime = cuda_runtime
+        self.pointer = ctypes.c_void_p()
+        error = cuda_runtime.cudaStreamCreateWithFlags(ctypes.byref(self.pointer), 1)
+        if error:
+            raise OSError(f"cudaStreamCreateWithFlags failed with CUDA error {error}")
+
+    def synchronize(self) -> None:
+        if self.pointer.value:
+            error = self.cuda_runtime.cudaStreamSynchronize(self.pointer)
+            if error:
+                raise OSError(f"cudaStreamSynchronize failed with CUDA error {error}")
+
+    def close(self) -> None:
+        if self.pointer.value:
+            self.synchronize()
+            error = self.cuda_runtime.cudaStreamDestroy(self.pointer)
+            if error:
+                raise OSError(f"cudaStreamDestroy failed with CUDA error {error}")
+            self.pointer = ctypes.c_void_p()
 
 
 class _CudaDeviceBuffer:
@@ -281,15 +342,27 @@ class _CudaDeviceBuffer:
         if error:
             raise OSError(f"cudaMalloc failed with CUDA error {error}")
 
-    def copy_from(self, offset: int, array: np.ndarray) -> None:
-        error = self.cuda_runtime.cudaMemcpy(
-            ctypes.c_void_p(int(self.pointer.value) + offset),
-            ctypes.c_void_p(array.ctypes.data),
-            array.nbytes,
-            1,  # cudaMemcpyHostToDevice
+    def copy_from(self, offset: int, array: np.ndarray, stream: _CudaUploadStream | None = None) -> None:
+        destination = ctypes.c_void_p(int(self.pointer.value) + offset)
+        source = ctypes.c_void_p(array.ctypes.data)
+        error = (
+            self.cuda_runtime.cudaMemcpyAsync(
+                destination,
+                source,
+                array.nbytes,
+                1,  # cudaMemcpyHostToDevice
+                stream.pointer,
+            )
+            if stream is not None
+            else self.cuda_runtime.cudaMemcpy(
+                destination,
+                source,
+                array.nbytes,
+                1,  # cudaMemcpyHostToDevice
+            )
         )
         if error:
-            raise OSError(f"cudaMemcpy failed with CUDA error {error}")
+            raise OSError(f"CUDA host-to-device copy failed with error {error}")
 
     def close(self) -> None:
         if self.pointer.value:
@@ -372,6 +445,23 @@ def _load_cuda_runtime() -> Any | None:
             ctypes.c_int,
         ]
         runtime.cudaMemcpy.restype = ctypes.c_int
+        runtime.cudaMemcpyAsync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        runtime.cudaMemcpyAsync.restype = ctypes.c_int
+        runtime.cudaStreamCreateWithFlags.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint,
+        ]
+        runtime.cudaStreamCreateWithFlags.restype = ctypes.c_int
+        runtime.cudaStreamSynchronize.argtypes = [ctypes.c_void_p]
+        runtime.cudaStreamSynchronize.restype = ctypes.c_int
+        runtime.cudaStreamDestroy.argtypes = [ctypes.c_void_p]
+        runtime.cudaStreamDestroy.restype = ctypes.c_int
         return runtime
     return None
 
@@ -467,8 +557,12 @@ class LoadedWeights:
         self._leases: list[_HostBufferLease] = []
         self._device_arrays: dict[str, DeviceWeightFeed] = {}
         self._device_buffer: _CudaDeviceBuffer | None = None
+        self._device_upload_stream: _CudaUploadStream | None = None
+        self._device_upload_started = 0.0
+        self._device_metrics_recorded = False
         self.device_bytes = 0
         self.upload_seconds = 0.0
+        self.upload_wait_seconds = 0.0
         locations = list(
             dict.fromkeys(item.location for item in actual if item.location is not None)
         )
@@ -561,12 +655,14 @@ class LoadedWeights:
             offsets[name] = total
             total += array.nbytes
         buffer = _CudaDeviceBuffer(cuda_runtime, total)
+        stream = _CudaUploadStream(cuda_runtime)
         uploaded: dict[str, DeviceWeightFeed] = {}
         try:
             for name, array in self.arrays.items():
                 contiguous = array if array.flags.c_contiguous else np.ascontiguousarray(array)
+                self.arrays[name] = contiguous
                 offset = offsets[name]
-                buffer.copy_from(offset, contiguous)
+                buffer.copy_from(offset, contiguous, stream)
                 uploaded[name] = DeviceWeightFeed(
                     int(buffer.pointer.value) + offset,
                     contiguous.dtype,
@@ -574,12 +670,24 @@ class LoadedWeights:
                 )
         except Exception:
             uploaded.clear()
+            stream.close()
             buffer.close()
             raise
         self._device_arrays = uploaded
         self._device_buffer = buffer
+        self._device_upload_stream = stream
+        self._device_upload_started = started
         self.device_bytes = sum(array.nbytes for array in self.arrays.values())
-        self.upload_seconds = time.perf_counter() - started
+
+    def _finish_device_upload(self) -> None:
+        stream = self._device_upload_stream
+        if stream is None:
+            return
+        wait_started = time.perf_counter()
+        stream.close()
+        self.upload_wait_seconds += time.perf_counter() - wait_started
+        self.upload_seconds = time.perf_counter() - self._device_upload_started
+        self._device_upload_stream = None
         self.arrays.clear()
         self._storage.clear()
         for lease in self._leases:
@@ -587,9 +695,11 @@ class LoadedWeights:
         self._leases.clear()
 
     def feeds(self) -> dict[str, Any]:
+        self._finish_device_upload()
         return dict(self._device_arrays or self.arrays)
 
     def close(self) -> None:
+        self._finish_device_upload()
         self._device_arrays.clear()
         if self._device_buffer is not None:
             self._device_buffer.close()
@@ -669,11 +779,53 @@ class PersistentWeightRuntime:
             max_workers=self._prefetch_workers,
             thread_name_prefix="h3-weight-prefetch",
         )
+        cuda_weights = getattr(runner, "provider", "CPUExecutionProvider") == "CUDAExecutionProvider"
         use_pinned = (
-            getattr(runner, "provider", "CPUExecutionProvider") == "CUDAExecutionProvider"
+            cuda_weights
             and os.environ.get("H3_PINNED_WEIGHTS", "1") != "0"
         )
         self._host_pool = HostWeightPool(use_pinned=use_pinned)
+        self._ram_cache_lock = threading.Lock()
+        self._ram_cache_budget = host_weight_ram_cache_budget_bytes() if cuda_weights else 0
+        self._ram_cache_candidates: dict[str, int] = {}
+        candidate_bytes = 0
+        for kind in RAM_CACHE_KINDS:
+            for graph, path in self.graph_paths.items():
+                if _graph_kind(graph) != kind or kind not in self.topology_inputs:
+                    continue
+                # Include parsing metadata and allocator slack in admission.
+                estimated = max(1, int(graph_storage_bytes(path) * 1.05))
+                if candidate_bytes + estimated > self._ram_cache_budget:
+                    continue
+                self._ram_cache_candidates[graph] = estimated
+                candidate_bytes += estimated
+        self._ram_weights: dict[str, LoadedWeights] = {}
+        self._ram_pending: dict[str, Future[LoadedWeights]] = {}
+        self._ram_cache_resident_bytes = 0
+        self._ram_cache_hits = 0
+        self._ram_cache_misses = 0
+        self._ram_cache_load_seconds = 0.0
+        try:
+            ram_workers = max(1, min(4, int(os.environ.get("H3_WEIGHT_RAM_WORKERS", "2"))))
+        except ValueError:
+            ram_workers = 2
+        self._ram_executor = (
+            ThreadPoolExecutor(
+                max_workers=min(ram_workers, len(self._ram_cache_candidates)),
+                thread_name_prefix="h3-weight-ram-cache",
+            )
+            if self._ram_cache_candidates
+            else None
+        )
+        shard_cache = getattr(runner, "shard_cache", None)
+        if (
+            self._ram_cache_candidates
+            and shard_cache is not None
+            and "H3_L2_CACHE_GIB" not in os.environ
+        ):
+            # RAM-resident weights and mmap read-ahead must share one host
+            # budget. Two GiB is enough to keep several uncached shards ahead.
+            shard_cache.set_budget(min(shard_cache.budget_bytes, 2 * GIB))
         device_setting = os.environ.get("H3_DEVICE_WEIGHT_PREFETCH", "auto").strip().lower()
         if device_setting not in {"auto", "0", "1"}:
             raise ValueError("H3_DEVICE_WEIGHT_PREFETCH must be auto, 0, or 1")
@@ -712,6 +864,7 @@ class PersistentWeightRuntime:
             "persistent_device_prefetch_failures": 0,
             "persistent_device_prefetch_bytes": 0,
             "persistent_device_prefetch_seconds": 0.0,
+            "persistent_device_prefetch_wait_seconds": 0.0,
         }
 
     @property
@@ -741,7 +894,7 @@ class PersistentWeightRuntime:
     @property
     def device_metrics(self) -> dict[str, int | float | bool]:
         with self._device_lock:
-            return {
+            device = {
                 **self._device_metrics,
                 "persistent_device_prefetch_enabled": self._device_prefetch_enabled,
                 "persistent_device_total_bytes": self._device_total_bytes,
@@ -749,8 +902,71 @@ class PersistentWeightRuntime:
                 "persistent_device_prefetch_reserve_bytes": self._device_reserve_bytes,
                 "persistent_device_prefetch_slot_limit": self._device_slot_limit,
             }
+        with self._ram_cache_lock:
+            return {
+                **device,
+                "persistent_ram_cache_enabled": bool(self._ram_cache_candidates),
+                "persistent_ram_cache_budget_bytes": self._ram_cache_budget,
+                "persistent_ram_cache_candidate_bytes": sum(
+                    self._ram_cache_candidates.values()
+                ),
+                "persistent_ram_cache_candidate_entries": len(self._ram_cache_candidates),
+                "persistent_ram_cache_resident_bytes": self._ram_cache_resident_bytes,
+                "persistent_ram_cache_resident_entries": len(self._ram_weights),
+                "persistent_ram_cache_hits": self._ram_cache_hits,
+                "persistent_ram_cache_misses": self._ram_cache_misses,
+                "persistent_ram_cache_load_seconds": round(self._ram_cache_load_seconds, 3),
+            }
+
+    def prime_ram_cache(self) -> dict[str, int | float | bool]:
+        """Queue the selected task working set before the first denoise graph."""
+        executor = self._ram_executor
+        if executor is None:
+            return {
+                "ram_cache_enabled": False,
+                "ram_cache_budget_bytes": self._ram_cache_budget,
+                "ram_cache_scheduled": 0,
+            }
+        scheduled = 0
+        with self._ram_cache_lock:
+            for graph in self._ram_cache_candidates:
+                if graph in self._ram_weights or graph in self._ram_pending:
+                    continue
+                kind = _graph_kind(graph)
+                if kind not in self.topology_inputs:
+                    continue
+                self._ram_pending[graph] = executor.submit(self._load_weights, graph, kind)
+                scheduled += 1
+        return {
+            "ram_cache_enabled": True,
+            "ram_cache_budget_bytes": self._ram_cache_budget,
+            "ram_cache_candidate_bytes": sum(self._ram_cache_candidates.values()),
+            "ram_cache_candidate_entries": len(self._ram_cache_candidates),
+            "ram_cache_scheduled": scheduled,
+        }
 
     def _load_weights(self, graph: str, kind: str) -> LoadedWeights:
+        if graph in self._ram_cache_candidates:
+            with self._ram_cache_lock:
+                cached = self._ram_weights.get(graph)
+                if cached is not None:
+                    self._ram_cache_hits += 1
+                    return cached
+            loaded = LoadedWeights(
+                self.graph_paths[graph],
+                self.topology_inputs[kind],
+            )
+            with self._ram_cache_lock:
+                cached = self._ram_weights.get(graph)
+                if cached is not None:
+                    loaded.close()
+                    self._ram_cache_hits += 1
+                    return cached
+                self._ram_weights[graph] = loaded
+                self._ram_cache_resident_bytes += loaded.host_bytes
+                self._ram_cache_misses += 1
+                self._ram_cache_load_seconds += loaded.load_seconds
+            return loaded
         loaded = LoadedWeights(
             self.graph_paths[graph],
             self.topology_inputs[kind],
@@ -798,7 +1014,6 @@ class PersistentWeightRuntime:
             self._device_active_slots += 1
             self._device_metrics["persistent_device_prefetch_hits"] += 1
             self._device_metrics["persistent_device_prefetch_bytes"] += loaded.device_bytes
-            self._device_metrics["persistent_device_prefetch_seconds"] += loaded.upload_seconds
         return loaded
 
     def supports(self, graph: str) -> bool:
@@ -829,12 +1044,21 @@ class PersistentWeightRuntime:
     def prefetch(self, graph: str) -> bool:
         if not self.supports(graph) or self._prefetch_depth == 0:
             return False
-        if graph in self._weights or graph in self._pending:
-            return False
-        if len(self._weights) + len(self._pending) >= self._prefetch_depth:
-            return False
         kind = _graph_kind(graph)
         if kind not in self.topology_inputs:
+            return False
+        if graph in self._ram_cache_candidates:
+            executor = self._ram_executor
+            if executor is None:
+                return False
+            with self._ram_cache_lock:
+                if graph in self._ram_weights or graph in self._ram_pending:
+                    return False
+                self._ram_pending[graph] = executor.submit(self._load_weights, graph, kind)
+            return True
+        if len(self._weights) + len(self._pending) >= self._prefetch_depth:
+            return False
+        if graph in self._weights or graph in self._pending:
             return False
         self._pending[graph] = self._executor.submit(
             self._load_weights,
@@ -864,7 +1088,12 @@ class PersistentWeightRuntime:
         kind = _graph_kind(graph)
         if kind not in self.topology_inputs:
             raise KeyError(graph)
-        pending = self._pending.pop(graph, None)
+        ram_resident_before = graph in self._ram_weights
+        if graph in self._ram_cache_candidates:
+            with self._ram_cache_lock:
+                pending = self._ram_pending.pop(graph, None)
+        else:
+            pending = self._pending.pop(graph, None)
         prefetched = pending is not None
         wait_started = time.perf_counter()
         loaded = (
@@ -873,15 +1102,24 @@ class PersistentWeightRuntime:
             else self._load_weights(graph, kind)
         )
         wait_seconds = time.perf_counter() - wait_started
+        feeds = loaded.feeds()
+        upload_wait_seconds = float(getattr(loaded, "upload_wait_seconds", 0.0))
+        wait_seconds += upload_wait_seconds
+        if loaded.device_resident and not getattr(loaded, "_device_metrics_recorded", False):
+            loaded._device_metrics_recorded = True
+            with self._device_lock:
+                self._device_metrics["persistent_device_prefetch_seconds"] += loaded.upload_seconds
+                self._device_metrics["persistent_device_prefetch_wait_seconds"] += upload_wait_seconds
         self._weights[graph] = loaded
+        mapped = not ram_resident_before
         return (
-            loaded.feeds(),
+            feeds,
             loaded.total_bytes,
             loaded.host_bytes,
             loaded.pinned_bytes,
             loaded.device_bytes,
-            True,
-            loaded.load_seconds,
+            mapped,
+            loaded.load_seconds if mapped else 0.0,
             wait_seconds,
             loaded.upload_seconds,
             prefetched,
@@ -891,6 +1129,9 @@ class PersistentWeightRuntime:
     def release(self, graph: str) -> None:
         loaded = self._weights.pop(graph, None)
         if loaded is not None:
+            if graph in self._ram_cache_candidates:
+                # The task-level cache owns this object across sampling steps.
+                return
             device_resident = loaded.device_resident
             loaded.close()
             if device_resident:
@@ -901,13 +1142,24 @@ class PersistentWeightRuntime:
         self._sessions.clear()
         pending = list(self._pending.values())
         self._pending.clear()
+        ram_pending = list(self._ram_pending.values())
+        self._ram_pending.clear()
         self._executor.shutdown(wait=True, cancel_futures=True)
+        if self._ram_executor is not None:
+            self._ram_executor.shutdown(wait=True, cancel_futures=True)
         for future in pending:
             if not future.cancelled() and future.exception() is None:
                 future.result().close()
+        for future in ram_pending:
+            if not future.cancelled() and future.exception() is None:
+                future.result().close()
         for weights in self._weights.values():
-            weights.close()
+            if weights not in self._ram_weights.values():
+                weights.close()
         self._weights.clear()
+        for weights in self._ram_weights.values():
+            weights.close()
+        self._ram_weights.clear()
         self._host_pool.close()
 
 

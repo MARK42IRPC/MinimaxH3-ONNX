@@ -33,11 +33,41 @@ dev = [
   "pytest==9.0.2",
   "ruff==0.15.1",
 ]
+gpu = [
+  "cuda-python>=12.6,<13",
+  "cupy-cuda12x>=14.1.1",
+  "nvidia-cutlass>=4.2.0.0",
+]
+tensorrt = [
+  "tensorrt-cu12==10.9.0.34",
+]
+
+[[tool.uv.index]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+tensorrt-cu12 = { index = "nvidia" }
+tensorrt-cu12-bindings = { index = "nvidia" }
+tensorrt-cu12-libs = { index = "nvidia" }
 
 [project.scripts]
 h3-workbench = "h3_workbench.__main__:main"
 h3-infer = "h3_workbench.inference_cli:main"
 h3-main-benchmark = "h3_workbench.main_benchmark:main"
+h3-gpu-backend-benchmark = "h3_workbench.gpu_backend_benchmark:main"
 h3-mlp-precision-benchmark = "h3_workbench.mlp_precision_benchmark:main"
 h3-scaled-mlp-export = "h3_workbench.scaled_mlp_export:main"
 h3-scaled-attention-export = "h3_workbench.scaled_attention_export:main"
@@ -57,8 +87,3 @@ target-version = "py311"
 
 [tool.uv]
 environments = ["sys_platform == 'win32'"]
-
-[[tool.uv.index]]
-name = "tsinghua"
-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
-default = true

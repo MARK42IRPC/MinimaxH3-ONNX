@@ -376,22 +376,26 @@ function renderComponents() {
 
 function renderModels() {
   const body = $("#modelsBody");
-  $("#modelCount").textContent = `${state.models.length} 个文件`;
+  $("#modelCount").textContent = `${state.models.length} 个模型资产`;
   $("#modelsEmpty").classList.toggle("hidden", state.models.length > 0 || !state.loaded.models);
   if (!state.loaded.models) {
     body.innerHTML = '<tr><td colspan="7"><div class="loading-state compact"><span class="spinner"></span>正在扫描原模型</div></td></tr>';
     return;
   }
   body.innerHTML = state.models.map((model, index) => {
+    const product = model.record_type === "product";
     const supported = Boolean(model.export_supported);
-    let scope = '<span class="type-pill">Encoder + Decoder</span>';
-    if (model.component === "video_vae") {
+    let scope = product ? '<span class="type-pill">已验证切片</span>' : '<span class="type-pill">Encoder + Decoder</span>';
+    if (!product && model.component === "video_vae") {
       scope = `<select class="scope-select" data-model-index="${index}" aria-label="Video VAE 切片范围"><option value="0">Block 0 冒烟验证</option><option value="all">全部 36 Blocks</option></select>`;
-    } else if (["fl2va_transformer", "ref2va_transformer"].includes(model.component)) {
+    } else if (!product && ["fl2va_transformer", "ref2va_transformer"].includes(model.component)) {
       scope = `<select class="scope-select" data-model-index="${index}" aria-label="主模型切片范围"><option value="0">Block 0 冒烟验证</option><option value="all">全部 50 Blocks</option></select>`;
-    } else if (model.component === "text_encoder") {
+    } else if (!product && model.component === "text_encoder") {
       scope = `<span class="type-pill">全部 50 Layers</span>`;
     }
+    const action = product
+      ? '<span class="status-pill ready">已识别</span>'
+      : `<button class="secondary-button table-action export-button" type="button" data-model-index="${index}" ${supported ? "" : "disabled"}>切片并验证</button>`;
     return `<tr>
       <td><span class="model-name" title="${escapeHtml(model.name)}">${escapeHtml(model.name)}</span><span class="model-path" title="${escapeHtml(model.id)}">${escapeHtml(model.id)}</span></td>
       <td><span class="type-pill">${escapeHtml(componentLabel(model.component))}</span></td>
@@ -399,7 +403,7 @@ function renderModels() {
       <td>${formatBytes(model.size_bytes)}</td>
       <td>${escapeHtml(model.tensor_count ?? "--")}</td>
       <td>${scope}</td>
-      <td><button class="secondary-button table-action export-button" type="button" data-model-index="${index}" ${supported ? "" : "disabled"}>切片并验证</button></td>
+      <td>${action}</td>
     </tr>`;
   }).join("");
 }
@@ -486,22 +490,23 @@ function renderProfiles() {
   const mode = temporalMode();
   const segments = mode === "segmented" ? Math.ceil(targetFrames / profile.frames) : 1;
   const turboSteps = steps >= 4 && steps <= 8;
+  const accelerationRequested = $("#accelerationLoraInput").checked;
   const baseReady = Boolean(profile.main_ready);
   const adapterReady = Boolean(profile.acceleration_ready);
-  const accelerationActive = Boolean(baseReady && adapterReady && turboSteps);
+  const accelerationActive = Boolean(accelerationRequested && baseReady && adapterReady && turboSteps);
   const latentFrames = mode === "native" ? videoLatentFramesForOutput(targetFrames) : profile.video_latent_frames;
   const audioTokens = mode === "native" ? Math.ceil(targetFrames * 40 / profile.fps) * 2 : profile.audio_tokens;
   const videoTokens = latentFrames * (paddedHeight / 32) * (paddedWidth / 32);
   const sequenceTokens = profile.text_tokens + audioTokens + videoTokens;
   const qkvCpuBytes = sequenceTokens * 56 * 384 * 2;
   const kvGpuBytes = sequenceTokens * 56 * 128 * 2 * 2;
-  const queryChunk = Number($("#queryChunkSelect").value) || 256;
+  const queryChunk = Number($("#queryChunkSelect").value) || 512;
   const videoReady = presetProductReady("video_vae");
   const audioReady = presetProductReady("audio_vae");
   const contentReady = Boolean(prompt || tokens.values.length) && tokens.valid;
   const tokenizerReady = !prompt || Boolean(profile.tokenizer_ready);
   const mainReady = baseReady;
-  const stepScheduleReady = !turboSteps || accelerationActive;
+  const stepScheduleReady = !accelerationRequested || (turboSteps && accelerationActive);
   const dimensionsReady = width >= 128 && width <= 1024 && height >= 128 && height <= 1024;
   const componentsKnown = state.loaded.presets;
   const mediaReady = !componentsKnown || (videoReady === true && audioReady === true);
@@ -514,7 +519,7 @@ function renderProfiles() {
     ["执行后端", profile.cuda_provider_available ? "CUDAExecutionProvider 可用" : "将使用 CPUExecutionProvider", profile.cuda_provider_available ? "passed" : "warning", profile.cuda_provider_available ? "CUDA" : "CPU"],
     ["Qwen 文本编码器", profile.qwen_ready ? "验证产物可用" : "缺少或未通过验证", profile.qwen_ready ? "passed" : "failed", profile.qwen_ready ? "通过" : "阻塞"],
     ["FL2VA 流式基座", mainReady ? "50 Block 基座产物可用" : "缺少或未通过验证", mainReady ? "passed" : "failed", mainReady ? "通过" : "阻塞"],
-    ["Turbo v4 动态 LoRA", turboSteps ? adapterReady ? "运行时适配器已就绪，将动态叠加" : "4–8 步必须先生成动态适配器" : adapterReady ? "适配器已就绪，当前步数不启用" : "当前步数使用基座，不要求适配器", stepScheduleReady ? "passed" : "failed", accelerationActive ? "启用" : stepScheduleReady ? "不启用" : "阻塞"],
+    ["Turbo v4 动态 LoRA", !accelerationRequested ? "手动关闭，使用流式基座" : !turboSteps ? "已开启，但仅支持 4–8 步" : adapterReady ? "手动开启，将动态叠加" : "已开启，但运行时适配器未就绪", stepScheduleReady ? "passed" : "failed", accelerationActive ? "启用" : stepScheduleReady ? "未启用" : "阻塞"],
     ["Video / Audio VAE", !componentsKnown ? "组件状态尚未返回" : mediaReady ? "编码与解码组件均可用" : "缺少 Video VAE 或 Audio VAE", !componentsKnown ? "warning" : mediaReady ? "passed" : "failed", !componentsKnown ? "待检查" : mediaReady ? "通过" : "阻塞"],
     ["文本输入", contentReady && tokenizerReady ? (prompt ? "Tokenizer 与提示词可用" : `${tokens.values.length} 个 Token IDs`) : !tokens.valid ? tokens.message : prompt ? "Tokenizer 文件不完整" : "请输入提示词或 Token IDs", contentReady && tokenizerReady ? "passed" : "failed", contentReady && tokenizerReady ? "通过" : "阻塞"],
     ["输出规格", dimensionsReady ? `${width} × ${height}，${targetFrames} 帧` : "宽高必须在 128–1024 之间", dimensionsReady ? "passed" : "failed", dimensionsReady ? "通过" : "阻塞"],
@@ -537,7 +542,8 @@ function renderProfiles() {
 
   const notices = [];
   if (!profile.cuda_provider_available) notices.push("当前 ONNX Runtime 没有 CUDAExecutionProvider，CPU 执行会非常缓慢。");
-  if (!adapterReady && turboSteps) notices.push("4–8 步要求 Turbo v4 动态 LoRA；系统不会静默回退到基座低步数，请先在模型页生成适配器。");
+  if (accelerationRequested && !turboSteps) notices.push("Turbo v4 加速 LoRA 仅支持 4–8 步，请调整采样步数或关闭加速 LoRA。");
+  if (accelerationRequested && turboSteps && !adapterReady) notices.push("已手动开启 Turbo v4 加速 LoRA，但适配器未就绪，请先在模型页生成适配器。");
   if (!baseReady && adapterReady) notices.push("动态 LoRA 不能独立运行，请先完成 FL2VA 流式基座。");
   if (mode === "segmented" && segments > 1) notices.push("分段模式尚未接入首帧续接，多段画面可能出现跳变。");
   if (mode === "native" && targetFrames > profile.frames) notices.push("长序列 Video VAE 会使用 GPU 时间窗口解码。");
@@ -1135,6 +1141,7 @@ async function startInference(event) {
         prompt: prompt || null,
         token_ids: prompt ? null : tokens.values,
         steps: Number($("#stepsInput").value),
+        use_acceleration_lora: $("#accelerationLoraInput").checked,
         seed: Number($("#seedInput").value),
         width: Number($("#widthInput").value),
         height: Number($("#heightInput").value),
@@ -1200,6 +1207,7 @@ function bindEvents() {
     .forEach((selector) => $(selector).addEventListener("input", renderProfiles));
   ["#widthInput", "#heightInput"].forEach((selector) => $(selector).addEventListener("input", renderProfiles));
   $$('input[name="temporalMode"]').forEach((input) => input.addEventListener("change", renderProfiles));
+  $("#accelerationLoraInput").addEventListener("change", renderProfiles);
   $("#exportPresetList").addEventListener("click", (event) => {
     const button = event.target.closest(".preset-export-button");
     if (button) startPresetExport(button.dataset.preset, button);

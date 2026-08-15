@@ -105,7 +105,7 @@
 
         <details class="workspace-section source-inventory">
           <summary>
-            <span><strong>本地原模型</strong><small>查看工作区中已识别的 Safetensors，并可单独执行切片验证</small></span>
+            <span><strong>本地模型资产</strong><small>查看原模型与已验证的本地切片产品</small></span>
             <span class="section-count" id="modelCount">0 个文件</span>
           </summary>
           <div class="table-wrap">
@@ -113,7 +113,7 @@
               <thead><tr><th>文件</th><th>组件</th><th>精度</th><th>大小</th><th>张量</th><th>切片范围</th><th><span class="sr-only">操作</span></th></tr></thead>
               <tbody id="modelsBody"></tbody>
             </table>
-            <div class="empty-state hidden" id="modelsEmpty"><strong>没有识别到原模型</strong><span>可从上方验证方案启动下载。</span></div>
+            <div class="empty-state hidden" id="modelsEmpty"><strong>没有识别到模型资产</strong><span>可从上方验证方案启动下载。</span></div>
           </div>
         </details>
       </section>
@@ -149,6 +149,14 @@
                   <label><input type="radio" name="temporalMode" value="native"><span><strong>整体长序列</strong><small>保持完整时间序列，显存需求更高</small></span></label>
                 </div>
               </fieldset>
+              <fieldset class="mode-field acceleration-field">
+                <legend>加速 LoRA</legend>
+                <label class="toggle-field">
+                  <input id="accelerationLoraInput" type="checkbox">
+                  <span class="toggle-control" aria-hidden="true"><i></i></span>
+                  <span class="toggle-copy"><strong>加载 Turbo v4 加速 LoRA</strong><small>手动开启，仅支持 4–8 步；关闭时始终使用流式基座</small></span>
+                </label>
+              </fieldset>
             </section>
 
             <details class="form-section advanced-section">
@@ -156,7 +164,7 @@
               <div class="advanced-content">
                 <div class="field-grid columns-3">
                   <label class="field"><span>随机种子</span><input id="seedInput" type="number" value="1" step="1" inputmode="numeric"></label>
-                  <label class="field"><span>Query 分块</span><select id="queryChunkSelect"><option>32</option><option>64</option><option>128</option><option selected>256</option><option>512</option></select></label>
+                  <label class="field"><span>Query 分块上限</span><select id="queryChunkSelect"><option>32</option><option>64</option><option>128</option><option>256</option><option selected>512</option></select></label>
                   <label class="field"><span>L1 预取</span><select id="l1PrefetchSelect"><option value="0">关闭</option><option value="1">1 个切片</option><option value="2" selected>2 个切片</option><option value="3">3 个切片</option><option value="4">4 个切片</option></select></label>
                   <label class="field custom-size"><span>宽度</span><input id="widthInput" type="number" value="640" min="128" max="1024" step="16" inputmode="numeric"></label>
                   <label class="field custom-size"><span>高度</span><input id="heightInput" type="number" value="360" min="128" max="1024" step="8" inputmode="numeric"></label>

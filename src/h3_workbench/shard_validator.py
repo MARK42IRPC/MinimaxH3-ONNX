@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import onnxruntime as ort
 
+from h3_workbench.device_profile import selected_device_index
 from h3_workbench.inference_runtime import streamed_attention
 from h3_workbench.shard_planner import file_sha256, validate_schedule
 
@@ -122,7 +123,13 @@ def _session(path: Path, provider: str) -> ort.InferenceSession:
     options.enable_cpu_mem_arena = True
     providers = ["CUDAExecutionProvider"] if provider == "cuda" else ["CPUExecutionProvider"]
     provider_options = (
-        [{"arena_extend_strategy": "kSameAsRequested", "cudnn_conv_use_max_workspace": "0"}]
+        [
+            {
+                "arena_extend_strategy": "kSameAsRequested",
+                "cudnn_conv_use_max_workspace": "0",
+                "device_id": str(selected_device_index()),
+            }
+        ]
         if provider == "cuda"
         else [{}]
     )
