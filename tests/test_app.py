@@ -1,3 +1,4 @@
+import json
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 import pytest
@@ -13,20 +14,23 @@ def test_health() -> None:
     assert response.json() == {"status": "ok"}
 
 
-def test_model_components_exposes_download_catalog() -> None:
-    response = TestClient(app).get("/api/model-components")
+def test_export_presets_expose_direct_source_and_local_product_state() -> None:
+    response = TestClient(app).get("/api/export-presets")
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["repo"] == "Mark42IRPC/Minimax-H3-int8-fl2va-onnx-50CLIPS"
-    assert payload["project"].endswith("MARK42IRPC/MinimaxH3-ONNX")
-    assert {item["id"] for item in payload["components"]} == {"qwen", "turbo", "streaming", "video_vae", "audio_vae", "tokenizer"}
+    assert payload["download_mode"] == "direct_http_range"
+    qwen = next(item for item in payload["presets"] if item["id"] == "qwen")
+    assert qwen["source"]["url"].startswith("https://")
+    assert qwen["output_dir"].endswith("_int8_virtual")
+    assert qwen["output_size_bytes"] < 1024**2
+    assert qwen["status"] in {"download_required", "source_ready", "ready"}
 
 
-def test_download_rejects_unknown_component() -> None:
+def test_old_sliced_product_download_endpoint_is_removed() -> None:
     response = TestClient(app).post("/api/jobs/download", json={"components": ["not-a-model"]})
 
-    assert response.status_code == 400
+    assert response.status_code == 405
 
 
 def test_export_presets_only_expose_validated_variants() -> None:
@@ -34,13 +38,51 @@ def test_export_presets_only_expose_validated_variants() -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["official_repo"] == "Comfy-Org/MiniMax-H3"
     assert {item["id"] for item in payload["presets"]} == {
-        "audio_vae", "video_vae", "qwen", "fl2va_streaming", "fl2va_turbo_v4"
+        "tokenizer", "audio_vae", "video_vae", "qwen", "fl2va_streaming", "fl2va_turbo_v4"
     }
     turbo = next(item for item in payload["presets"] if item["id"] == "fl2va_turbo_v4")
-    assert turbo["lora"]["path"] == "minimax_h3_turbo_v4_step600_ema.safetensors"
+    assert turbo["label"] == "Turbo v4 动态 LoRA"
+    assert turbo["component"] == "acceleration_lora"
+    assert turbo["product_type"] == "runtime_adapter"
+    assert turbo["depends_on"] == ["fl2va_streaming"]
+    assert turbo["source"]["path"] == "minimax_h3_turbo_v4_step600_ema.safetensors"
+    assert turbo["source"]["role"] == "lora"
+    assert turbo["lora"] is None
     assert turbo["support"]["path"] == "export_support/h3_silu_temb_grid.safetensors"
+    assert turbo["support"]["role"] == "silu_timestep_grid"
+    assert turbo["source"]["url"].startswith("https://huggingface.co/")
+    assert turbo["download_size_bytes"] == 779849816 + 5510600
+    assert turbo["output_size_bytes"] < 16 * 1024**2
+    assert turbo["required_space_bytes"] < 1024**3
+    assert "40GB" in turbo["description"]
+
+
+def test_turbo_adapter_preset_exposes_base_dependency(monkeypatch, tmp_path) -> None:
+    from h3_workbench import app as app_module
+
+    models = tmp_path / "onnx_models"
+    monkeypatch.setattr(
+        app_module,
+        "settings",
+        replace(app_module.settings, workspace=tmp_path, output_dir=models, state_dir=tmp_path / ".h3-workbench"),
+    )
+
+    turbo = next(
+        item for item in TestClient(app_module.app).get("/api/export-presets").json()["presets"]
+        if item["id"] == "fl2va_turbo_v4"
+    )
+
+    assert turbo["status"] == "dependency_required"
+    assert turbo["dependencies_ready"] is False
+    assert turbo["dependencies"] == [
+        {
+            "id": "fl2va_streaming",
+            "label": "FL2VA 流式基座",
+            "ready": False,
+            "path": str((models / "minimax_h3_fl2va_pruned_fp8_scaled_streaming").resolve()),
+        }
+    ]
 
 
 def test_preset_export_rejects_unknown_variant() -> None:
@@ -67,6 +109,9 @@ def test_webui_contains_live_job_elapsed_timer() -> None:
     assert "执行参数" in response.text
     assert "job-progress-value" in response.text
     assert "/performance" in response.text
+    assert "Turbo v4 动态 LoRA" in response.text
+    assert "不会静默回退" in response.text
+    assert "Turbo v4 尚未就绪，将使用流式基座模型" not in response.text
 
 
 def test_performance_log_endpoint(monkeypatch, tmp_path) -> None:
@@ -83,6 +128,84 @@ def test_performance_log_endpoint(monkeypatch, tmp_path) -> None:
     assert response.json() == {"sequence": 0}
     assert response.headers["content-type"].startswith("application/x-ndjson")
     assert missing.status_code == 404
+
+
+def test_hardware_snapshot_sse_and_websocket_share_structured_contract(monkeypatch) -> None:
+    from h3_workbench import app as app_module
+
+    class FakeLivePerformanceMonitor:
+        interval_seconds = 0.01
+
+        def __init__(self) -> None:
+            self.stopped = False
+
+        @staticmethod
+        def _sample(sequence: int) -> dict[str, object]:
+            return {
+                "schema": "h3-hardware-sample-v1",
+                "timestamp": "2026-08-15T00:00:00+00:00",
+                "sequence": sequence,
+                "cpu": {"system_percent": 25.0},
+                "memory": {"available_bytes": 1024},
+                "gpu": {"available": False, "devices": [], "reason": "not_found"},
+                "disk": {"read_bytes_per_second": 128.0, "write_bytes_per_second": 64.0},
+                "process": {"pid": 7},
+            }
+
+        def snapshot(self) -> dict[str, object]:
+            return self._sample(7)
+
+        def wait_for_sample(self, after_sequence: int, timeout: float) -> dict[str, object]:
+            assert timeout >= self.interval_seconds
+            return self._sample(after_sequence + 1)
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    monitor = FakeLivePerformanceMonitor()
+    monkeypatch.setattr(app_module, "live_performance_monitor", monitor)
+
+    with TestClient(app_module.app) as client:
+        snapshot = client.get("/api/hardware/snapshot")
+        stream = client.get("/api/hardware/stream?samples=1")
+        with client.websocket_connect("/api/hardware/ws?samples=1") as websocket:
+            websocket_sample = websocket.receive_json()
+
+    assert snapshot.status_code == 200
+    assert snapshot.json()["sequence"] == 7
+    assert snapshot.json()["gpu"]["available"] is False
+    assert stream.status_code == 200
+    assert stream.headers["content-type"].startswith("text/event-stream")
+    assert stream.headers["cache-control"] == "no-cache"
+    assert "event: hardware" in stream.text
+    data_line = next(line for line in stream.text.splitlines() if line.startswith("data: "))
+    assert json.loads(data_line.removeprefix("data: "))["schema"] == "h3-hardware-sample-v1"
+    assert websocket_sample["schema"] == "h3-hardware-sample-v1"
+    assert websocket_sample["disk"]["write_bytes_per_second"] == 64.0
+    assert monitor.stopped is True
+
+
+def test_hardware_snapshot_reports_monitor_timeout(monkeypatch) -> None:
+    from h3_workbench import app as app_module
+
+    class TimedOutMonitor:
+        interval_seconds = 1.0
+
+        @staticmethod
+        def snapshot():
+            raise TimeoutError("sample unavailable")
+
+        @staticmethod
+        def stop() -> None:
+            pass
+
+    monkeypatch.setattr(app_module, "live_performance_monitor", TimedOutMonitor())
+
+    with TestClient(app_module.app) as client:
+        response = client.get("/api/hardware/snapshot")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "sample unavailable"
 
 
 def test_job_progress_never_moves_backwards(tmp_path) -> None:
@@ -105,25 +228,48 @@ def test_generation_profiles() -> None:
     assert profile["acceleration_active"] is False
 
 
-def test_generation_profile_is_ready_with_turbo_only(monkeypatch, tmp_path) -> None:
+def test_generation_profile_detects_turbo_capability(monkeypatch, tmp_path) -> None:
     from h3_workbench import app as app_module
 
     models = tmp_path / "onnx_models"
-    turbo = models / "minimax_h3_fl2va_pruned_fp8_scaled_accelerated"
+    base = models / "minimax_h3_fl2va_pruned_fp8_scaled_streaming"
+    turbo = tmp_path / ".h3-workbench" / "accelerators" / "turbo_v4"
     qwen = models / "qwen3vl_32b_minimax_h3_nvfp4_awq"
+    base.mkdir(parents=True)
     turbo.mkdir(parents=True)
     qwen.mkdir(parents=True)
-    manifest = '{"validation_passed": true, "blocks": [' + ",".join(str(item) for item in range(50)) + "]}"
-    (turbo / "manifest.json").write_text(manifest, encoding="utf-8")
-    (qwen / "manifest.json").write_text(manifest, encoding="utf-8")
-    monkeypatch.setattr(app_module, "settings", replace(app_module.settings, output_dir=models))
+    blocks = list(range(50))
+    (base / "manifest.json").write_text(
+        json.dumps(
+            {
+                "validation_passed": True,
+                "build_complete": True,
+                "schedule_format": "h3-schedule-v2",
+                "schedule": "schedule.json",
+                "blocks": blocks,
+                "graphs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (base / "schedule.json").write_text("{}", encoding="utf-8")
+    (qwen / "manifest.json").write_text(
+        json.dumps({"validation_passed": True, "blocks": blocks}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        app_module,
+        "settings",
+        replace(app_module.settings, workspace=tmp_path, output_dir=models, state_dir=tmp_path / ".h3-workbench"),
+    )
     monkeypatch.setattr(app_module, "tokenizer_files_ready", lambda _: True)
+    monkeypatch.setattr(app_module, "validate_turbo_adapter", lambda *_, **__: {})
 
     profile = TestClient(app_module.app).get("/api/profiles").json()[0]
 
-    assert profile["main_ready"] is False
+    assert profile["main_ready"] is True
     assert profile["acceleration_ready"] is True
-    assert profile["generation_ready"] is True
+    assert profile["generation_ready"] is False
 
 
 def test_prompt_inference_request_accepts_dynamic_resolution() -> None:

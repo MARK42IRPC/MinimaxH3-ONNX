@@ -15,7 +15,9 @@ from h3_workbench.main_transformer import (
     load_dit_mlp_shard,
     load_refiner_attention_shard,
     load_refiner_mlp_shard,
+    enable_gpu_native_bf16,
     enable_gpu_native_fp16,
+    enable_scaled_gpu_native_fp16,
 )
 
 
@@ -33,6 +35,8 @@ def main() -> None:
     parser.add_argument("--lora", type=Path)
     parser.add_argument("--lora-strength", type=float, default=1.0)
     parser.add_argument("--gpu-native-fp16", action="store_true")
+    parser.add_argument("--gpu-native-bf16", action="store_true")
+    parser.add_argument("--gpu-scaled-fp16", action="store_true")
     args = parser.parse_args()
 
     with np.load(args.inputs, allow_pickle=False) as archive:
@@ -95,7 +99,14 @@ def main() -> None:
     with torch.inference_mode():
         expected = module(*inputs)
     np.savez(args.expected, output_0=expected.detach().cpu().numpy())
-    if args.gpu_native_fp16:
+    selected_modes = sum((args.gpu_native_fp16, args.gpu_native_bf16, args.gpu_scaled_fp16))
+    if selected_modes > 1:
+        parser.error("Select only one GPU-native precision mode")
+    if args.gpu_native_bf16:
+        enable_gpu_native_bf16(module)
+    elif args.gpu_scaled_fp16:
+        enable_scaled_gpu_native_fp16(module)
+    elif args.gpu_native_fp16:
         enable_gpu_native_fp16(module)
     _export_graph(
         module,

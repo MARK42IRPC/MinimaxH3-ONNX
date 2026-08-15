@@ -1,34 +1,51 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import platform
 import subprocess
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import asdict
 from pathlib import Path
 from typing import Literal
 
 import onnxruntime as ort
 import psutil
 import torch
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
 from h3_workbench.config import Settings
-from h3_workbench.jobs import JobManager
+from h3_workbench.jobs import JobManager, resolve_main_model_directory
 from h3_workbench.memory_planner import main_model_shards, plan_shard_batches, probe_gpu_memory
 from h3_workbench.model_registry import scan_models
+from h3_workbench.performance_monitor import LivePerformanceMonitor
 from h3_workbench.profiles import GENERATION_PROFILES
+from h3_workbench.qwen_persistent import resolve_qwen_directory, validated_int8_virtual_qwen_ready
 from h3_workbench.shard_cache import default_l2_cache_bytes, default_prefetch_depth
 from h3_workbench.tokenizer import tokenizer_files_ready
-from h3_workbench.model_catalog import MODELSCOPE_REPO, GITHUB_REPO, all_component_status
-from h3_workbench.source_catalog import EXPORT_PRESETS
+from h3_workbench.source_catalog import EXPORT_PRESETS, ExportPreset, SourceAsset
+from h3_workbench.turbo_lora import validate_turbo_adapter
+from h3_workbench.video_vae_persistent import persistent_video_vae_ready, video_vae_block_indices
 
 settings = Settings.from_env()
 manager = JobManager(settings.workspace, settings.output_dir)
 web_dir = Path(__file__).parent / "web"
+live_performance_monitor = LivePerformanceMonitor()
 
-app = FastAPI(title="MiniMax H3 Edge Workbench", version="0.1.0")
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+    try:
+        yield
+    finally:
+        live_performance_monitor.stop()
+
+
+app = FastAPI(title="MiniMax H3 Edge Workbench", version="0.1.0", lifespan=_lifespan)
 app.mount("/assets", StaticFiles(directory=web_dir), name="assets")
 
 
@@ -38,6 +55,29 @@ def _manifest_has_blocks(path: Path, count: int) -> bool:
         return manifest.get("validation_passed") is True and len(manifest.get("blocks", [])) == count
     except (OSError, ValueError, TypeError):
         return False
+
+
+def _complete_main_model(directory: Path) -> bool:
+    try:
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    schedule = directory / str(manifest.get("schedule", ""))
+    return (
+        manifest.get("validation_passed") is True
+        and manifest.get("build_complete") is True
+        and manifest.get("schedule_format") == "h3-schedule-v2"
+        and len(manifest.get("blocks", [])) == 50
+        and schedule.is_file()
+    )
+
+
+def _runtime_adapter_ready(directory: Path, base_model_directory: Path | None = None) -> bool:
+    try:
+        validate_turbo_adapter(directory, base_model_dir=base_model_directory)
+    except Exception:  # noqa: BLE001 - corrupt optional artifacts are reported as not ready
+        return False
+    return True
 
 
 def _gpu_info() -> dict[str, object]:
@@ -132,31 +172,204 @@ def system_info() -> dict[str, object]:
     }
 
 
+@app.get("/api/hardware/snapshot")
+def hardware_snapshot() -> dict[str, object]:
+    try:
+        return live_performance_monitor.snapshot()
+    except TimeoutError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/api/telemetry", include_in_schema=False)
+def telemetry_snapshot() -> dict[str, object]:
+    """Compatibility alias used by the polling WebUI client."""
+    return hardware_snapshot()
+
+
+@app.get("/api/hardware/stream")
+async def hardware_stream(
+    request: Request,
+    samples: int | None = Query(default=None, ge=1, le=3600),
+) -> StreamingResponse:
+    async def events() -> AsyncIterator[str]:
+        after_sequence = -1
+        sent = 0
+        timeout = max(3.0, live_performance_monitor.interval_seconds * 2)
+        while samples is None or sent < samples:
+            if await request.is_disconnected():
+                break
+            sample = await asyncio.to_thread(
+                live_performance_monitor.wait_for_sample,
+                after_sequence,
+                timeout,
+            )
+            if sample is None:
+                yield ": keepalive\n\n"
+                continue
+            after_sequence = int(sample["sequence"])
+            payload = json.dumps(sample, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            yield f"id: {after_sequence}\nevent: hardware\ndata: {payload}\n\n"
+            sent += 1
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.websocket("/api/hardware/ws")
+async def hardware_websocket(websocket: WebSocket) -> None:
+    raw_limit = websocket.query_params.get("samples")
+    try:
+        limit = None if raw_limit is None else int(raw_limit)
+        if limit is not None and not 1 <= limit <= 3600:
+            raise ValueError
+    except ValueError:
+        await websocket.close(code=1008, reason="samples must be from 1 to 3600")
+        return
+
+    await websocket.accept()
+    after_sequence = -1
+    sent = 0
+    timeout = max(3.0, live_performance_monitor.interval_seconds * 2)
+    try:
+        while limit is None or sent < limit:
+            sample = await asyncio.to_thread(
+                live_performance_monitor.wait_for_sample,
+                after_sequence,
+                timeout,
+            )
+            if sample is None:
+                continue
+            after_sequence = int(sample["sequence"])
+            await websocket.send_json(sample)
+            sent += 1
+    except WebSocketDisconnect:
+        return
+    if limit is not None:
+        await websocket.close(code=1000)
+
+
 @app.get("/api/models")
 def models() -> list[dict[str, object]]:
     return [record.to_dict() for record in scan_models(settings.workspace)]
 
 
-@app.get("/api/model-components")
-def model_components() -> dict[str, object]:
-    return {"repo": MODELSCOPE_REPO, "project": GITHUB_REPO, "components": all_component_status(settings.workspace)}
+def _source_asset_status(asset: SourceAsset) -> dict[str, object]:
+    cached = settings.state_dir / "sources" / asset.repo_id.replace("/", "--") / asset.path
+    local = settings.workspace / Path(asset.path).name
+    tokenizer_local = settings.workspace / "qwen_tokenizer" / Path(asset.path).name
+    path = next(
+        (
+            candidate
+            for candidate in (cached, local, tokenizer_local)
+            if candidate.is_file() and candidate.stat().st_size == asset.size_bytes
+        ),
+        None,
+    )
+    return {
+        **asdict(asset),
+        "ready": path is not None,
+        "local_path": str(path.resolve()) if path is not None else None,
+    }
 
 
-class ModelDownloadRequest(BaseModel):
-    components: list[str] = Field(min_length=1, max_length=6)
+def _directory_size(directory: Path) -> int:
+    if not directory.is_dir():
+        return 0
+    return sum(path.stat().st_size for path in directory.rglob("*") if path.is_file())
 
 
-@app.post("/api/jobs/download", status_code=202)
-def create_download(request: ModelDownloadRequest) -> dict[str, object]:
-    try:
-        return manager.create_download(request.components).to_dict()
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+def _preset_product_ready(preset: ExportPreset, directory: Path) -> bool:
+    if preset.id == "tokenizer":
+        return tokenizer_files_ready(directory)
+    if preset.id == "qwen":
+        return validated_int8_virtual_qwen_ready(directory)
+    if preset.id == "video_vae":
+        try:
+            blocks = video_vae_block_indices(directory)
+        except (OSError, ValueError):
+            return False
+        long_graphs = (
+            directory / "video_decoder_prelude_t7.onnx",
+            directory / "video_decoder_head_t7.onnx",
+        )
+        return (
+            len(blocks) == 36
+            and all(path.is_file() for path in long_graphs)
+            and persistent_video_vae_ready(directory, blocks)
+        )
+    if preset.product_type == "runtime_adapter":
+        return _runtime_adapter_ready(directory)
+    if preset.component == "fl2va_transformer":
+        return _complete_main_model(directory)
+    return _manifest_has_blocks(directory / "manifest.json", 0)
+
+
+def _preset_product_directory(preset: ExportPreset) -> Path:
+    product = settings.workspace / preset.output_dir
+    if preset.component == "fl2va_transformer":
+        resolved = resolve_main_model_directory(settings.workspace, settings.output_dir, accelerated=False)
+        if resolved is not None:
+            product = resolved
+    return product
+
+
+def _preset_payload(preset: ExportPreset) -> dict[str, object]:
+    assets = list(preset.sources)
+    source_status = [_source_asset_status(item) for item in assets]
+    product = _preset_product_directory(preset)
+    product_ready = _preset_product_ready(preset, product)
+    presets_by_id = {item.id: item for item in EXPORT_PRESETS}
+    dependencies = []
+    for dependency_id in preset.depends_on:
+        dependency = presets_by_id[dependency_id]
+        dependency_product = _preset_product_directory(dependency)
+        dependencies.append(
+            {
+                "id": dependency.id,
+                "label": dependency.label,
+                "ready": _preset_product_ready(dependency, dependency_product),
+                "path": str(dependency_product.resolve()),
+            }
+        )
+    dependencies_ready = all(bool(item["ready"]) for item in dependencies)
+    if product_ready and dependencies_ready:
+        status = "ready"
+    elif not dependencies_ready:
+        status = "dependency_required"
+    elif all(bool(item["ready"]) for item in source_status):
+        status = "source_ready"
+    else:
+        status = "download_required"
+    return {
+        **preset.to_dict(),
+        "status": status,
+        "sources": source_status,
+        "dependencies": dependencies,
+        "dependencies_ready": dependencies_ready,
+        "product": {
+            "ready": product_ready,
+            "usable": product_ready and dependencies_ready,
+            "path": str(product.resolve()),
+            "size_bytes": _directory_size(product),
+        },
+    }
 
 
 @app.get("/api/export-presets")
 def export_presets() -> dict[str, object]:
-    return {"official_repo": "Comfy-Org/MiniMax-H3", "turbo_repo": "larryvrh/MiniMax-H3-Turbo-Lora", "presets": [item.to_dict() for item in EXPORT_PRESETS]}
+    disk = psutil.disk_usage(str(settings.workspace))
+    return {
+        "download_mode": "direct_http_range",
+        "workspace": str(settings.workspace),
+        "disk": {"total_bytes": disk.total, "free_bytes": disk.free},
+        "presets": [_preset_payload(item) for item in EXPORT_PRESETS],
+    }
 
 
 class PresetExportRequest(BaseModel):
@@ -253,14 +466,32 @@ def health() -> dict[str, str]:
 def generation_profiles() -> list[dict[str, object]]:
     snapshot = probe_gpu_memory()
     providers = ort.get_available_providers()
-    main_directory = settings.output_dir / "minimax_h3_fl2va_pruned_fp8_scaled_streaming"
-    qwen_manifest = settings.output_dir / "qwen3vl_32b_minimax_h3_nvfp4_awq" / "manifest.json"
-    accelerated_manifest = settings.output_dir / "minimax_h3_fl2va_pruned_fp8_scaled_accelerated" / "manifest.json"
-    qwen_ready = _manifest_has_blocks(qwen_manifest, 50)
-    acceleration_ready = _manifest_has_blocks(accelerated_manifest, 50)
+    main_directory = resolve_main_model_directory(settings.workspace, settings.output_dir, accelerated=False)
+    turbo_preset = next(item for item in EXPORT_PRESETS if item.id == "fl2va_turbo_v4")
+    turbo_directory = _preset_product_directory(turbo_preset)
+    qwen_directory = resolve_qwen_directory(settings.output_dir)
+    qwen_manifest = qwen_directory / "manifest.json"
+    qwen_ready = (
+        validated_int8_virtual_qwen_ready(qwen_directory)
+        if qwen_directory.name.endswith("_int8_virtual")
+        else _manifest_has_blocks(qwen_manifest, 50)
+    )
+    acceleration_ready = main_directory is not None and _runtime_adapter_ready(turbo_directory, main_directory)
     tokenizer_ready = tokenizer_files_ready(settings.workspace / "qwen_tokenizer")
-    shards = main_model_shards(main_directory) if (main_directory / "manifest.json").is_file() else []
-    main_ready = bool(shards)
+    video_directory = settings.output_dir / "video_vae"
+    try:
+        video_blocks = video_vae_block_indices(video_directory)
+    except (OSError, ValueError):
+        video_blocks = []
+    video_vae_ready = (
+        len(video_blocks) == 36
+        and (video_directory / "video_decoder_prelude_t7.onnx").is_file()
+        and (video_directory / "video_decoder_head_t7.onnx").is_file()
+        and persistent_video_vae_ready(video_directory, video_blocks)
+    )
+    audio_vae_ready = _manifest_has_blocks(settings.output_dir / "audio_vae" / "manifest.json", 0)
+    shards = main_model_shards(main_directory) if main_directory is not None else []
+    main_ready = main_directory is not None
     result: list[dict[str, object]] = []
     for profile in GENERATION_PROFILES.values():
         batches = plan_shard_batches(shards, profile, snapshot.free_bytes) if snapshot.free_bytes and shards else []
@@ -274,10 +505,15 @@ def generation_profiles() -> list[dict[str, object]]:
                 "acceleration_ready": acceleration_ready,
                 "acceleration_active": False,
                 "tokenizer_ready": tokenizer_ready,
-                # A complete Turbo export is independently runnable for its
-                # supported 4-8 step range, even when the optional base model
-                # has been removed to reclaim disk space.
-                "generation_ready": qwen_ready and (main_ready or acceleration_ready),
+                "video_vae_ready": video_vae_ready,
+                "audio_vae_ready": audio_vae_ready,
+                "generation_ready": (
+                    qwen_ready
+                    and main_ready
+                    and tokenizer_ready
+                    and video_vae_ready
+                    and audio_vae_ready
+                ),
                 "main_shard_batches": [batch.to_dict() for batch in batches],
             }
         )

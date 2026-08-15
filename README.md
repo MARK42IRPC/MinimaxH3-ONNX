@@ -51,9 +51,9 @@ uv run h3-infer plan
 uv run h3-infer generate --token-ids 1,42,1000,151935 --steps 6 --output output.mp4
 ```
 
-The runtime probes free VRAM before every denoising step, groups consecutive model shards within the available budget, and halves a batch before execution if CUDA session creation reports OOM. The Larryvrh Turbo v4 acceleration LoRA is exported as a separate model variant; 4 steps is the default and 4-8 is its supported quality range, while the workbench still accepts manual values from 1 to 50. Tasks outside 4-8 steps use the unmerged base model.
+The runtime probes free VRAM before every denoising step and streams the validated Base shards within the available budget. Larryvrh Turbo v4 is installed as a runtime adapter over that Base product; 4 steps is the default and 4-8 is its supported quality range. The workbench does not export or retain a second merged 40GB main model. Tasks outside 4-8 steps use the Base model without the adapter.
 
-On the pruned/curve base, 208 backbone LoRA pairs are merged into the FP16 ONNX shards. The remaining 51 AdaLN pairs stay exact through the author's 1025-row full-width SiLU timestep grid: `main_conditioning.onnx` interpolates the 2688-wide embedding and every DiT/head shard applies the corresponding low-rank AdaLN residual at run time. The manifest records `259/259` coverage and the source LoRA SHA-256.
+The adapter publishes six graph-only ONNX topologies and keeps all 259 LoRA pairs dynamic. Backbone/refiner factors run as FP16 low-rank GEMMs, while 50 DiT AdaLN pairs and the final head pair use FP32 factors with the author's 1025-row full-width SiLU timestep grid. The adapter manifest locks the Base topology, LoRA, and grid identities by SHA-256; no Base weights are copied into the adapter directory.
 
 The WebUI accepts a natural-language prompt and dynamically pads requested output dimensions to multiples of 32. The current edge profile accepts output widths and heights from 128 to 1024 pixels while retaining the 17-frame temporal profile. Main-model sequence length, position IDs, attention memory planning, Video VAE tile layout, and final center crop are derived from the requested dimensions.
 

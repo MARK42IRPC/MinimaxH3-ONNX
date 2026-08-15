@@ -8,8 +8,8 @@ from pathlib import Path
 from onnx import TensorProto, helper
 
 from h3_workbench.inference_runtime import (
-    H3MainRuntime,
     ORTGraphRunner,
+    _ensure_device_streamed_sdpa_graph,
     _ensure_streamed_sdpa_graph,
     host_prefetch_budget_bytes,
     modulation_ids,
@@ -23,7 +23,14 @@ from h3_workbench.inference_runtime import (
     unpack_audio,
     unpatchify_video,
 )
-from h3_workbench.media_output import _assemble_video_vae_tiles, _split_tiles, _video_vae_temporal_windows
+from h3_workbench.media_output import (
+    _assemble_video_vae_tiles,
+    _pad_video_latents_to_tile,
+    _release_io_binding,
+    _split_tiles,
+    _video_vae_temporal_windows,
+    decode_video_latents_onnx,
+)
 from h3_workbench.media_output import decode_audio_latents_onnx
 from h3_workbench.profiles import PROFILE_360P_17F, video_latent_frames_for_output, video_vae_output_frames
 from h3_workbench.shard_cache import ShardPrefetchCache
@@ -39,6 +46,50 @@ def test_long_video_vae_temporal_window_plan_matches_reference() -> None:
     assert frames == 124
 
 
+def test_video_vae_io_binding_cleanup_releases_inputs_and_outputs() -> None:
+    class Binding:
+        inputs_cleared = False
+        outputs_cleared = False
+
+        def clear_binding_inputs(self) -> None:
+            self.inputs_cleared = True
+
+        def clear_binding_outputs(self) -> None:
+            self.outputs_cleared = True
+
+    binding = Binding()
+    _release_io_binding(binding)
+
+    assert binding.inputs_cleared
+    assert binding.outputs_cleared
+
+
+def test_video_vae_onnx_runner_closes_when_decode_fails(monkeypatch, tmp_path: Path) -> None:
+    state = {"closed": False}
+
+    class Runner:
+        def __init__(self, prefer_cuda: bool):
+            assert prefer_cuda
+
+        def close(self) -> None:
+            state["closed"] = True
+
+    def fail(*_: object) -> np.ndarray:
+        raise RuntimeError("decode failed")
+
+    monkeypatch.setattr("h3_workbench.inference_runtime.ORTGraphRunner", Runner)
+    monkeypatch.setattr("h3_workbench.media_output._decode_video_latents_onnx_with_runner", fail)
+
+    with pytest.raises(RuntimeError, match="decode failed"):
+        decode_video_latents_onnx(
+            tmp_path,
+            np.zeros((1, 24, 2, 1, 1), dtype=np.float16),
+            16,
+        )
+
+    assert state["closed"]
+
+
 def test_video_vae_two_latent_tokens_decode_to_five_frames() -> None:
     with torch.device("meta"):
         model = MiniMaxH3VideoVAE()
@@ -46,7 +97,18 @@ def test_video_vae_two_latent_tokens_decode_to_five_frames() -> None:
     assert model._decode_temporal_chunks(2) == (5, 1)
     assert model.decode_output_shape((1, 24, 2, 24, 40)) == (1, 3, 5, 384, 640)
     assert video_vae_output_frames(2) == 5
+    assert video_latent_frames_for_output(1) == 2
     assert video_latent_frames_for_output(5) == 2
+
+
+def test_small_video_latent_canvas_is_center_padded_to_one_vae_tile() -> None:
+    latents = np.ones((1, 24, 2, 8, 10), dtype=np.float16)
+
+    padded = _pad_video_latents_to_tile(latents)
+
+    assert padded.shape == (1, 24, 2, 16, 16)
+    np.testing.assert_array_equal(padded[:, :, :, 4:12, 3:13], latents)
+    assert np.count_nonzero(padded[:, :, :, :4]) == 0
 
 
 def test_requested_frames_snap_to_native_h3_temporal_grid() -> None:
@@ -92,6 +154,39 @@ def test_host_prefetch_budget_reports_zero_below_reserve(monkeypatch) -> None:
     )
 
     assert host_prefetch_budget_bytes() == 0
+
+
+def test_cuda_runner_defaults_to_non_spinning_single_cpu_thread(monkeypatch) -> None:
+    monkeypatch.delenv("H3_ORT_CPU_THREADS", raising=False)
+    monkeypatch.delenv("H3_ORT_ALLOW_SPINNING", raising=False)
+    monkeypatch.setattr(
+        "h3_workbench.inference_runtime.ort.get_available_providers",
+        lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    monkeypatch.setattr("h3_workbench.inference_runtime._preload_cuda_dlls", lambda: None)
+
+    runner = ORTGraphRunner(prefer_cuda=True, prefetch_depth=0)
+
+    assert runner.ort_cpu_threads == 1
+    assert runner.ort_allow_spinning is False
+    runner.close()
+
+
+def test_cuda_runner_enables_low_vram_mode(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "h3_workbench.inference_runtime.ort.get_available_providers",
+        lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    monkeypatch.setattr("h3_workbench.inference_runtime._preload_cuda_dlls", lambda: None)
+    monkeypatch.setattr(
+        "h3_workbench.inference_runtime.probe_gpu_memory",
+        lambda: type("Memory", (), {"total_bytes": 4 * 1024**3})(),
+    )
+
+    runner = ORTGraphRunner(prefer_cuda=True, prefetch_depth=0)
+
+    assert runner.low_vram_mode is True
+    runner.close()
 
 
 @pytest.mark.parametrize("frames", (17, 20, 28))
@@ -174,6 +269,22 @@ def test_streamed_attention_matches_full_attention_on_cpu() -> None:
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
 
 
+def test_device_streamed_attention_graph_matches_chunked_reference(tmp_path: Path) -> None:
+    random = np.random.default_rng(13)
+    packed = random.standard_normal((7, 56, 384), dtype=np.float32)
+    graph = _ensure_device_streamed_sdpa_graph(
+        tmp_path / "device_sdpa.onnx",
+        sequence_tokens=7,
+        query_chunk_tokens=3,
+    )
+    session = ort.InferenceSession(str(graph), providers=["CPUExecutionProvider"])
+
+    actual = session.run(None, {"packed": packed})[0]
+    expected = streamed_attention(packed, use_cuda=False, query_chunk_tokens=3)
+
+    np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-3)
+
+
 def test_normalized_ort_attention_stays_finite_for_large_qkv(tmp_path) -> None:
     graph = _ensure_streamed_sdpa_graph(tmp_path / "normalized_sdpa.onnx")
     random = np.random.default_rng(17)
@@ -243,6 +354,37 @@ def test_sampling_isolates_nonfinite_audio_velocity() -> None:
     assert runtime.audio_fallback_reason is not None
 
 
+def test_sample_latents_emits_step_checkpoints() -> None:
+    class Runtime:
+        audio_fallback_reason = None
+        sampling_step = 0
+        sampling_steps = 0
+
+        @staticmethod
+        def prepare_text(text_states):
+            return text_states
+
+        @staticmethod
+        def denoise_step(video, audio, text_states, sigma, text_is_refined=False):
+            return np.ones_like(video), np.ones_like(audio)
+
+    checkpoints = []
+    runtime = Runtime()
+    sample_latents(
+        runtime,
+        np.zeros((1, 1), dtype=np.float32),
+        np.zeros((1, 1), dtype=np.float32),
+        np.ones((1, 1), dtype=np.float32),
+        steps=2,
+        checkpoint_callback=lambda current, total, video, audio: checkpoints.append(
+            (current, total, video.copy(), audio.copy())
+        ),
+    )
+
+    assert [(current, total) for current, total, _, _ in checkpoints] == [(1, 2), (2, 2)]
+    assert not np.array_equal(checkpoints[0][2], checkpoints[1][2])
+
+
 def test_session_batch_does_not_retry_a_consumer_error(tmp_path) -> None:
     graph = tmp_path / "graph.onnx"
     graph.write_bytes(b"stub")
@@ -250,6 +392,11 @@ def test_session_batch_does_not_retry_a_consumer_error(tmp_path) -> None:
     runner.provider = "CPUExecutionProvider"
     runner.shard_cache = ShardPrefetchCache(budget_bytes=0)
     runner.session = lambda path: object()
+    runner._session_cache = {}
+    runner._session_cache_bytes = 0
+    runner._session_cache_budget = 0
+    runner._session_cache_hits = 0
+    runner._session_cache_misses = 0
     batches_seen = 0
 
     with pytest.raises(RuntimeError, match="compute failed"):
@@ -292,6 +439,11 @@ def test_l1_session_prefetch_overlaps_following_shard(tmp_path) -> None:
     runner._l1_prefetch_hits = 0
     runner._l1_prefetch_waits = 0
     runner._l1_prefetch_wait_seconds = 0.0
+    runner._session_cache = {}
+    runner._session_cache_bytes = 0
+    runner._session_cache_budget = 0
+    runner._session_cache_hits = 0
+    runner._session_cache_misses = 0
 
     def fake_session(path=None, serialized_model=None):
         time.sleep(0.02)
@@ -317,33 +469,6 @@ def test_l1_session_prefetch_overlaps_following_shard(tmp_path) -> None:
 
     assert "L1 prefetch queued" in operations
     assert runner._l1_prefetch_hits >= 1
-
-
-def test_chunked_session_binds_into_preallocated_output(tmp_path) -> None:
-    input_info = helper.make_tensor_value_info("input", TensorProto.FLOAT, ["rows", 4])
-    output_info = helper.make_tensor_value_info("output", TensorProto.FLOAT, ["rows", 4])
-    graph = helper.make_graph([helper.make_node("Identity", ["input"], ["output"])], "chunks", [input_info], [output_info])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 20)], ir_version=9)
-    path = tmp_path / "chunks.onnx"
-    onnx.save(model, path)
-    runner = ORTGraphRunner(prefer_cuda=False)
-    runtime = object.__new__(__import__("h3_workbench.inference_runtime", fromlist=["H3MainRuntime"]).H3MainRuntime)
-    runtime.runner = runner
-    runtime.chunk_io_binding = True
-    runtime.chunk_sizes = {"test": 3}
-    values = np.arange(28, dtype=np.float32).reshape(7, 4)
-
-    output = runtime._run_chunked_session(
-        runner.session(path),
-        rows=7,
-        output_tail=(4,),
-        chunk_tokens=3,
-        chunk_key="test",
-        inputs_for_chunk=lambda start, stop: {"input": values[start:stop]},
-    )
-
-    np.testing.assert_array_equal(output, values)
-    runner.close()
 
 
 def test_l1_prefetch_stages_one_stable_rolling_window(tmp_path) -> None:
@@ -401,38 +526,61 @@ def test_l1_prefetch_barrier_runs_before_building_barrier_batch(tmp_path) -> Non
     assert events.index("consume:main_block_00_attention_output.onnx") < events.index("build:main_block_00_mlp.onnx")
 
 
-def test_streaming_qkv_uses_fp16_backing_buffer_for_base_short_sequence() -> None:
-    runtime = H3MainRuntime.__new__(H3MainRuntime)
-    observed: dict[str, object] = {}
-    runtime.turbo_adaln = False
-    runtime.profile = PROFILE_360P_17F
-
-    def fake_run(*args, **kwargs):
-        observed.update(kwargs)
-        return np.empty((5, 56, 384), dtype=kwargs["output_dtype"])
-
-    runtime._run_chunked_session = fake_run  # type: ignore[method-assign]
-    hidden = np.zeros((5, 4096), dtype=np.float32)
-    result = runtime._run_streaming_qkv(
-        object(),
-        hidden,
-        np.zeros((2, 256), dtype=np.float32),
-        np.zeros(5, dtype=np.int64),
-        np.zeros((1, 5, 64), dtype=np.float32),
-        256,
+def test_run_reuses_cached_session_across_calls(tmp_path) -> None:
+    graph = tmp_path / "identity.onnx"
+    input_info = helper.make_tensor_value_info("input", TensorProto.FLOAT, [2])
+    output_info = helper.make_tensor_value_info("output", TensorProto.FLOAT, [2])
+    model = helper.make_model(
+        helper.make_graph([helper.make_node("Identity", ["input"], ["output"])], "identity", [input_info], [output_info]),
+        opset_imports=[helper.make_opsetid("", 20)],
+        ir_version=9,
     )
+    onnx.save(model, graph)
+    runner = ORTGraphRunner(prefer_cuda=False)
+    runner.set_session_cache_budget(1 << 20)
+    built = 0
+    original_session = runner.session
 
-    assert observed["output_dtype"] == np.float16
-    assert result.dtype == np.float16
+    def counting_session(path):
+        nonlocal built
+        built += 1
+        return original_session(path)
+
+    runner.session = counting_session
+    first = runner.run(graph, {"input": np.zeros(2, dtype=np.float32)})
+    second = runner.run(graph, {"input": np.ones(2, dtype=np.float32)})
+
+    np.testing.assert_array_equal(first[0], np.zeros(2))
+    np.testing.assert_array_equal(second[0], np.ones(2))
+    assert built == 1
+    assert runner._session_cache_hits == 1
+    assert len(runner._session_cache) == 1
+    runner.close()
 
 
-def test_streaming_qkv_uses_fp32_backing_buffer_for_turbo_or_long_sequence() -> None:
-    runtime = H3MainRuntime.__new__(H3MainRuntime)
-    runtime.turbo_adaln = True
-    runtime.profile = PROFILE_360P_17F
+def test_run_does_not_cache_without_budget(tmp_path) -> None:
+    graph = tmp_path / "identity.onnx"
+    input_info = helper.make_tensor_value_info("input", TensorProto.FLOAT, [2])
+    output_info = helper.make_tensor_value_info("output", TensorProto.FLOAT, [2])
+    model = helper.make_model(
+        helper.make_graph([helper.make_node("Identity", ["input"], ["output"])], "identity", [input_info], [output_info]),
+        opset_imports=[helper.make_opsetid("", 20)],
+        ir_version=9,
+    )
+    onnx.save(model, graph)
+    runner = ORTGraphRunner(prefer_cuda=False)
+    built = 0
+    original_session = runner.session
 
-    assert runtime._streaming_qkv_dtype() == np.float32
+    def counting_session(path):
+        nonlocal built
+        built += 1
+        return original_session(path)
 
-    runtime.turbo_adaln = False
-    runtime.profile = PROFILE_360P_17F.with_frame_count(360)
-    assert runtime._streaming_qkv_dtype() == np.float32
+    runner.session = counting_session
+    runner.run(graph, {"input": np.zeros(2, dtype=np.float32)})
+    runner.run(graph, {"input": np.zeros(2, dtype=np.float32)})
+
+    assert built == 2
+    assert len(runner._session_cache) == 0
+    runner.close()

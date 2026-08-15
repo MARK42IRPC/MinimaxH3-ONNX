@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import subprocess
 import tempfile
 import wave
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -71,6 +73,100 @@ def _blend_numpy(left: np.ndarray, right: np.ndarray, extent: int, axis: int) ->
     return blended
 
 
+def _release_io_binding(binding: object | None) -> None:
+    if binding is None:
+        return
+    for method_name in ("clear_binding_inputs", "clear_binding_outputs"):
+        method = getattr(binding, method_name, None)
+        if callable(method):
+            try:
+                method()
+            except Exception:  # noqa: BLE001 - cleanup must not replace the inference error
+                pass
+
+
+def _decode_video_vae_blocks_persistent(
+    directory: Path,
+    runner: object,
+    hidden_tiles: list[np.ndarray],
+    rotary_tiles: list[np.ndarray],
+    block_count: int,
+    callback: Callable[[dict[str, object]], None] | None,
+) -> list[np.ndarray]:
+    import onnxruntime as ort
+
+    from h3_workbench.video_vae_persistent import (
+        PERSISTENT_VIDEO_VAE_TOPOLOGY,
+        load_video_vae_block_weights,
+    )
+
+    session = None
+    hidden_devices: list[ort.OrtValue] = []
+    rotary_devices: list[ort.OrtValue] = []
+    try:
+        session = runner.session(directory / PERSISTENT_VIDEO_VAE_TOPOLOGY)  # type: ignore[attr-defined]
+        hidden_devices = [ort.OrtValue.ortvalue_from_numpy(value, "cuda", 0) for value in hidden_tiles]
+        rotary_devices = [ort.OrtValue.ortvalue_from_numpy(value, "cuda", 0) for value in rotary_tiles]
+        shapes = [value.shape for value in hidden_tiles]
+        dtypes = [value.dtype for value in hidden_tiles]
+        hidden_tiles.clear()
+        rotary_tiles.clear()
+
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-vae-weight-prefetch") as executor:
+            pending = executor.submit(load_video_vae_block_weights, directory, 0)
+            for index in range(block_count):
+                loaded = pending.result()
+                weight_devices: dict[str, ort.OrtValue] = {}
+                if index + 1 < block_count:
+                    pending = executor.submit(load_video_vae_block_weights, directory, index + 1)
+                try:
+                    weight_devices = {
+                        name: ort.OrtValue.ortvalue_from_numpy(value, "cuda", 0)
+                        for name, value in loaded.feeds().items()
+                    }
+                    for tile_index in range(len(hidden_devices)):
+                        if callback is not None:
+                            callback(
+                                {
+                                    "module": "Video VAE",
+                                    "operation": "Persistent transformer block",
+                                    "current": index + 1,
+                                    "total": block_count,
+                                    "tile": tile_index + 1,
+                                    "tiles": len(hidden_devices),
+                                    "weight_load_seconds": round(loaded.load_seconds, 3),
+                                }
+                            )
+                        output = ort.OrtValue.ortvalue_from_shape_and_type(
+                            shapes[tile_index], dtypes[tile_index], "cuda", 0
+                        )
+                        binding = None
+                        try:
+                            binding = session.io_binding()
+                            for weight_name, weight_value in weight_devices.items():
+                                binding.bind_ortvalue_input(weight_name, weight_value)
+                            del weight_name, weight_value
+                            binding.bind_ortvalue_input("hidden_states", hidden_devices[tile_index])
+                            binding.bind_ortvalue_input("rotary_table", rotary_devices[tile_index])
+                            binding.bind_ortvalue_output("hidden_states_out", output)
+                            binding.synchronize_inputs()
+                            session.run_with_iobinding(binding)
+                            binding.synchronize_outputs()
+                            hidden_devices[tile_index] = output
+                        finally:
+                            _release_io_binding(binding)
+                            binding = None
+                finally:
+                    loaded.close()
+                    weight_devices.clear()
+        return [value.numpy() for value in hidden_devices]
+    finally:
+        hidden_devices.clear()
+        rotary_devices.clear()
+        session = None
+        gc.collect()
+
+
 def decode_video_latents_onnx(
     directory: Path,
     latents: np.ndarray,
@@ -80,6 +176,51 @@ def decode_video_latents_onnx(
     callback: Callable[[dict[str, object]], None] | None = None,
 ) -> np.ndarray:
     """Decode short or long clips with spatial tiles and reference temporal overlap."""
+    from h3_workbench.inference_runtime import ORTGraphRunner
+
+    runner = ORTGraphRunner(prefer_cuda=prefer_cuda)
+    try:
+        return _decode_video_latents_onnx_with_runner(
+            directory,
+            latents,
+            output_height,
+            output_width,
+            runner,
+            callback,
+        )
+    finally:
+        runner.close()
+
+
+def _pad_video_latents_to_tile(latents: np.ndarray, minimum: int = 16) -> np.ndarray:
+    """Center-pad sub-tile latent canvases for the fixed 256 px VAE boundary graphs."""
+    pad_height = max(0, minimum - latents.shape[-2])
+    pad_width = max(0, minimum - latents.shape[-1])
+    if pad_height == 0 and pad_width == 0:
+        return latents
+    top = pad_height // 2
+    left = pad_width // 2
+    return np.pad(
+        latents,
+        (
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (top, pad_height - top),
+            (left, pad_width - left),
+        ),
+        mode="constant",
+    )
+
+
+def _decode_video_latents_onnx_with_runner(
+    directory: Path,
+    latents: np.ndarray,
+    output_height: int,
+    output_width: int | None,
+    runner: object,
+    callback: Callable[[dict[str, object]], None] | None,
+) -> np.ndarray:
     if latents.ndim != 5 or latents.shape[2] < 2:
         raise ValueError("The ONNX Video VAE expects at least two temporal latent tokens.")
     manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
@@ -87,9 +228,7 @@ def decode_video_latents_onnx(
     if expected != (5, 16, 16):
         raise ValueError(f"Unsupported Video VAE tile profile: {expected}")
 
-    from h3_workbench.inference_runtime import ORTGraphRunner
-
-    runner = ORTGraphRunner(prefer_cuda=prefer_cuda)
+    latents = _pad_video_latents_to_tile(latents, expected[-1])
     padded_height, padded_width = latents.shape[-2] * 16, latents.shape[-1] * 16
     output_width = padded_width if output_width is None else output_width
     if output_height > padded_height or output_width > padded_width:
@@ -160,28 +299,47 @@ def decode_video_latents_onnx(
         gc.collect()
 
     block_count = len(manifest["blocks"])
-    for index in range(block_count):
-        session = runner.session(directory / f"video_decoder_block_{index:02d}.onnx")
-        try:
-            for tile_index in range(len(hidden_tiles)):
-                if callback is not None:
-                    callback(
-                        {
-                            "module": "Video VAE",
-                            "operation": "Transformer block",
-                            "current": index + 1,
-                            "total": block_count,
-                            "tile": tile_index + 1,
-                            "tiles": len(hidden_tiles),
-                        }
-                    )
-                hidden_tiles[tile_index] = session.run(
-                    None,
-                    {"hidden_states": hidden_tiles[tile_index], "rotary_table": rotary_tiles[tile_index]},
-                )[0]
-        finally:
-            del session
-            gc.collect()
+    from h3_workbench.video_vae_persistent import persistent_video_vae_ready
+
+    persistent_enabled = os.environ.get("H3_VIDEO_VAE_PERSISTENT", "1") != "0"
+    if (
+        persistent_enabled
+        and runner.provider == "CUDAExecutionProvider"
+        and persistent_video_vae_ready(directory, range(block_count), dynamic_batch=False)
+    ):
+        hidden_tiles = _decode_video_vae_blocks_persistent(
+            directory,
+            runner,
+            hidden_tiles,
+            rotary_tiles,
+            block_count,
+            callback,
+        )
+        rotary_tiles.clear()
+        gc.collect()
+    else:
+        for index in range(block_count):
+            session = runner.session(directory / f"video_decoder_block_{index:02d}.onnx")
+            try:
+                for tile_index in range(len(hidden_tiles)):
+                    if callback is not None:
+                        callback(
+                            {
+                                "module": "Video VAE",
+                                "operation": "Transformer block",
+                                "current": index + 1,
+                                "total": block_count,
+                                "tile": tile_index + 1,
+                                "tiles": len(hidden_tiles),
+                            }
+                        )
+                    hidden_tiles[tile_index] = session.run(
+                        None,
+                        {"hidden_states": hidden_tiles[tile_index], "rotary_table": rotary_tiles[tile_index]},
+                    )[0]
+            finally:
+                del session
+                gc.collect()
 
     heads = {
         length: runner.session(directory / ("video_decoder_head_t7.onnx" if length == 7 else "video_decoder_head.onnx"))
@@ -237,7 +395,6 @@ def decode_video_latents_onnx(
     top = max(0, (padded_height - output_height) // 2)
     left = max(0, (padded_width - output_width) // 2)
     result = canvas[:, :, :, top : top + output_height, left : left + output_width]
-    runner.close()
     return result
 
 

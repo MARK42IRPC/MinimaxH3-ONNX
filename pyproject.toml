@@ -11,7 +11,6 @@ requires-python = ">=3.11,<3.13"
 dependencies = [
   "fastapi==0.134.0",
   "ml-dtypes==0.5.4",
-  "modelscope-hub==0.2.0",
   "numpy==2.4.2",
   "onnx==1.21.0",
   "onnxruntime-gpu==1.23.2",
@@ -22,12 +21,14 @@ dependencies = [
   "transformers==5.15.0",
   "uvicorn[standard]==0.41.0",
   "nvidia-cublas-cu12==12.9.2.10; platform_system == 'Windows'",
+  "nvidia-cuda-runtime-cu12==12.9.79; platform_system == 'Windows'",
   "nvidia-cuda-nvrtc-cu12==12.9.86; platform_system == 'Windows'",
   "nvidia-cudnn-cu12==9.24.0.43; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]
 dev = [
+  "editables==0.5",
   "httpx==0.28.1",
   "pytest==9.0.2",
   "ruff==0.15.1",
@@ -36,9 +37,16 @@ dev = [
 [project.scripts]
 h3-workbench = "h3_workbench.__main__:main"
 h3-infer = "h3_workbench.inference_cli:main"
+h3-main-benchmark = "h3_workbench.main_benchmark:main"
+h3-mlp-precision-benchmark = "h3_workbench.mlp_precision_benchmark:main"
+h3-scaled-mlp-export = "h3_workbench.scaled_mlp_export:main"
+h3-scaled-attention-export = "h3_workbench.scaled_attention_export:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/h3_workbench"]
+
+[tool.hatch.build]
+dev-mode-exact = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

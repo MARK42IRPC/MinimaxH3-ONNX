@@ -1,19 +1,96 @@
-const state = { system: null, models: [], components: [], exportPresets: [], jobs: [], profiles: [] };
+const TELEMETRY_ENDPOINT = "/api/hardware/snapshot";
+const TELEMETRY_STREAM_ENDPOINT = "/api/hardware/stream";
+const TELEMETRY_MODE = new URLSearchParams(window.location.search).get("telemetry") || "stream";
+const TELEMETRY_MAX_POINTS = 180;
+const JOB_POLL_INTERVAL_MS = 2000;
+const TELEMETRY_POLL_INTERVAL_MS = 1000;
+
+const state = {
+  system: null,
+  models: [],
+  exportPresets: [],
+  modelWorkspace: null,
+  jobs: [],
+  profiles: [],
+  loaded: { system: false, models: false, presets: false, jobs: false, profiles: false },
+  activePage: "models",
+  jobFilter: "all",
+  selectedJobId: null,
+  jobEvents: new Map(),
+  jobSignatures: new Map(),
+  telemetry: [],
+  telemetrySource: "none",
+  telemetryError: null,
+  telemetryEndpointAvailable: null,
+  telemetryRetryAt: 0,
+  lastJobUpdate: null,
+};
+
 let toastTimer = null;
+let jobsPollActive = false;
+let telemetryPollActive = false;
+let systemPollActive = false;
+let chartFrame = null;
+let telemetryEventSource = null;
+let telemetryLastReceivedAt = 0;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 
+class ApiError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>'"]/g, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "'": "&#39;",
+    '"': "&quot;",
+  })[character]);
+}
+
+function safeClass(value, fallback = "") {
+  const normalized = String(value || "").toLowerCase();
+  return /^[a-z0-9_-]+$/.test(normalized) ? normalized : fallback;
+}
+
+function finite(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function clamp(value, minimum, maximum) {
+  return Math.min(maximum, Math.max(minimum, value));
+}
+
 function formatBytes(value) {
-  if (!Number.isFinite(value)) return "--";
+  const number = finite(value);
+  if (number === null) return "--";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let size = value;
+  let size = Math.max(0, number);
   let index = 0;
   while (size >= 1024 && index < units.length - 1) {
     size /= 1024;
     index += 1;
   }
-  return `${size.toFixed(index > 2 ? 2 : 1)} ${units[index]}`;
+  const digits = index >= 3 ? 2 : index > 0 ? 1 : 0;
+  return `${size.toFixed(digits)} ${units[index]}`;
+}
+
+function formatRate(value) {
+  const number = finite(value);
+  return number === null ? "--" : `${formatBytes(number)}/s`;
+}
+
+function formatPercent(value) {
+  const number = finite(value);
+  return number === null ? "--" : `${clamp(number, 0, 100).toFixed(0)}%`;
 }
 
 function formatElapsed(milliseconds) {
@@ -25,51 +102,313 @@ function formatElapsed(milliseconds) {
 }
 
 function jobElapsed(job, now = Date.now()) {
-  const started = Date.parse(job.started_at || job.created_at);
+  const started = Date.parse(job.started_at || job.created_at || "");
   if (!Number.isFinite(started)) return "--:--:--";
   const finished = Date.parse(job.finished_at || "");
-  const end = Number.isFinite(finished) ? finished : now;
-  return formatElapsed(end - started);
+  return formatElapsed((Number.isFinite(finished) ? finished : now) - started);
 }
 
-function performanceDetails(job) {
-  const record = job.performance || {};
-  const perf = record.performance || {};
-  if (record.monitor_error) return [`监控异常 ${record.monitor_error}`];
-  if (!Object.keys(perf).length) return [];
-  const gpu = perf.gpu || {};
-  const details = [];
-  if (Number.isFinite(gpu.utilization_percent)) details.push(`GPU ${gpu.utilization_percent.toFixed(0)}%`);
-  if (Number.isFinite(gpu.memory_used_mib)) {
-    const totalMib = gpu.memory_used_mib + (gpu.memory_free_mib || 0);
-    details.push(`显存 ${(gpu.memory_used_mib / 1024).toFixed(2)}/${(totalMib / 1024).toFixed(2)} GiB`);
+function shortTime(value) {
+  const date = value ? new Date(value) : new Date();
+  if (Number.isNaN(date.getTime())) return "--:--:--";
+  return new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+function showToast(message, error = false) {
+  const toast = $("#toast");
+  toast.textContent = message;
+  toast.classList.toggle("error", error);
+  toast.classList.add("visible");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove("visible"), 4400);
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(path, { cache: "no-store", ...options });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new ApiError(body.detail || `${response.status} ${response.statusText}`, response.status);
   }
-  if (Number.isFinite(perf.system_cpu_percent)) details.push(`CPU ${perf.system_cpu_percent.toFixed(0)}%`);
-  if (Number.isFinite(perf.process_cpu_percent)) details.push(`进程 ${perf.process_cpu_percent.toFixed(0)}%`);
-  if (Number.isFinite(perf.memory_available_bytes)) details.push(`可用内存 ${formatBytes(perf.memory_available_bytes)}`);
-  if (Number.isFinite(perf.disk_read_bytes_per_second)) details.push(`磁盘读 ${formatBytes(perf.disk_read_bytes_per_second)}/s`);
-  if (Number.isFinite(perf.process_read_bytes_per_second)) details.push(`进程读 ${formatBytes(perf.process_read_bytes_per_second)}/s`);
-  if (Number.isFinite(gpu.power_watts)) details.push(`${gpu.power_watts.toFixed(0)} W`);
-  return details;
+  if (response.status === 204) return null;
+  return response.json();
 }
 
-function activityGroup(label, title, details, kind = "") {
-  if (!title && details.length === 0) return "";
-  return `<div class="activity-group ${kind}">
-    <div class="activity-label">${label}</div>
-    <div class="activity-content">
-      ${title ? `<strong>${title}</strong>` : ""}
-      ${details.map((detail) => `<span>${detail}</span>`).join("")}
-    </div>
-  </div>`;
+function componentLabel(component) {
+  const labels = {
+    audio_vae: "Audio VAE",
+    video_vae: "Video VAE",
+    text_encoder: "Qwen 文本编码器",
+    fl2va_transformer: "FL2VA 主模型",
+    ref2va_transformer: "Ref2VA 主模型",
+    acceleration_lora: "加速 LoRA",
+    tokenizer: "H3 Tokenizer",
+    unknown: "未识别",
+  };
+  return labels[component] || component || "未识别";
 }
 
-function updateJobTimers() {
-  const now = Date.now();
-  $$("[data-job-elapsed]").forEach((element) => {
-    const job = state.jobs.find((item) => item.id === element.dataset.jobElapsed);
-    if (job) element.textContent = `耗时 ${jobElapsed(job, now)}`;
-  });
+function componentStatusLabel(status) {
+  return {
+    ready: "已验证",
+    source_ready: "原文件就绪",
+    download_required: "需要下载",
+    dependency_required: "等待基座",
+    incomplete: "文件不完整",
+    missing: "未生成",
+    invalid: "清单损坏",
+    unvalidated: "未验证",
+  }[status] || status || "未知";
+}
+
+function jobStatusLabel(status) {
+  return {
+    queued: "排队中",
+    running: "运行中",
+    completed: "已完成",
+    failed: "失败",
+  }[status] || status || "未知";
+}
+
+function jobKindLabel(job) {
+  const labels = {
+    inference: "推理生成",
+    download_export: "下载并自动切片",
+    export: "本地模型切片",
+    download: "模型下载",
+  };
+  return labels[job.kind] || job.kind || "任务";
+}
+
+function isActiveJob(job) {
+  return job.status === "queued" || job.status === "running";
+}
+
+function setConnection(online, message = "服务正常") {
+  const dot = $("#healthDot");
+  dot.classList.toggle("online", online);
+  dot.classList.toggle("error", !online);
+  $("#healthText").textContent = message;
+  $("#connectionBanner").classList.toggle("hidden", online);
+  if (!online) $("#connectionBanner").textContent = `工作台连接异常：${message}。界面会继续自动重试。`;
+}
+
+function renderSystem() {
+  if (!state.system) return;
+  const system = state.system;
+  const gpu = system.gpu || {};
+  const cuda = Array.isArray(system.providers) && system.providers.includes("CUDAExecutionProvider");
+  $("#workspacePath").textContent = system.workspace || "工作区未知";
+  $("#sidebarGpu").textContent = gpu.name || "未检测到 GPU";
+  $("#sidebarProvider").textContent = cuda ? "ONNX CUDA" : "ONNX CPU";
+  $("#sidebarMemory").textContent = `可用内存 ${formatBytes(system.memory_available_bytes)}`;
+  $("#providerDot").classList.toggle("online", cuda);
+}
+
+function presetProductReady(id) {
+  return state.exportPresets.find((preset) => preset.id === id)?.product?.ready === true;
+}
+
+function mainProductReady() {
+  return presetProductReady("fl2va_streaming");
+}
+
+function presetJob(preset) {
+  return state.jobs.find((job) => job.kind === "download_export" && (
+    job.model_id === preset.label
+    || job.result?.preset === preset.id
+  ));
+}
+
+function assetUrl(asset) {
+  if (!asset) return "";
+  const provided = asset.download_url || asset.url;
+  if (typeof provided === "string" && /^https:\/\//i.test(provided)) return provided;
+  if (!asset.repo_id || !asset.path) return "";
+  const path = String(asset.path).split("/").map((part) => encodeURIComponent(part)).join("/");
+  return `https://huggingface.co/${encodeURI(String(asset.repo_id))}/resolve/main/${path}?download=true`;
+}
+
+function assetRoleLabel(asset, index) {
+  return {
+    lora: "LoRA",
+    silu_timestep_grid: "SiLU 网格",
+    tokenizer: "Tokenizer",
+  }[asset?.role] || (index === 0 ? "原模型" : "辅助文件");
+}
+
+function renderModelOverview() {
+  const requiredChecks = [
+    presetProductReady("tokenizer"),
+    presetProductReady("qwen"),
+    mainProductReady(),
+    presetProductReady("video_vae"),
+    presetProductReady("audio_vae"),
+  ];
+  const requiredReady = requiredChecks.filter(Boolean).length;
+  const validated = state.exportPresets.filter((preset) => preset.product?.ready).length;
+  const readySources = new Set(state.exportPresets.flatMap((preset) => preset.sources || [])
+    .filter((source) => source.ready)
+    .map((source) => `${source.repo_id}:${source.path}`)).size;
+  const modelTasks = state.jobs.filter((job) => ["download_export", "export"].includes(job.kind) && isActiveJob(job)).length;
+  $("#requiredModelMetric").textContent = state.loaded.presets ? `${requiredReady} / ${requiredChecks.length}` : "--";
+  $("#validatedModelMetric").textContent = state.loaded.presets ? `${validated} / ${state.exportPresets.length}` : "--";
+  $("#sourceModelMetric").textContent = state.loaded.presets ? `${readySources} 个` : "--";
+  $("#modelTaskMetric").textContent = state.loaded.jobs ? `${modelTasks} 个` : "--";
+  const freeBytes = finite(state.modelWorkspace?.disk?.free_bytes);
+  $("#diskNotice").textContent = `原始权重受 MiniMax H3 Community License Agreement 约束。${freeBytes === null ? "任务启动前会检查所需空间。" : `当前工作盘可用 ${formatBytes(freeBytes)}，任务会再次检查源文件、切片或适配器产物所需空间。`}`;
+
+  const profile = state.profiles[0];
+  const status = $("#modelReadiness");
+  status.classList.remove("warning", "error", "neutral");
+  if (!state.loaded.presets || !state.loaded.profiles) {
+    status.classList.add("neutral");
+    status.querySelector("span:last-child").textContent = "正在检查模型";
+  } else if (profile?.generation_ready && requiredReady === requiredChecks.length) {
+    status.querySelector("span:last-child").textContent = "端到端链路已就绪";
+  } else {
+    status.classList.add("warning");
+    const missing = Math.max(0, requiredChecks.length - requiredReady);
+    status.querySelector("span:last-child").textContent = missing ? `缺少 ${missing} 个必需组件` : "主模型尚未就绪";
+  }
+}
+
+function renderExportPresets() {
+  const list = $("#exportPresetList");
+  if (!state.loaded.presets) {
+    list.innerHTML = '<div class="loading-state"><span class="spinner"></span>正在读取可用方案</div>';
+    return;
+  }
+  if (state.exportPresets.length === 0) {
+    list.innerHTML = '<div class="empty-state"><strong>没有可用的验证方案</strong><span>服务端尚未登记原模型与切片配置。</span></div>';
+    return;
+  }
+
+  list.innerHTML = state.exportPresets.map((preset) => {
+    const job = presetJob(preset);
+    const active = job && isActiveJob(job);
+    const runtimeAdapter = preset.product_type === "runtime_adapter";
+    const dependencies = Array.isArray(preset.dependencies) ? preset.dependencies : [];
+    const dependencyMissing = dependencies.some((dependency) => dependency.ready !== true);
+    const status = active ? job.status : preset.status || (preset.product?.ready ? "ready" : "download_required");
+    const statusLabel = active ? jobStatusLabel(job.status) : componentStatusLabel(status);
+    const assets = Array.isArray(preset.sources) && preset.sources.length
+      ? preset.sources.map((asset, index) => [assetRoleLabel(asset, index), asset])
+      : [["原模型", preset.source], ["LoRA", preset.lora], ["辅助文件", preset.support]].filter(([, asset]) => asset);
+    const sourceLines = assets.map(([label, asset]) => {
+      const href = assetUrl(asset);
+      const identity = `${asset.repo_id || "来源"} · ${asset.path || "文件"}`;
+      const sourceLabel = asset.ready === true ? `${label} ✓` : label;
+      return `<div class="source-line"><span>${escapeHtml(sourceLabel)}</span>${href
+        ? `<a href="${escapeHtml(href)}" title="${escapeHtml(identity)}" target="_blank" rel="noreferrer">${escapeHtml(identity)}</a>`
+        : `<span title="${escapeHtml(identity)}">${escapeHtml(identity)}</span>`}</div>`;
+    }).join("");
+    const dependencyLines = dependencies.map((dependency) => {
+      const label = dependency.ready === true ? "依赖 ✓" : "依赖";
+      const detail = `${dependency.label || dependency.id}${dependency.ready === true ? " 已验证" : " 尚未就绪"}`;
+      return `<div class="source-line"><span>${escapeHtml(label)}</span><span title="${escapeHtml(dependency.path || detail)}">${escapeHtml(detail)}</span></div>`;
+    }).join("");
+    const sources = `${sourceLines}${dependencyLines}`;
+    const progress = active ? clamp(finite(job.progress) ?? 0, 0, 1) : null;
+    const buttonLabel = active
+      ? jobStatusLabel(job.status)
+      : runtimeAdapter
+        ? status === "ready" ? "重新校验适配器" : status === "source_ready" ? "生成动态适配器" : "下载并生成适配器"
+        : status === "ready" ? "重新检查并切片" : status === "source_ready" ? "开始自动切片" : "下载并自动切片";
+    const sourceMetric = runtimeAdapter ? "适配文件" : "原文件";
+    const productMetric = runtimeAdapter ? "拓扑产物" : "切片产物";
+    const actionDetail = dependencyMissing
+      ? `先完成 ${dependencies.find((dependency) => dependency.ready !== true)?.label || "依赖模型"}`
+      : preset.product?.ready
+        ? `当前产物 ${formatBytes(preset.product.size_bytes)}`
+        : status === "source_ready" ? "源文件已缓存" : "HTTP Range 断点续传";
+    return `<article class="preset-row">
+      <div class="preset-identity">
+        <div class="preset-title-line"><strong>${escapeHtml(preset.label)}</strong><span class="status-pill ${safeClass(status)}">${escapeHtml(statusLabel)}</span></div>
+        <p>${escapeHtml(preset.description)}</p>
+      </div>
+      <div class="preset-source">${sources}</div>
+      <dl class="preset-metrics">
+        <div><dt>${sourceMetric}</dt><dd>${formatBytes(preset.download_size_bytes)}</dd></div>
+        <div><dt>${productMetric}</dt><dd>${formatBytes(preset.output_size_bytes)}</dd></div>
+        <div><dt>空间需求</dt><dd>${formatBytes(preset.required_space_bytes)}</dd></div>
+      </dl>
+      <div class="preset-actions">
+        <button class="primary-button preset-export-button" type="button" data-preset="${escapeHtml(preset.id)}" ${active || dependencyMissing ? "disabled" : ""}>${escapeHtml(buttonLabel)}</button>
+        <small>${escapeHtml(actionDetail)}</small>
+      </div>
+      ${progress !== null ? `<div class="pipeline-progress"><div class="progress-track"><div class="progress-bar" style="width:${(progress * 100).toFixed(1)}%"></div></div><small>${Math.round(progress * 100)}% · ${escapeHtml(job.message)}</small></div>` : ""}
+    </article>`;
+  }).join("");
+}
+
+function renderComponents() {
+  const grid = $("#componentGrid");
+  const empty = $("#componentsEmpty");
+  if (!state.loaded.presets || state.exportPresets.length === 0) {
+    grid.innerHTML = state.loaded.presets ? "" : '<div class="loading-state"><span class="spinner"></span>正在读取组件状态</div>';
+    empty.classList.toggle("hidden", !state.loaded.presets);
+    $("#componentCount").textContent = "--";
+    return;
+  }
+  empty.classList.add("hidden");
+  const ready = state.exportPresets.filter((preset) => preset.product?.ready).length;
+  $("#componentCount").textContent = `${ready} / ${state.exportPresets.length} 已验证`;
+  grid.innerHTML = state.exportPresets.map((preset) => {
+    const status = preset.status || (preset.product?.ready ? "ready" : "download_required");
+    const runtimeAdapter = preset.product_type === "runtime_adapter";
+    const detail = status === "dependency_required" ? "需要先完成 FL2VA 流式基座"
+      : preset.product?.ready
+        ? runtimeAdapter ? "动态叠加拓扑与适配器清单已验证" : "产物清单与运行拓扑已验证"
+        : status === "source_ready" ? runtimeAdapter ? "LoRA 与 SiLU 网格已就绪" : "原文件已就绪，等待切片"
+          : runtimeAdapter ? "需要下载 LoRA 与 SiLU 网格" : "需要下载原文件";
+    return `<article class="component-item">
+      <strong title="${escapeHtml(preset.label)}">${escapeHtml(preset.label)}</strong>
+      <span class="status-pill ${safeClass(status)}">${escapeHtml(componentStatusLabel(status))}</span>
+      <p title="${escapeHtml(preset.product?.path || preset.output_dir || "")}">${escapeHtml(detail)} · ${formatBytes(preset.product?.size_bytes)}</p>
+    </article>`;
+  }).join("");
+}
+
+function renderModels() {
+  const body = $("#modelsBody");
+  $("#modelCount").textContent = `${state.models.length} 个文件`;
+  $("#modelsEmpty").classList.toggle("hidden", state.models.length > 0 || !state.loaded.models);
+  if (!state.loaded.models) {
+    body.innerHTML = '<tr><td colspan="7"><div class="loading-state compact"><span class="spinner"></span>正在扫描原模型</div></td></tr>';
+    return;
+  }
+  body.innerHTML = state.models.map((model, index) => {
+    const supported = Boolean(model.export_supported);
+    let scope = '<span class="type-pill">Encoder + Decoder</span>';
+    if (model.component === "video_vae") {
+      scope = `<select class="scope-select" data-model-index="${index}" aria-label="Video VAE 切片范围"><option value="0">Block 0 冒烟验证</option><option value="all">全部 36 Blocks</option></select>`;
+    } else if (["fl2va_transformer", "ref2va_transformer"].includes(model.component)) {
+      scope = `<select class="scope-select" data-model-index="${index}" aria-label="主模型切片范围"><option value="0">Block 0 冒烟验证</option><option value="all">全部 50 Blocks</option></select>`;
+    } else if (model.component === "text_encoder") {
+      scope = `<span class="type-pill">全部 50 Layers</span>`;
+    }
+    return `<tr>
+      <td><span class="model-name" title="${escapeHtml(model.name)}">${escapeHtml(model.name)}</span><span class="model-path" title="${escapeHtml(model.id)}">${escapeHtml(model.id)}</span></td>
+      <td><span class="type-pill">${escapeHtml(componentLabel(model.component))}</span></td>
+      <td>${escapeHtml(model.dtype || "--")}</td>
+      <td>${formatBytes(model.size_bytes)}</td>
+      <td>${escapeHtml(model.tensor_count ?? "--")}</td>
+      <td>${scope}</td>
+      <td><button class="secondary-button table-action export-button" type="button" data-model-index="${index}" ${supported ? "" : "disabled"}>切片并验证</button></td>
+    </tr>`;
+  }).join("");
+}
+
+function renderModelPage() {
+  renderModelOverview();
+  renderExportPresets();
+  renderComponents();
+  renderModels();
 }
 
 function videoVaeOutputFrames(latentFrames) {
@@ -92,377 +431,826 @@ function videoVaeOutputFrames(latentFrames) {
 }
 
 function videoLatentFramesForOutput(outputFrames) {
-  let latentFrames = 1;
+  let latentFrames = 2;
   while (videoVaeOutputFrames(latentFrames) < outputFrames) latentFrames += 1;
   return latentFrames;
 }
 
-function showToast(message, error = false) {
-  const toast = $("#toast");
-  toast.textContent = message;
-  toast.classList.toggle("error", error);
-  toast.classList.add("visible");
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toast.classList.remove("visible"), 4200);
+function temporalMode() {
+  return $('input[name="temporalMode"]:checked')?.value || "segmented";
 }
 
-async function api(path, options) {
-  const response = await fetch(path, options);
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({}));
-    throw new Error(body.detail || `${response.status} ${response.statusText}`);
-  }
-  return response.json();
+function parsedTokenIds() {
+  const raw = $("#tokenIdsInput").value.trim();
+  if (!raw) return { values: [], valid: true };
+  const parts = raw.split(",").map((value) => value.trim());
+  if (parts.some((part) => !/^-?\d+$/.test(part))) return { values: [], valid: false, message: "Token IDs 必须是逗号分隔的整数" };
+  const values = parts.map(Number);
+  if (values.length > 192) return { values, valid: false, message: "Token IDs 不能超过 192 个" };
+  if (values.some((value) => !Number.isSafeInteger(value))) return { values, valid: false, message: "Token ID 超出整数范围" };
+  if (values.some((value) => value < 0)) return { values, valid: false, message: "Token ID 不能为负数" };
+  return { values, valid: true };
 }
 
-function componentLabel(component) {
-  const labels = {
-    audio_vae: "Audio VAE",
-    video_vae: "Video VAE",
-    text_encoder: "Text Encoder",
-    fl2va_transformer: "FL2VA",
-    ref2va_transformer: "Ref2VA",
-    acceleration_lora: "加速 LoRA",
-    unknown: "Unknown",
-  };
-  return labels[component] || component;
-}
-
-function componentStatusLabel(status) {
-  return { ready: "完整", incomplete: "不完整", missing: "未安装", invalid: "清单损坏", unvalidated: "未验证" }[status] || status;
-}
-
-function renderDownloadComponents() {
-  const list = $("#downloadList");
-  if (!list) return;
-  list.innerHTML = state.components.map((item) => {
-    const checked = item.status !== "ready" ? "checked" : "";
-    const disabled = item.status === "ready" ? "disabled" : "";
-    const size = item.size_bytes ? formatBytes(item.size_bytes) : "待下载";
-    const missing = item.missing_files?.length ? `缺少 ${item.missing_files.length} 个文件` : "文件清单正常";
-    return `<label class="download-item ${item.status}"><input type="checkbox" value="${item.id}" ${checked} ${disabled}><span class="download-item-main"><strong>${item.label}</strong><small>${item.role} · ${size} · ${missing}</small></span><span class="download-status">${componentStatusLabel(item.status)}</span></label>`;
-  }).join("");
-  const incomplete = state.components.filter((item) => item.status !== "ready").length;
-  $("#downloadSummary").textContent = `${incomplete} 个组件需要处理 / ${state.components.length} 个已登记`;
-}
-
-function renderExportPresets() {
-  const list = $("#exportPresetList");
-  if (!list) return;
-  list.innerHTML = state.exportPresets.map((preset) => {
-    const assets = [preset.source, preset.lora, preset.support].filter(Boolean);
-    const sources = assets.map((asset) => `<span title="${asset.repo_id}/${asset.path}">${asset.repo_id} · ${asset.path}</span>`).join("");
-    return `<article class="preset-row">
-      <div class="preset-copy"><strong>${preset.label}</strong><p>${preset.description}</p><div class="preset-sources">${sources}</div></div>
-      <dl><div><dt>下载</dt><dd>${formatBytes(preset.download_size_bytes)}</dd></div><div><dt>预计 ONNX</dt><dd>${formatBytes(preset.output_size_bytes)}</dd></div><div><dt>空间需求</dt><dd>${formatBytes(preset.required_space_bytes)}</dd></div></dl>
-      <button class="command-button preset-export-button" data-preset="${preset.id}" type="button">下载并切片</button>
-    </article>`;
-  }).join("");
-  $$(".preset-export-button").forEach((button) => button.addEventListener("click", () => startPresetExport(button.dataset.preset)));
-}
-
-function renderSystem() {
-  const system = state.system;
-  if (!system) return;
-  $("#workspacePath").textContent = system.workspace;
-  $("#gpuName").textContent = system.gpu.name || "CPU only";
-  $("#gpuMemory").textContent = system.gpu.memory_bytes ? formatBytes(system.gpu.memory_bytes) : "--";
-  $("#ramAvailable").textContent = formatBytes(system.memory_available_bytes);
-  $("#providerName").textContent = system.providers.includes("CUDAExecutionProvider") ? "ONNX CUDA" : "ONNX CPU";
-  $("#healthDot").classList.add("online");
-  $("#healthText").textContent = "服务正常";
-
-  const rows = [
-    ["操作系统", system.platform],
-    ["Python", system.python],
-    ["PyTorch", `${system.torch} / CUDA ${system.gpu.cuda || "N/A"}`],
-    ["ONNX Runtime", system.onnxruntime],
-    ["Execution Providers", system.providers.join(", ")],
-    ["系统内存", `${formatBytes(system.memory_available_bytes)} 可用 / ${formatBytes(system.memory_total_bytes)}`],
-    ["分页文件", `${formatBytes(system.pagefile_used_bytes)} 已用 / ${formatBytes(system.pagefile_total_bytes)}`],
-    ["L2 分片缓存", `${formatBytes(system.l2_cache_bytes)} / 向前预取 ${system.prefetch_shards} 个图`],
-    ["GPU", system.gpu.name || "不可用"],
-    ["工作区", system.workspace],
-  ];
-  $("#systemGrid").innerHTML = rows.map(([key, value]) => `<dt>${key}</dt><dd>${value}</dd>`).join("");
-}
-
-function renderModels() {
-  const body = $("#modelsBody");
-  $("#modelCount").textContent = `${state.models.length} 个组件`;
-  $("#modelsEmpty").classList.toggle("hidden", state.models.length > 0);
-  body.innerHTML = state.models.map((model, index) => {
-    const supported = model.export_supported;
-    let scope = "Encoder + Decoder";
-    if (model.component === "video_vae") {
-      scope = `<select id="scope-${index}" aria-label="Video VAE 导出范围"><option value="0">Block 0 冒烟验证</option><option value="all">全部 36 Blocks</option></select>`;
-    } else if (["fl2va_transformer", "ref2va_transformer"].includes(model.component)) {
-      scope = `<select id="scope-${index}" aria-label="主模型导出范围"><option value="0">Block 0 冒烟验证</option><option value="all">全部 50 Blocks</option></select>`;
-    } else if (model.component === "text_encoder") {
-      scope = `<select id="scope-${index}" aria-label="文本编码器导出范围"><option value="0">Layer 0 冒烟验证</option><option value="all">全部 50 Layers</option></select>`;
-    }
-    return `<tr>
-      <td><span class="model-name" title="${model.name}">${model.name}</span><span class="model-path">${model.id}</span></td>
-      <td><span class="tag ${supported ? "" : "unsupported"}">${componentLabel(model.component)}</span></td>
-      <td>${model.dtype}</td>
-      <td>${formatBytes(model.size_bytes)}</td>
-      <td>${model.tensor_count}</td>
-      <td>${scope}</td>
-      <td><button class="command-button export-button" data-index="${index}" ${supported ? "" : "disabled"}>导出并验证</button></td>
-    </tr>`;
-  }).join("");
-
-  $$(".export-button").forEach((button) => button.addEventListener("click", () => startExport(Number(button.dataset.index))));
-}
-
-function renderJobs() {
-  $("#jobCount").textContent = `${state.jobs.length} 个任务`;
-  $("#jobsEmpty").classList.toggle("hidden", state.jobs.length > 0);
-  $("#jobsList").classList.toggle("hidden", state.jobs.length === 0);
-  $("#jobsList").innerHTML = state.jobs.map((job) => {
-    const activity = job.activity || {};
-    const prefetch = job.prefetch || {};
-    const performance = performanceDetails(job);
-    const positionDetails = [];
-    const executionDetails = [];
-    const cacheDetails = [];
-    if (activity.sampling_step) positionDetails.push(`步数 ${activity.sampling_step}/${activity.sampling_steps}`);
-    if (activity.segment) positionDetails.push(`片段 ${activity.segment}/${activity.segments}`);
-    if (activity.current !== undefined && activity.total !== undefined) {
-      const unit = activity.module === "Qwen" ? "Layer" : activity.module === "Video VAE" ? "Block" : "Block";
-      positionDetails.push(`${unit} ${activity.current}/${activity.total}`);
-    }
-    if (activity.shard) positionDetails.push(`分片 ${activity.shard}/${activity.shards}`);
-    if (activity.tile) positionDetails.push(`Tile ${activity.tile}/${activity.tiles}`);
-    if (activity.provider) positionDetails.push(activity.provider.replace("ExecutionProvider", ""));
-    if (activity.elapsed_seconds !== undefined) positionDetails.push(`本片 ${Number(activity.elapsed_seconds).toFixed(2)}s`);
-    if (activity.qkv_chunk_tokens) executionDetails.push(`QKV ${activity.qkv_chunk_tokens}`);
-    if (activity.qkv_buffer_dtype) executionDetails.push(`QKV Buffer ${activity.qkv_buffer_dtype.toUpperCase()}`);
-    if (activity.attention_output_chunk_tokens) executionDetails.push(`Attention Out ${activity.attention_output_chunk_tokens}`);
-    if (activity.mlp_chunk_tokens) executionDetails.push(`MLP ${activity.mlp_chunk_tokens}`);
-    if (activity.chunk_io_binding) executionDetails.push("I/O Binding");
-    if (activity.attention_buffer_dtype) executionDetails.push(`Attended ${activity.attention_buffer_dtype.toUpperCase()}`);
-    if (activity.l1_sessions) cacheDetails.push(`L1 ${activity.l1_sessions} 分片 / ${formatBytes(activity.l1_weight_bytes)}`);
-    if (activity.l2_budget_bytes) {
-      cacheDetails.push(`L2 ${formatBytes(activity.l2_staged_bytes)} / ${formatBytes(activity.l2_budget_bytes)}`);
-      cacheDetails.push(`就绪 ${activity.l2_ready}/${activity.l2_entries}`);
-      cacheDetails.push(`命中 ${activity.l2_hits} / 等待 ${activity.l2_waits}`);
-    }
-    if (activity.vram_free_bytes) cacheDetails.push(`规划显存 ${formatBytes(activity.vram_free_bytes)}`);
-    if (activity.batch_size) cacheDetails.push(`加载批次 ${activity.batch_index || 1}/${activity.batch_size}`);
-    if (activity.host_prefetch_budget_bytes !== undefined && activity.host_prefetch_budget_bytes !== null) {
-      cacheDetails.push(`提交余量 ${formatBytes(activity.host_prefetch_budget_bytes)}`);
-    }
-    const prefetchDetails = [];
-    if (prefetch.prefetch_layer) prefetchDetails.push(`Layer ${prefetch.prefetch_layer}/${prefetch.prefetch_total}`);
-    if (prefetch.shard) prefetchDetails.push(`分片 ${prefetch.shard}/${prefetch.shards}`);
-    if (prefetch.prefetch_ahead !== undefined) prefetchDetails.push(`向前 ${prefetch.prefetch_ahead} 片`);
-    if (prefetch.l1_prefetch_hits !== undefined) {
-      prefetchDetails.push(`L1 命中 ${prefetch.l1_prefetch_hits} / 等待 ${prefetch.l1_prefetch_waits}`);
-    }
-    if (prefetch.wait_seconds !== undefined) prefetchDetails.push(`等待 ${Number(prefetch.wait_seconds).toFixed(2)}s`);
-    const cacheTitle = prefetch.operation ? `预取: ${prefetch.operation}` : cacheDetails.length ? "缓存状态" : "";
-    return `<article class="job-row">
-    <div><div class="job-title" title="${job.model_id}">${job.model_id}</div><div class="job-message">${job.message}</div><div class="job-elapsed" data-job-elapsed="${job.id}">耗时 ${jobElapsed(job)}</div></div>
-    <span class="status ${job.status}">${job.status}</span>
-    <div class="progress-track" aria-label="${Math.round(job.progress * 100)}%"><div class="progress-bar" style="width:${job.progress * 100}%"></div></div>
-    <div class="job-actions">
-      <strong class="job-progress-value">${Math.round(job.progress * 100)}%</strong>
-      <div class="job-links">
-        ${job.kind === "inference" && job.status === "completed" ? `<a href="/api/jobs/${job.id}/output">下载 MP4</a>` : ""}
-        ${job.kind === "inference" && job.result?.metadata ? `<a href="/api/jobs/${job.id}/metadata">元数据</a>` : ""}
-        ${job.kind === "inference" && job.performance_log ? `<a href="/api/jobs/${job.id}/performance">性能日志</a>` : ""}
-      </div>
-    </div>
-    <div class="job-activity">
-      ${activityGroup("当前计算", `${activity.module || "Queue"} · ${activity.operation || "Waiting"}`, positionDetails, "compute")}
-      ${activityGroup("执行参数", "", executionDetails, "execution")}
-      ${activityGroup("缓存与预取", cacheTitle, [...cacheDetails, ...prefetchDetails], "cache")}
-      ${activityGroup("实时性能", "", performance, "performance")}
-    </div>
-  </article>`;
-  }).join("");
-  updateJobTimers();
+function preflightRow(label, detail, stateName, trailing) {
+  const icon = stateName === "passed" ? "✓" : stateName === "warning" ? "!" : "×";
+  const className = stateName === "passed" ? "" : stateName;
+  return `<div class="preflight-row ${className}"><span class="preflight-icon">${icon}</span><div><strong>${escapeHtml(label)}</strong><small title="${escapeHtml(detail)}">${escapeHtml(detail)}</small></div><span>${escapeHtml(trailing)}</span></div>`;
 }
 
 function renderProfiles() {
   const profile = state.profiles[0];
-  if (!profile) return;
-  $("#inferenceProvider").textContent = profile.cuda_provider_available ? "CUDA" : "CPU";
-  const width = Math.max(128, Math.min(1024, Number($("#widthInput").value) || profile.output_width));
-  const height = Math.max(128, Math.min(1024, Number($("#heightInput").value) || profile.output_height));
+  const provider = $("#inferenceProvider");
+  const prompt = $("#promptInput").value.trim();
+  const tokens = parsedTokenIds();
+  $("#promptCounter").textContent = `${$("#promptInput").value.length} / 4000`;
+
+  if (!profile) {
+    provider.className = "header-status neutral";
+    provider.querySelector("span:last-child").textContent = state.loaded.profiles ? "没有可用配置" : "正在预检";
+    $("#generateButton").disabled = true;
+    $("#preflightList").innerHTML = state.loaded.profiles
+      ? preflightRow("推理配置", "服务端没有返回生成配置", "failed", "阻塞")
+      : '<div class="loading-state compact"><span class="spinner"></span>正在检查</div>';
+    $("#profileGrid").innerHTML = "";
+    return;
+  }
+
+  const width = clamp(finite($("#widthInput").value) || profile.output_width || 640, 128, 1024);
+  const height = clamp(finite($("#heightInput").value) || profile.output_height || 360, 128, 1024);
+  const duration = clamp(finite($("#durationInput").value) || profile.frames / profile.fps, 0.1, 15);
+  const steps = clamp(finite($("#stepsInput").value) || 4, 1, 50);
   const paddedWidth = Math.ceil(width / 32) * 32;
   const paddedHeight = Math.ceil(height / 32) * 32;
-  const duration = Math.max(0.1, Math.min(15, Number($("#durationInput").value) || profile.frames / profile.fps));
   const targetFrames = Math.max(1, Math.round(duration * profile.fps));
-  const temporalMode = $("#temporalMode").value;
-  const segments = temporalMode === "segmented" ? Math.ceil(targetFrames / profile.frames) : 1;
-  const steps = Math.max(1, Math.min(50, Number($("#stepsInput").value) || 4));
-  const accelerationActive = profile.acceleration_ready && steps >= 4 && steps <= 8;
-  const latentFrames = temporalMode === "native" ? videoLatentFramesForOutput(targetFrames) : profile.video_latent_frames;
-  const audioTokens = temporalMode === "native" ? Math.ceil(targetFrames * 40 / profile.fps) * 2 : profile.audio_tokens;
+  const mode = temporalMode();
+  const segments = mode === "segmented" ? Math.ceil(targetFrames / profile.frames) : 1;
+  const turboSteps = steps >= 4 && steps <= 8;
+  const baseReady = Boolean(profile.main_ready);
+  const adapterReady = Boolean(profile.acceleration_ready);
+  const accelerationActive = Boolean(baseReady && adapterReady && turboSteps);
+  const latentFrames = mode === "native" ? videoLatentFramesForOutput(targetFrames) : profile.video_latent_frames;
+  const audioTokens = mode === "native" ? Math.ceil(targetFrames * 40 / profile.fps) * 2 : profile.audio_tokens;
   const videoTokens = latentFrames * (paddedHeight / 32) * (paddedWidth / 32);
   const sequenceTokens = profile.text_tokens + audioTokens + videoTokens;
   const qkvCpuBytes = sequenceTokens * 56 * 384 * 2;
   const kvGpuBytes = sequenceTokens * 56 * 128 * 2 * 2;
-  const queryChunk = Number($("#queryChunkSelect").value) || 128;
+  const queryChunk = Number($("#queryChunkSelect").value) || 256;
+  const videoReady = presetProductReady("video_vae");
+  const audioReady = presetProductReady("audio_vae");
+  const contentReady = Boolean(prompt || tokens.values.length) && tokens.valid;
+  const tokenizerReady = !prompt || Boolean(profile.tokenizer_ready);
+  const mainReady = baseReady;
+  const stepScheduleReady = !turboSteps || accelerationActive;
+  const dimensionsReady = width >= 128 && width <= 1024 && height >= 128 && height <= 1024;
+  const componentsKnown = state.loaded.presets;
+  const mediaReady = !componentsKnown || (videoReady === true && audioReady === true);
+  const canStart = Boolean(profile.generation_ready && mainReady && stepScheduleReady && contentReady && tokenizerReady && dimensionsReady && mediaReady);
+
+  provider.className = `header-status ${profile.cuda_provider_available ? "" : "warning"}`.trim();
+  provider.querySelector("span:last-child").textContent = profile.cuda_provider_available ? "CUDA 推理" : "CPU 推理（较慢）";
+
+  const checks = [
+    ["执行后端", profile.cuda_provider_available ? "CUDAExecutionProvider 可用" : "将使用 CPUExecutionProvider", profile.cuda_provider_available ? "passed" : "warning", profile.cuda_provider_available ? "CUDA" : "CPU"],
+    ["Qwen 文本编码器", profile.qwen_ready ? "验证产物可用" : "缺少或未通过验证", profile.qwen_ready ? "passed" : "failed", profile.qwen_ready ? "通过" : "阻塞"],
+    ["FL2VA 流式基座", mainReady ? "50 Block 基座产物可用" : "缺少或未通过验证", mainReady ? "passed" : "failed", mainReady ? "通过" : "阻塞"],
+    ["Turbo v4 动态 LoRA", turboSteps ? adapterReady ? "运行时适配器已就绪，将动态叠加" : "4–8 步必须先生成动态适配器" : adapterReady ? "适配器已就绪，当前步数不启用" : "当前步数使用基座，不要求适配器", stepScheduleReady ? "passed" : "failed", accelerationActive ? "启用" : stepScheduleReady ? "不启用" : "阻塞"],
+    ["Video / Audio VAE", !componentsKnown ? "组件状态尚未返回" : mediaReady ? "编码与解码组件均可用" : "缺少 Video VAE 或 Audio VAE", !componentsKnown ? "warning" : mediaReady ? "passed" : "failed", !componentsKnown ? "待检查" : mediaReady ? "通过" : "阻塞"],
+    ["文本输入", contentReady && tokenizerReady ? (prompt ? "Tokenizer 与提示词可用" : `${tokens.values.length} 个 Token IDs`) : !tokens.valid ? tokens.message : prompt ? "Tokenizer 文件不完整" : "请输入提示词或 Token IDs", contentReady && tokenizerReady ? "passed" : "failed", contentReady && tokenizerReady ? "通过" : "阻塞"],
+    ["输出规格", dimensionsReady ? `${width} × ${height}，${targetFrames} 帧` : "宽高必须在 128–1024 之间", dimensionsReady ? "passed" : "failed", dimensionsReady ? "通过" : "阻塞"],
+  ];
+  $("#preflightList").innerHTML = checks.map((row) => preflightRow(...row)).join("");
+  const passed = checks.filter((row) => row[2] === "passed").length;
+  $("#preflightSummary").textContent = `${passed} / ${checks.length} 通过`;
+
   const rows = [
-    ["输出", `${width}×${height} / ${targetFrames} 帧 / ${(targetFrames / profile.fps).toFixed(2)}s`],
-    ["主模型", accelerationActive ? "Turbo v4 加速版" : "基础版"],
-    ["时序计划", temporalMode === "native" ? `${latentFrames} latent / 整体` : `${segments} 段 / ${segments * steps} 次去噪`],
-    ["注意力序列", `${sequenceTokens} tokens / query ${queryChunk}`],
-    ["CPU QKV 缓存 (FP16)", formatBytes(qkvCpuBytes)],
+    ["输出", `${width} × ${height} / ${targetFrames} 帧`],
+    ["预计时长", `${(targetFrames / profile.fps).toFixed(2)} 秒 @ ${profile.fps} FPS`],
+    ["主模型", "FL2VA 流式基座"],
+    ["运行时适配", accelerationActive ? "Turbo v4 动态 LoRA" : "未启用"],
+    ["时序", mode === "native" ? `${latentFrames} latent / 整体` : `${segments} 段 / ${segments * steps} 次去噪`],
+    ["注意力", `${sequenceTokens} tokens / query ${queryChunk}`],
+    ["CPU QKV 缓存", formatBytes(qkvCpuBytes)],
     ["GPU K/V 缓存", formatBytes(kvGpuBytes)],
   ];
-  $("#profileGrid").innerHTML = rows.map(([key, value]) => `<div><dt>${key}</dt><dd>${value}</dd></div>`).join("");
-  const warning = $("#runtimeWarning");
+  $("#profileGrid").innerHTML = rows.map(([key, value]) => `<div><dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("");
+
   const notices = [];
-  if (!profile.cuda_provider_available) notices.push("当前 ONNX Runtime 没有 CUDAExecutionProvider，将使用 CPU 执行。");
-  if (!profile.acceleration_ready && steps >= 4 && steps <= 8) notices.push("加速 LoRA 主模型变体尚未完成，将使用基础模型。");
-  if (!profile.main_ready && profile.acceleration_ready && (steps < 4 || steps > 8)) notices.push("当前仅安装 Turbo v4 主模型，请使用 4-8 步；其他步数需要基础主模型。");
-  if (!profile.tokenizer_ready) notices.push("Tokenizer 尚未落盘，当前仅接受 Token IDs。");
-  if (temporalMode === "segmented" && segments > 1) notices.push("分段模式会独立生成 17 帧片段；当前尚未接入首帧续接，段间画面可能跳变。");
-  if (temporalMode === "native" && targetFrames > profile.frames) notices.push("整体模式保持完整时间序列；长时间 Video VAE 将使用 GPU 时间窗口解码。");
-  if (steps < 5 && !accelerationActive) notices.push("基础主模型低于 5 步时音频支路可能数值失稳；异常时任务会保留视频并使用静音轨。");
+  if (!profile.cuda_provider_available) notices.push("当前 ONNX Runtime 没有 CUDAExecutionProvider，CPU 执行会非常缓慢。");
+  if (!adapterReady && turboSteps) notices.push("4–8 步要求 Turbo v4 动态 LoRA；系统不会静默回退到基座低步数，请先在模型页生成适配器。");
+  if (!baseReady && adapterReady) notices.push("动态 LoRA 不能独立运行，请先完成 FL2VA 流式基座。");
+  if (mode === "segmented" && segments > 1) notices.push("分段模式尚未接入首帧续接，多段画面可能出现跳变。");
+  if (mode === "native" && targetFrames > profile.frames) notices.push("长序列 Video VAE 会使用 GPU 时间窗口解码。");
+  if (steps < 4) notices.push("当前步数使用流式基座；低步数可能导致画面语义或音频数值不稳定。");
+  const warning = $("#runtimeWarning");
   warning.classList.toggle("hidden", notices.length === 0);
   warning.textContent = notices.join(" ");
-  $("#generateButton").disabled = !profile.generation_ready;
+
+  $("#generateButton").disabled = !canStart;
+  $("#submitSummary").textContent = canStart ? `${width} × ${height} · ${targetFrames} 帧 · ${steps} 步` : "预检尚未通过";
+  $("#submitHint").textContent = canStart ? `${accelerationActive ? "基座 + Turbo v4 动态 LoRA" : "流式基座"} · ${mode === "native" ? "整体长序列" : "低显存分段"}` : "处理所有阻塞项后即可启动";
+}
+
+function updateResolutionPreset() {
+  const value = $("#resolutionPreset").value;
+  const custom = value === "custom";
+  $("#widthInput").disabled = !custom;
+  $("#heightInput").disabled = !custom;
+  if (!custom) {
+    const [width, height] = value.split("x").map(Number);
+    $("#widthInput").value = String(width);
+    $("#heightInput").value = String(height);
+  }
+  renderProfiles();
+}
+
+function activitySummary(job) {
+  const activity = job.activity || {};
+  const module = activity.module || jobKindLabel(job);
+  const operation = activity.operation || job.message || jobStatusLabel(job.status);
+  return `${module} · ${operation}`;
+}
+
+function rememberJobEvents(jobs) {
+  for (const job of jobs) {
+    const activity = job.activity || {};
+    const prefetch = job.prefetch || {};
+    const signature = JSON.stringify([
+      job.status,
+      Math.round((finite(job.progress) || 0) * 1000),
+      job.message,
+      activity.phase,
+      activity.module,
+      activity.operation,
+      activity.current,
+      activity.total,
+      prefetch.operation,
+    ]);
+    if (state.jobSignatures.get(job.id) === signature) continue;
+    state.jobSignatures.set(job.id, signature);
+    const events = state.jobEvents.get(job.id) || [];
+    let message = activitySummary(job);
+    if (prefetch.operation) message += `；预取：${prefetch.operation}`;
+    events.push({
+      time: new Date().toISOString(),
+      message,
+      error: job.status === "failed",
+    });
+    state.jobEvents.set(job.id, events.slice(-80));
+  }
+}
+
+function jobMatchesFilter(job) {
+  if (state.jobFilter === "all") return true;
+  if (state.jobFilter === "active") return isActiveJob(job);
+  return job.status === state.jobFilter;
+}
+
+function renderTaskSummary() {
+  const counts = { running: 0, queued: 0, completed: 0, failed: 0 };
+  state.jobs.forEach((job) => { if (Object.hasOwn(counts, job.status)) counts[job.status] += 1; });
+  $("#runningCount").textContent = String(counts.running);
+  $("#queuedCount").textContent = String(counts.queued);
+  $("#completedCount").textContent = String(counts.completed);
+  $("#failedCount").textContent = String(counts.failed);
+  $("#runningBadge").textContent = String(counts.running + counts.queued);
+  $("#runningBadge").classList.toggle("hidden", counts.running + counts.queued === 0);
+}
+
+function renderJobList() {
+  const jobs = state.jobs.filter(jobMatchesFilter);
+  $("#jobCount").textContent = `${jobs.length} / ${state.jobs.length} 个任务`;
+  $("#jobsEmpty").classList.toggle("hidden", jobs.length > 0 || !state.loaded.jobs);
+  const list = $("#jobsList");
+  list.classList.toggle("hidden", state.loaded.jobs && jobs.length === 0);
+  $("#jobInspector").classList.toggle("hidden", state.loaded.jobs && jobs.length === 0);
+  if (!state.loaded.jobs) {
+    list.innerHTML = '<div class="loading-state"><span class="spinner"></span>正在读取任务</div>';
+    return;
+  }
+  if (jobs.length === 0) {
+    const filtered = state.jobs.length > 0;
+    $("#jobsEmpty").innerHTML = filtered
+      ? '<strong>没有匹配的任务</strong><span>切换筛选条件可查看其他任务。</span>'
+      : '<strong>暂无任务</strong><span>从模型页或推理页启动一个任务后，进度会显示在这里。</span>';
+    list.innerHTML = "";
+    return;
+  }
+  if (!jobs.some((job) => job.id === state.selectedJobId)) {
+    state.selectedJobId = jobs.find(isActiveJob)?.id || jobs[0].id;
+  }
+  list.innerHTML = jobs.map((job) => {
+    const progress = clamp(finite(job.progress) || 0, 0, 1);
+    const status = safeClass(job.status);
+    return `<button class="job-list-item ${job.id === state.selectedJobId ? "selected" : ""}" type="button" data-job-id="${escapeHtml(job.id)}">
+      <div class="job-list-top"><span class="job-kind" title="${escapeHtml(job.model_id)}">${escapeHtml(jobKindLabel(job))} · ${escapeHtml(job.model_id)}</span><span class="status-pill ${status}">${escapeHtml(jobStatusLabel(job.status))}</span></div>
+      <div class="job-stage-line"><span title="${escapeHtml(activitySummary(job))}">${escapeHtml(activitySummary(job))}</span><strong class="job-progress-value">${Math.round(progress * 100)}%</strong></div>
+      <div class="progress-track"><div class="progress-bar ${job.status === "failed" ? "failed" : ""}" style="width:${(progress * 100).toFixed(1)}%"></div></div>
+      <div class="job-list-meta"><span class="job-id">${escapeHtml(job.id)}</span><span data-job-elapsed="${escapeHtml(job.id)}">耗时 ${jobElapsed(job)}</span></div>
+    </button>`;
+  }).join("");
+}
+
+function activityItems(job) {
+  const activity = job.activity || {};
+  const prefetch = job.prefetch || {};
+  const performance = job.performance?.performance || {};
+  const gpu = performance.gpu || {};
+  const items = [];
+  const push = (label, value) => { if (value !== null && value !== undefined && value !== "") items.push([label, value]); };
+  push("当前模块", activity.module);
+  push("当前操作", activity.operation);
+  if (activity.current !== undefined && activity.total !== undefined) push("执行位置", `${activity.current} / ${activity.total}`);
+  if (activity.sampling_step) push("采样步数", `${activity.sampling_step} / ${activity.sampling_steps}`);
+  if (activity.segment) push("视频片段", `${activity.segment} / ${activity.segments}`);
+  if (activity.shard) push("当前分片", `${activity.shard} / ${activity.shards}`);
+  if (activity.provider) push("执行后端", String(activity.provider).replace("ExecutionProvider", ""));
+  if (activity.elapsed_seconds !== undefined) push("本片耗时", `${Number(activity.elapsed_seconds).toFixed(2)} 秒`);
+  if (prefetch.operation) push("预取状态", prefetch.operation);
+  if (prefetch.l1_prefetch_hits !== undefined) push("L1 命中 / 等待", `${prefetch.l1_prefetch_hits} / ${prefetch.l1_prefetch_waits || 0}`);
+  const execution = [];
+  if (activity.qkv_chunk_tokens) execution.push(`QKV ${activity.qkv_chunk_tokens}`);
+  if (activity.attention_output_chunk_tokens) execution.push(`Attention ${activity.attention_output_chunk_tokens}`);
+  if (activity.mlp_chunk_tokens) execution.push(`MLP ${activity.mlp_chunk_tokens}`);
+  if (activity.chunk_io_binding) execution.push("I/O Binding");
+  if (execution.length) push("执行参数", execution.join(" · "));
+  const cache = [];
+  if (activity.l1_sessions) cache.push(`L1 ${activity.l1_sessions} 片`);
+  if (activity.l2_budget_bytes) cache.push(`L2 ${formatBytes(activity.l2_staged_bytes)} / ${formatBytes(activity.l2_budget_bytes)}`);
+  if (prefetch.prefetch_ahead !== undefined) cache.push(`向前 ${prefetch.prefetch_ahead} 片`);
+  if (cache.length) push("缓存与预取", cache.join(" · "));
+  if (finite(gpu.utilization_percent) !== null) push("GPU / CPU", `${formatPercent(gpu.utilization_percent)} / ${formatPercent(performance.system_cpu_percent)}`);
+  if (finite(gpu.memory_used_mib) !== null) push("显存", `${formatBytes(gpu.memory_used_mib * 1024 ** 2)} 已用`);
+  if (finite(performance.disk_read_bytes_per_second) !== null) push("磁盘读取", formatRate(performance.disk_read_bytes_per_second));
+  return items;
+}
+
+function artifactLinks(job) {
+  if (job.kind !== "inference") return "";
+  const links = [];
+  if (job.status === "completed") links.push(`<a class="link-button" href="/api/jobs/${encodeURIComponent(job.id)}/output">↓ 下载 MP4</a>`);
+  if (job.result?.metadata) links.push(`<a class="link-button" href="/api/jobs/${encodeURIComponent(job.id)}/metadata">{} 元数据</a>`);
+  if (job.performance_log) links.push(`<a class="link-button" href="/api/jobs/${encodeURIComponent(job.id)}/performance">↗ 性能日志</a>`);
+  return links.join("");
+}
+
+function renderJobInspector() {
+  const inspector = $("#jobInspector");
+  const job = state.jobs.find((item) => item.id === state.selectedJobId);
+  if (!job) {
+    inspector.innerHTML = '<div class="inspector-empty"><span aria-hidden="true">≡</span><strong>选择一个任务</strong><p>查看当前阶段、缓存状态、运行日志和产物。</p></div>';
+    return;
+  }
+  const progress = clamp(finite(job.progress) || 0, 0, 1);
+  const items = activityItems(job);
+  const events = state.jobEvents.get(job.id) || [];
+  const links = artifactLinks(job);
+  const eventHtml = events.length
+    ? events.map((event) => `<div class="log-line ${event.error ? "error" : ""}"><span class="log-time">${escapeHtml(shortTime(event.time))}</span><span>${escapeHtml(event.message)}</span></div>`).join("")
+    : '<div class="log-line"><span class="log-time">--:--:--</span><span>等待任务状态更新</span></div>';
+  inspector.innerHTML = `<div class="inspector-content">
+    <header class="inspector-header">
+      <div class="inspector-title"><h4 title="${escapeHtml(job.model_id)}">${escapeHtml(job.model_id)}</h4><span class="status-pill ${safeClass(job.status)}">${escapeHtml(jobStatusLabel(job.status))}</span></div>
+      <p>${escapeHtml(job.message || activitySummary(job))}</p>
+      <div class="inspector-progress"><div class="progress-track"><div class="progress-bar ${job.status === "failed" ? "failed" : ""}" style="width:${(progress * 100).toFixed(1)}%"></div></div><strong class="job-progress-value">${Math.round(progress * 100)}%</strong></div>
+    </header>
+    <div class="inspector-meta">
+      <div><span>任务类型</span><strong>${escapeHtml(jobKindLabel(job))}</strong></div>
+      <div><span>任务 ID</span><strong title="${escapeHtml(job.id)}">${escapeHtml(job.id)}</strong></div>
+      <div><span>累计耗时</span><strong data-job-elapsed="${escapeHtml(job.id)}">${jobElapsed(job)}</strong></div>
+    </div>
+    <section class="activity-panel"><h5 class="inspector-section-title">实时性能与执行参数</h5><div class="activity-grid">${items.length
+      ? items.map(([label, value]) => `<div class="activity-item"><span>${escapeHtml(label)}</span><strong title="${escapeHtml(value)}">${escapeHtml(value)}</strong></div>`).join("")
+      : '<div class="activity-item"><span>状态</span><strong>等待执行信息</strong></div>'}</div></section>
+    <section class="log-panel"><h5 class="inspector-section-title">任务日志</h5><div class="log-viewer" id="jobLogViewer">${eventHtml}</div>${job.error ? `<pre class="error-trace">${escapeHtml(job.error)}</pre>` : ""}</section>
+    ${links ? `<section class="artifact-panel"><h5 class="inspector-section-title">任务产物</h5><div class="artifact-links">${links}</div></section>` : ""}
+  </div>`;
+  const log = $("#jobLogViewer");
+  if (log) log.scrollTop = log.scrollHeight;
+}
+
+function renderJobs() {
+  rememberJobEvents(state.jobs);
+  renderTaskSummary();
+  renderJobList();
+  renderJobInspector();
+  renderModelOverview();
+  renderExportPresets();
+  updateJobTimers();
+  if (state.lastJobUpdate) $("#lastUpdated").textContent = `${shortTime(state.lastJobUpdate)} 更新`;
+}
+
+function updateJobTimers() {
+  const now = Date.now();
+  $$('[data-job-elapsed]').forEach((element) => {
+    const job = state.jobs.find((item) => item.id === element.dataset.jobElapsed);
+    if (!job) return;
+    const value = jobElapsed(job, now);
+    element.textContent = element.closest(".job-list-item") ? `耗时 ${value}` : value;
+  });
+}
+
+function normalizeTelemetry(payload, source) {
+  if (!payload || typeof payload !== "object") return null;
+  const envelope = payload.sample && typeof payload.sample === "object" ? payload.sample : payload;
+  const performance = envelope.performance && typeof envelope.performance === "object" ? envelope.performance : envelope;
+  const gpuGroup = performance.gpu && typeof performance.gpu === "object"
+    ? performance.gpu
+    : envelope.gpu && typeof envelope.gpu === "object" ? envelope.gpu : {};
+  const gpu = Array.isArray(gpuGroup.devices) && gpuGroup.devices.length ? gpuGroup.devices[0] : gpuGroup;
+  const cpu = performance.cpu && typeof performance.cpu === "object" ? performance.cpu : {};
+  const memory = performance.memory && typeof performance.memory === "object" ? performance.memory : {};
+  const disk = performance.disk && typeof performance.disk === "object" ? performance.disk : {};
+  const process = performance.process && typeof performance.process === "object" ? performance.process : {};
+  const system = state.system || {};
+  const vramUsedMib = finite(gpu.memory_used_mib ?? gpu.used_memory_mib ?? performance.gpu_memory_used_mib)
+    ?? (finite(gpu.memory_used_bytes) !== null ? gpu.memory_used_bytes / 1024 ** 2 : null);
+  const vramFreeMib = finite(gpu.memory_free_mib ?? gpu.free_memory_mib ?? performance.gpu_memory_free_mib)
+    ?? (finite(gpu.memory_free_bytes) !== null ? gpu.memory_free_bytes / 1024 ** 2 : null);
+  const vramTotalMib = finite(gpu.memory_total_mib ?? performance.gpu_memory_total_mib)
+    ?? (finite(gpu.memory_total_bytes) !== null ? gpu.memory_total_bytes / 1024 ** 2 : null)
+    ?? (vramUsedMib !== null && vramFreeMib !== null ? vramUsedMib + vramFreeMib : finite(system.gpu?.memory_bytes) !== null ? system.gpu.memory_bytes / 1024 ** 2 : null);
+  const ramAvailable = finite(memory.available_bytes ?? performance.memory_available_bytes ?? envelope.memory_available_bytes);
+  const ramTotal = finite(memory.total_bytes ?? performance.memory_total_bytes ?? envelope.memory_total_bytes ?? system.memory_total_bytes);
+  const ramPercent = finite(memory.percent ?? performance.memory_percent ?? envelope.memory_percent)
+    ?? (ramAvailable !== null && ramTotal ? (1 - ramAvailable / ramTotal) * 100 : null);
+  const vramCapacityPercent = vramUsedMib !== null && vramTotalMib ? vramUsedMib / vramTotalMib * 100 : null;
+  const sample = {
+    timestamp: envelope.timestamp || payload.timestamp || new Date().toISOString(),
+    sequence: envelope.sequence ?? payload.sequence ?? null,
+    source,
+    gpuUtil: finite(gpu.utilization_percent ?? gpu.utilization_gpu_percent ?? performance.gpu_utilization_percent),
+    cpuUtil: finite(cpu.system_percent ?? performance.system_cpu_percent ?? envelope.system_cpu_percent ?? performance.cpu_percent),
+    vramUsedMib,
+    vramTotalMib,
+    vramPercent: finite(gpu.memory_percent) ?? vramCapacityPercent,
+    ramAvailable,
+    ramTotal,
+    ramPercent,
+    diskRead: finite(disk.read_bytes_per_second ?? performance.disk_read_bytes_per_second ?? envelope.disk_read_bytes_per_second),
+    diskWrite: finite(disk.write_bytes_per_second ?? performance.disk_write_bytes_per_second ?? envelope.disk_write_bytes_per_second),
+    processRead: finite(process.read_bytes_per_second ?? disk.process_read_bytes_per_second ?? performance.process_read_bytes_per_second),
+    powerWatts: finite(gpu.power_watts),
+    temperatureC: finite(gpu.temperature_c),
+  };
+  const hasMetric = [sample.gpuUtil, sample.cpuUtil, sample.vramPercent, sample.ramPercent, sample.diskRead, sample.diskWrite].some((value) => value !== null);
+  return hasMetric ? sample : null;
+}
+
+function addTelemetrySample(sample) {
+  if (!sample) return;
+  const last = state.telemetry.at(-1);
+  const identity = sample.sequence !== null ? `${sample.source}:${sample.sequence}` : `${sample.source}:${sample.timestamp}`;
+  const lastIdentity = last ? (last.sequence !== null ? `${last.source}:${last.sequence}` : `${last.source}:${last.timestamp}`) : null;
+  if (identity === lastIdentity) return;
+  state.telemetry.push(sample);
+  if (state.telemetry.length > TELEMETRY_MAX_POINTS) state.telemetry.splice(0, state.telemetry.length - TELEMETRY_MAX_POINTS);
+  state.telemetrySource = sample.source;
+  renderTelemetry();
+}
+
+function latestJobTelemetry() {
+  const job = state.jobs.find((item) => item.status === "running" && item.performance?.performance)
+    || state.jobs.find((item) => item.performance?.performance);
+  return job ? normalizeTelemetry(job.performance, "任务性能快照") : null;
+}
+
+function renderTelemetry() {
+  const sample = state.telemetry.at(-1);
+  const live = $("#telemetryLive");
+  live.className = "live-indicator idle";
+  if (sample) {
+    const age = Date.now() - Date.parse(sample.timestamp);
+    if (state.telemetryError) live.className = "live-indicator error";
+    else if (!Number.isFinite(age) || age < 6000) live.className = "live-indicator live";
+    live.querySelector("span").textContent = state.telemetryError ? "降级" : live.classList.contains("live") ? "实时" : "已暂停";
+    $("#telemetrySource").textContent = state.telemetryError
+      ? `${state.telemetryError} · 显示 ${shortTime(sample.timestamp)} 的最后采样`
+      : `${sample.source} · ${shortTime(sample.timestamp)} · ${sample.powerWatts !== null ? `${sample.powerWatts.toFixed(0)} W` : "功耗 --"}${sample.temperatureC !== null ? ` · ${sample.temperatureC.toFixed(0)} °C` : ""}`;
+    $("#utilizationValue").textContent = `${formatPercent(sample.gpuUtil)} GPU · ${formatPercent(sample.cpuUtil)} CPU`;
+    $("#memoryValue").textContent = sample.vramUsedMib !== null
+      ? `${formatBytes(sample.vramUsedMib * 1024 ** 2)} 显存`
+      : `${formatPercent(sample.ramPercent)} 内存`;
+    $("#diskValue").textContent = `${formatRate(sample.diskRead)} 读`;
+  } else {
+    live.className = state.telemetryError ? "live-indicator error" : "live-indicator idle";
+    live.querySelector("span").textContent = state.telemetryError ? "异常" : state.telemetryEndpointAvailable === false ? "待机" : "连接中";
+    $("#telemetrySource").textContent = state.telemetryError || (state.telemetryEndpointAvailable === false ? "等待工作台硬件采样或推理任务" : "正在连接硬件采样");
+    $("#utilizationValue").textContent = "--";
+    $("#memoryValue").textContent = "--";
+    $("#diskValue").textContent = "--";
+  }
+  scheduleCharts();
+}
+
+function chartSeriesValues(key) {
+  return state.telemetry.map((sample) => finite(sample[key]));
+}
+
+function drawLineChart(canvas, series, options = {}) {
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width < 2 || rect.height < 2) return;
+  const ratio = Math.min(window.devicePixelRatio || 1, 2);
+  const width = Math.round(rect.width);
+  const height = Math.round(rect.height);
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  const context = canvas.getContext("2d");
+  context.setTransform(ratio, 0, 0, ratio, 0, 0);
+  context.clearRect(0, 0, width, height);
+  const padding = { top: 9, right: 8, bottom: 18, left: options.leftPadding || 30 };
+  const plotWidth = Math.max(1, width - padding.left - padding.right);
+  const plotHeight = Math.max(1, height - padding.top - padding.bottom);
+  const allValues = series.flatMap((item) => item.values.filter((value) => value !== null));
+  const maximum = options.maximum || Math.max(options.minimumMaximum || 1, ...allValues, 0);
+  const axisMax = options.maximum || Math.max(options.minimumMaximum || 1, maximum * 1.12);
+
+  context.strokeStyle = "#e3e7e4";
+  context.fillStyle = "#8a948e";
+  context.lineWidth = 1;
+  context.font = "9px Consolas, monospace";
+  context.textAlign = "right";
+  context.textBaseline = "middle";
+  for (let index = 0; index <= 2; index += 1) {
+    const fraction = index / 2;
+    const y = padding.top + plotHeight * fraction;
+    context.beginPath();
+    context.moveTo(padding.left, y + 0.5);
+    context.lineTo(width - padding.right, y + 0.5);
+    context.stroke();
+    const labelValue = axisMax * (1 - fraction);
+    const label = options.percent ? `${labelValue.toFixed(0)}` : options.formatAxis ? options.formatAxis(labelValue) : labelValue.toFixed(0);
+    context.fillText(label, padding.left - 5, y);
+  }
+
+  const pointCount = Math.max(2, ...series.map((item) => item.values.length));
+  for (const item of series) {
+    context.strokeStyle = item.color;
+    context.lineWidth = 1.7;
+    context.lineJoin = "round";
+    context.lineCap = "round";
+    context.beginPath();
+    let drawing = false;
+    item.values.forEach((value, index) => {
+      if (value === null) {
+        drawing = false;
+        return;
+      }
+      const x = padding.left + (pointCount <= 1 ? plotWidth : index / (pointCount - 1) * plotWidth);
+      const y = padding.top + (1 - clamp(value / axisMax, 0, 1)) * plotHeight;
+      if (!drawing) {
+        context.moveTo(x, y);
+        drawing = true;
+      } else {
+        context.lineTo(x, y);
+      }
+    });
+    context.stroke();
+  }
+
+  return axisMax;
+}
+
+function drawCharts() {
+  chartFrame = null;
+  const utilizationValues = [...chartSeriesValues("gpuUtil"), ...chartSeriesValues("cpuUtil")].filter((value) => value !== null);
+  const memoryValues = [...chartSeriesValues("vramPercent"), ...chartSeriesValues("ramPercent")].filter((value) => value !== null);
+  const diskValues = [...chartSeriesValues("diskRead"), ...chartSeriesValues("diskWrite")].filter((value) => value !== null);
+  $("#utilizationEmpty").classList.toggle("hidden", utilizationValues.length > 0);
+  $("#memoryEmpty").classList.toggle("hidden", memoryValues.length > 0);
+  $("#diskEmpty").classList.toggle("hidden", diskValues.length > 0);
+  drawLineChart($("#utilizationChart"), [
+    { values: chartSeriesValues("gpuUtil"), color: "#16805c" },
+    { values: chartSeriesValues("cpuUtil"), color: "#3178a6" },
+  ], { maximum: 100, percent: true });
+  drawLineChart($("#memoryChart"), [
+    { values: chartSeriesValues("vramPercent"), color: "#8c6db0" },
+    { values: chartSeriesValues("ramPercent"), color: "#c58631" },
+  ], { maximum: 100, percent: true });
+  const diskMaximum = drawLineChart($("#diskChart"), [
+    { values: chartSeriesValues("diskRead"), color: "#3178a6" },
+    { values: chartSeriesValues("diskWrite"), color: "#b65a50" },
+  ], { minimumMaximum: 1024 ** 2, leftPadding: 46, formatAxis: (value) => formatBytes(value).replace(" ", "") });
+  $("#diskScale").textContent = diskValues.length ? `峰值 ${formatRate(diskMaximum)}` : "自动量程";
+}
+
+function scheduleCharts() {
+  if (chartFrame !== null) return;
+  chartFrame = requestAnimationFrame(drawCharts);
+}
+
+async function pollTelemetry() {
+  if (telemetryPollActive) return;
+  if (telemetryLastReceivedAt && Date.now() - telemetryLastReceivedAt < 3500) return;
+  telemetryPollActive = true;
+  let sample = null;
+  try {
+    if (Date.now() >= state.telemetryRetryAt) {
+      try {
+        const payload = await api(TELEMETRY_ENDPOINT);
+        state.telemetryEndpointAvailable = true;
+        state.telemetryError = payload?.monitor_error || null;
+        sample = normalizeTelemetry(payload, "硬件采样快照");
+      } catch (error) {
+        state.telemetryEndpointAvailable = false;
+        state.telemetryError = `硬件快照不可用：${error.message}`;
+        state.telemetryRetryAt = Date.now() + (error.status === 404 ? 30000 : 5000);
+      }
+    }
+    addTelemetrySample(sample || latestJobTelemetry());
+    if (!sample && !latestJobTelemetry()) renderTelemetry();
+  } finally {
+    telemetryPollActive = false;
+  }
+}
+
+function connectTelemetryStream() {
+  if (TELEMETRY_MODE === "snapshot") return;
+  if (!("EventSource" in window)) return;
+  if (telemetryEventSource) telemetryEventSource.close();
+  telemetryEventSource = new EventSource(TELEMETRY_STREAM_ENDPOINT);
+  telemetryEventSource.addEventListener("hardware", (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      if (payload.monitor_error) {
+        state.telemetryEndpointAvailable = false;
+        state.telemetryError = `硬件采样失败：${payload.monitor_error}`;
+        renderTelemetry();
+        return;
+      }
+      const sample = normalizeTelemetry(payload, "系统硬件流");
+      if (!sample) return;
+      telemetryLastReceivedAt = Date.now();
+      state.telemetryEndpointAvailable = true;
+      state.telemetryError = null;
+      addTelemetrySample(sample);
+    } catch (_) {
+      state.telemetryEndpointAvailable = false;
+    }
+  });
+  telemetryEventSource.addEventListener("open", () => {
+    state.telemetryEndpointAvailable = true;
+    state.telemetryError = null;
+    renderTelemetry();
+  });
+  telemetryEventSource.addEventListener("error", () => {
+    state.telemetryEndpointAvailable = false;
+    state.telemetryError = "实时硬件连接中断，正在切换到快照采样";
+    renderTelemetry();
+  });
+}
+
+async function loadJobs({ announceErrors = false } = {}) {
+  try {
+    const jobs = await api("/api/jobs");
+    state.jobs = Array.isArray(jobs) ? jobs : [];
+    state.loaded.jobs = true;
+    state.lastJobUpdate = new Date().toISOString();
+    renderJobs();
+  } catch (error) {
+    if (announceErrors) showToast(`任务刷新失败：${error.message}`, true);
+    throw error;
+  }
+}
+
+async function refreshSystem() {
+  if (systemPollActive) return;
+  systemPollActive = true;
+  try {
+    state.system = await api("/api/system");
+    state.loaded.system = true;
+    renderSystem();
+  } finally {
+    systemPollActive = false;
+  }
+}
+
+async function refreshAll({ quiet = false } = {}) {
+  const button = $("#refreshButton");
+  button.disabled = true;
+  const requests = [
+    ["system", "/api/system"],
+    ["models", "/api/models"],
+    ["presets", "/api/export-presets"],
+    ["jobs", "/api/jobs"],
+    ["profiles", "/api/profiles"],
+  ];
+  try {
+    const results = await Promise.allSettled(requests.map(([, path]) => api(path)));
+    const failures = [];
+    results.forEach((result, index) => {
+      const key = requests[index][0];
+      if (result.status === "rejected") {
+        failures.push(`${key}: ${result.reason.message}`);
+        return;
+      }
+      state.loaded[key] = true;
+      if (key === "system") state.system = result.value;
+      if (key === "models") state.models = Array.isArray(result.value) ? result.value : [];
+      if (key === "presets") {
+        state.exportPresets = result.value?.presets || [];
+        state.modelWorkspace = result.value || null;
+      }
+      if (key === "jobs") {
+        state.jobs = Array.isArray(result.value) ? result.value : [];
+        state.lastJobUpdate = new Date().toISOString();
+      }
+      if (key === "profiles") state.profiles = Array.isArray(result.value) ? result.value : [];
+    });
+    renderSystem();
+    renderModelPage();
+    renderProfiles();
+    renderJobs();
+    setConnection(failures.length === 0, failures.length ? `${failures.length} 个接口不可用` : "服务正常");
+    if (failures.length && !quiet) showToast(`部分数据刷新失败：${failures[0]}`, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function startPresetExport(presetId, button) {
+  const preset = state.exportPresets.find((item) => item.id === presetId);
+  if (!preset) return;
+  button.disabled = true;
+  try {
+    const job = await api("/api/jobs/download-export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ preset_id: presetId }),
+    });
+    state.selectedJobId = job.id;
+    showToast(`${preset.label} 已进入${preset.product_type === "runtime_adapter" ? "下载与适配器构建" : "下载与切片"}队列`);
+    await loadJobs();
+    switchPage("tasks");
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function startExport(index, button) {
+  const model = state.models[index];
+  if (!model) return;
+  const selector = $(`.scope-select[data-model-index="${index}"]`);
+  button.disabled = true;
+  try {
+    const job = await api("/api/jobs/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model_id: model.id, video_blocks: selector?.value || "all" }),
+    });
+    state.selectedJobId = job.id;
+    showToast(`${model.name} 已进入切片验证队列`);
+    await loadJobs();
+    switchPage("tasks");
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function startInference(event) {
   event.preventDefault();
+  const form = event.currentTarget;
+  if (!form.reportValidity()) return;
   const prompt = $("#promptInput").value.trim();
-  const tokenIds = $("#tokenIdsInput").value.split(",").map((value) => Number(value.trim())).filter(Number.isInteger);
-  const profile = state.profiles[0];
+  const tokens = parsedTokenIds();
+  if (!tokens.valid) {
+    showToast(tokens.message, true);
+    return;
+  }
+  if (!prompt && tokens.values.length === 0) {
+    showToast("请输入提示词或 Token IDs", true);
+    return;
+  }
+  const button = $("#generateButton");
+  button.disabled = true;
   try {
-    if (!prompt && tokenIds.length === 0) throw new Error("请输入 Prompt 或 Token IDs");
-    if (prompt && profile && !profile.tokenizer_ready) throw new Error("H3 Tokenizer 文件不完整");
-    await api("/api/jobs/inference", {
+    const job = await api("/api/jobs/inference", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         prompt: prompt || null,
-        token_ids: prompt ? null : tokenIds,
+        token_ids: prompt ? null : tokens.values,
         steps: Number($("#stepsInput").value),
         seed: Number($("#seedInput").value),
         width: Number($("#widthInput").value),
         height: Number($("#heightInput").value),
         duration_seconds: Number($("#durationInput").value),
-        temporal_mode: $("#temporalMode").value,
+        temporal_mode: temporalMode(),
         attention_query_chunk: Number($("#queryChunkSelect").value),
         l1_prefetch_shards: Number($("#l1PrefetchSelect").value),
       }),
     });
+    state.selectedJobId = job.id;
     showToast("推理任务已加入队列");
-    switchTab("jobs");
     await loadJobs();
+    switchPage("tasks");
   } catch (error) {
-    showToast(error.message, true);
-  }
-}
-
-async function startExport(index) {
-  const model = state.models[index];
-  const selector = $(`#scope-${index}`);
-  const videoBlocks = selector ? selector.value : "all";
-  try {
-    await api("/api/jobs/export", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model_id: model.id, video_blocks: videoBlocks }),
-    });
-    showToast(`${model.name} 已加入导出队列`);
-    switchTab("jobs");
-    await loadJobs();
-  } catch (error) {
-    showToast(error.message, true);
-  }
-}
-
-function switchTab(name) {
-  $$(".nav-item").forEach((item) => item.classList.toggle("active", item.dataset.tab === name));
-  $$(".tab-panel").forEach((panel) => panel.classList.remove("active"));
-  $(`#${name}Panel`).classList.add("active");
-  if (window.location.hash !== `#${name}`) window.history.replaceState(null, "", `#${name}`);
-}
-
-async function loadJobs() {
-  state.jobs = await api("/api/jobs");
-  renderJobs();
-}
-
-async function refresh() {
-  $("#refreshButton").disabled = true;
-  try {
-    const [system, models, components, exportPresets, jobs, profiles] = await Promise.all([api("/api/system"), api("/api/models"), api("/api/model-components"), api("/api/export-presets"), api("/api/jobs"), api("/api/profiles")]);
-    state.system = system;
-    state.models = models;
-    state.components = components.components || [];
-    state.exportPresets = exportPresets.presets || [];
-    state.jobs = jobs;
-    state.profiles = profiles;
-    renderSystem();
-    renderModels();
-    renderDownloadComponents();
-    renderExportPresets();
-    renderJobs();
-    renderProfiles();
-  } catch (error) {
-    $("#healthText").textContent = "连接失败";
     showToast(error.message, true);
   } finally {
-    $("#refreshButton").disabled = false;
+    renderProfiles();
   }
 }
 
-async function downloadSelectedModels() {
-  const ids = $$("#downloadList input[type=checkbox]:checked").map((input) => input.value);
-  if (!ids.length) { showToast("请选择至少一个未安装组件", true); return; }
-  const button = $("#downloadModelsButton");
-  button.disabled = true;
-  try {
-    await api("/api/jobs/download", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ components: ids }) });
-    showToast(`已加入 ${ids.length} 个组件的下载队列`);
-    switchTab("jobs");
-    await loadJobs();
-  } catch (error) { showToast(error.message, true); } finally { button.disabled = false; }
+function closeSidebar() {
+  $("#sidebar").classList.remove("open");
+  $("#menuButton").setAttribute("aria-expanded", "false");
 }
 
-async function startPresetExport(presetId) {
-  const button = $(`.preset-export-button[data-preset="${presetId}"]`);
-  button.disabled = true;
-  try {
-    await api("/api/jobs/download-export", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ preset_id: presetId }) });
-    showToast("原模型下载与切片任务已加入队列");
-    switchTab("jobs");
-    await loadJobs();
-  } catch (error) { showToast(error.message, true); } finally { button.disabled = false; }
+function switchPage(page) {
+  if (!["models", "inference", "tasks"].includes(page)) page = "models";
+  state.activePage = page;
+  $$(".nav-item").forEach((item) => {
+    const active = item.dataset.page === page;
+    item.classList.toggle("active", active);
+    if (active) item.setAttribute("aria-current", "page");
+    else item.removeAttribute("aria-current");
+  });
+  $$("[data-page-panel]").forEach((panel) => panel.classList.toggle("active", panel.dataset.pagePanel === page));
+  if (window.location.hash !== `#${page}`) window.history.replaceState(null, "", `#${page}`);
+  closeSidebar();
+  if (page === "tasks") scheduleCharts();
+  $("#mainContent").focus({ preventScroll: true });
+  window.scrollTo({ top: 0, behavior: "auto" });
 }
 
-$$('.nav-item').forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.tab)));
-$("#refreshButton").addEventListener("click", refresh);
-$("#checkModelsButton").addEventListener("click", refresh);
-$("#downloadModelsButton").addEventListener("click", downloadSelectedModels);
-$("#inferenceForm").addEventListener("submit", startInference);
-$("#widthInput").addEventListener("input", renderProfiles);
-$("#heightInput").addEventListener("input", renderProfiles);
-$("#durationInput").addEventListener("input", renderProfiles);
-$("#stepsInput").addEventListener("input", renderProfiles);
-$("#temporalMode").addEventListener("change", renderProfiles);
-$("#queryChunkSelect").addEventListener("change", renderProfiles);
-const initialTab = window.location.hash.slice(1);
-if (["models", "export", "inference", "jobs", "system"].includes(initialTab)) switchTab(initialTab);
-refresh();
-let jobsPollActive = false;
+function setJobFilter(filter) {
+  state.jobFilter = filter;
+  $$("[data-job-filter]").forEach((button) => button.classList.toggle("active", button.dataset.jobFilter === filter));
+  renderJobList();
+  renderJobInspector();
+}
+
+function bindEvents() {
+  $$(".nav-item").forEach((button) => button.addEventListener("click", () => switchPage(button.dataset.page)));
+  $("#menuButton").addEventListener("click", () => {
+    const open = $("#sidebar").classList.toggle("open");
+    $("#menuButton").setAttribute("aria-expanded", String(open));
+  });
+  $("#sidebarScrim").addEventListener("click", closeSidebar);
+  $("#refreshButton").addEventListener("click", () => refreshAll());
+  $("#checkModelsButton").addEventListener("click", () => refreshAll());
+  $("#refreshTasksButton").addEventListener("click", () => loadJobs({ announceErrors: true }));
+  $("#inferenceForm").addEventListener("submit", startInference);
+  $("#resolutionPreset").addEventListener("change", updateResolutionPreset);
+  ["#promptInput", "#tokenIdsInput", "#durationInput", "#stepsInput", "#seedInput", "#queryChunkSelect", "#l1PrefetchSelect"]
+    .forEach((selector) => $(selector).addEventListener("input", renderProfiles));
+  ["#widthInput", "#heightInput"].forEach((selector) => $(selector).addEventListener("input", renderProfiles));
+  $$('input[name="temporalMode"]').forEach((input) => input.addEventListener("change", renderProfiles));
+  $("#exportPresetList").addEventListener("click", (event) => {
+    const button = event.target.closest(".preset-export-button");
+    if (button) startPresetExport(button.dataset.preset, button);
+  });
+  $("#modelsBody").addEventListener("click", (event) => {
+    const button = event.target.closest(".export-button");
+    if (button) startExport(Number(button.dataset.modelIndex), button);
+  });
+  $("#jobsList").addEventListener("click", (event) => {
+    const item = event.target.closest("[data-job-id]");
+    if (!item) return;
+    state.selectedJobId = item.dataset.jobId;
+    renderJobList();
+    renderJobInspector();
+  });
+  $$("[data-job-filter]").forEach((button) => button.addEventListener("click", () => setJobFilter(button.dataset.jobFilter)));
+  window.addEventListener("resize", scheduleCharts, { passive: true });
+  window.addEventListener("hashchange", () => switchPage(window.location.hash.slice(1)));
+  window.addEventListener("beforeunload", () => telemetryEventSource?.close());
+}
+
+async function initialize() {
+  bindEvents();
+  updateResolutionPreset();
+  const initialPage = window.location.hash.slice(1);
+  switchPage(["models", "inference", "tasks"].includes(initialPage) ? initialPage : "models");
+  await refreshAll({ quiet: true });
+  connectTelemetryStream();
+  pollTelemetry();
+}
+
+initialize();
+
 setInterval(async () => {
   if (jobsPollActive) return;
   jobsPollActive = true;
   try {
     await loadJobs();
   } catch (_) {
-    // The next poll recovers transient API failures and stale terminal states.
+    // The next poll retries transient service failures.
   } finally {
     jobsPollActive = false;
   }
-}, 2000);
+}, JOB_POLL_INTERVAL_MS);
+
+setInterval(pollTelemetry, TELEMETRY_POLL_INTERVAL_MS);
 setInterval(updateJobTimers, 1000);
+setInterval(async () => {
+  try {
+    await refreshSystem();
+  } catch (_) {
+    // System status is supplementary; the full refresh remains available.
+  }
+}, 15000);

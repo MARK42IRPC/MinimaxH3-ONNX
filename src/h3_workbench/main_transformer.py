@@ -93,6 +93,35 @@ class _StreamingSafeTensorFile:
             raise ValueError(f"Safetensors tensor is truncated: {key}")
         return np.frombuffer(payload, dtype=dtype).reshape(shape)
 
+    def has_tensor(self, key: str) -> bool:
+        return key in self._entries
+
+    def tensor_shape(self, key: str) -> tuple[int, ...]:
+        try:
+            return tuple(int(value) for value in self._entries[key]["shape"])
+        except KeyError as exc:
+            raise KeyError(f"Tensor not found in {self.path.name}: {key}") from exc
+
+    def memmap_tensor(self, key: str) -> np.ndarray:
+        try:
+            entry = self._entries[key]
+        except KeyError as exc:
+            raise KeyError(f"Tensor not found in {self.path.name}: {key}") from exc
+        start, stop = (int(value) for value in entry["data_offsets"])
+        shape = tuple(int(value) for value in entry["shape"])
+        dtype = self._dtype(entry["dtype"])
+        expected_bytes = math.prod(shape) * dtype.itemsize
+        if stop - start != expected_bytes or self._data_start + stop > self._file_size:
+            raise ValueError(f"Invalid Safetensors bounds for {key}: {start}:{stop}")
+        return np.memmap(
+            self.path,
+            dtype=dtype,
+            mode="r",
+            offset=self._data_start + start,
+            shape=shape,
+            order="C",
+        )
+
 
 class CheckpointReader:
     """Load one tensor at a time without mapping the complete checkpoint.
@@ -113,6 +142,10 @@ class CheckpointReader:
         target = np.float32 if dtype == torch.float32 else np.float16
         converted = np.asarray(array, dtype=target).copy()
         return torch.from_numpy(converted).to(dtype).contiguous()
+
+    def raw_tensor(self, key: str) -> np.ndarray:
+        """Native-dtype array (fp8 stays fp8) for ONNX fp8 initializer embedding."""
+        return self._file.get_tensor(key)
 
     def dequant_weight(self, prefix: str) -> torch.Tensor:
         weight = self._file.get_tensor(f"{prefix}.weight")
@@ -160,11 +193,19 @@ class FrozenLinear(nn.Module):
         self.bias = nn.Parameter(bias, requires_grad=False) if bias is not None else None
         self.compute_fp32 = compute_fp32
         self.gpu_native_fp16 = False
+        self.gpu_native_dtype: torch.dtype | None = None
+        self.gpu_input_scale = 1.0
+        self.gpu_output_scale = 1.0
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        if self.compute_fp32 and self.gpu_native_fp16:
-            bias = self.bias.to(torch.float16) if self.bias is not None else None
-            return F.linear(inputs.to(torch.float16), self.weight.to(torch.float16), bias).float()
+        if self.compute_fp32 and self.gpu_native_dtype is not None:
+            values = inputs.float()
+            if self.gpu_input_scale != 1.0:
+                values = values / self.gpu_input_scale
+            result = F.linear(values.to(self.gpu_native_dtype), self.weight, self.bias).float()
+            if self.gpu_output_scale != 1.0:
+                result = result * self.gpu_output_scale
+            return result
         if self.compute_fp32:
             outputs = []
             rows_per_chunk = 256
@@ -178,9 +219,49 @@ class FrozenLinear(nn.Module):
 
 
 def enable_gpu_native_fp16(module: nn.Module) -> None:
+    _enable_gpu_native(module, torch.float16)
+
+
+def enable_gpu_native_bf16(module: nn.Module) -> None:
+    _enable_gpu_native(module, torch.bfloat16)
+
+
+def enable_scaled_gpu_native_fp16(
+    module: nn.Module,
+    fc1_weight_scale: float = 16.0,
+    fc2_input_scale: float = 128.0,
+    fc2_weight_scale: float = 16.0,
+) -> None:
+    for name, child in module.named_modules():
+        if not isinstance(child, FrozenLinear) or not child.compute_fp32:
+            continue
+        input_scale = fc2_input_scale if name.endswith("fc2") else 1.0
+        weight_scale = fc2_weight_scale if name.endswith("fc2") else fc1_weight_scale
+        _configure_gpu_native(child, torch.float16, input_scale, weight_scale)
+
+
+def _enable_gpu_native(module: nn.Module, dtype: torch.dtype) -> None:
     for child in module.modules():
         if isinstance(child, FrozenLinear) and child.compute_fp32:
-            child.gpu_native_fp16 = True
+            _configure_gpu_native(child, dtype, 1.0, 1.0)
+
+
+def _configure_gpu_native(
+    linear: FrozenLinear,
+    dtype: torch.dtype,
+    input_scale: float,
+    weight_scale: float,
+) -> None:
+    if input_scale <= 0.0 or weight_scale <= 0.0:
+        raise ValueError("Tensor Core scales must be positive")
+    output_scale = input_scale * weight_scale
+    linear.weight = nn.Parameter((linear.weight.float() / weight_scale).to(dtype), requires_grad=False)
+    if linear.bias is not None:
+        linear.bias = nn.Parameter((linear.bias.float() / output_scale).to(dtype), requires_grad=False)
+    linear.gpu_native_fp16 = dtype == torch.float16
+    linear.gpu_native_dtype = dtype
+    linear.gpu_input_scale = float(input_scale)
+    linear.gpu_output_scale = float(output_scale)
 
 
 def rms_norm(inputs: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:

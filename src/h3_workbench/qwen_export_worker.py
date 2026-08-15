@@ -14,13 +14,14 @@ from h3_workbench.qwen_transformer import (
     QwenDownShard,
     QwenEmbedding,
     QwenGateShard,
+    QwenMLPShard,
     QwenUpShard,
 )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("kind", choices=("embedding", "attention", "gate", "up", "down"))
+    parser.add_argument("kind", choices=("embedding", "attention", "gate", "up", "down", "mlp"))
     parser.add_argument("index", type=int)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("model", type=Path)
@@ -63,7 +64,7 @@ def main() -> None:
         input_names = ["normalized_states"]
         output_names = ["up"]
         dynamic_axes = {"normalized_states": {0: "sequence"}, "up": {0: "sequence"}}
-    else:
+    elif args.kind == "down":
         module = QwenDownShard(reader, args.index).eval()
         input_names = ["hidden_states", "gate", "up"]
         output_names = ["hidden_states_out"]
@@ -71,6 +72,14 @@ def main() -> None:
             "hidden_states": {0: "sequence"},
             "gate": {0: "sequence"},
             "up": {0: "sequence"},
+            "hidden_states_out": {0: "sequence"},
+        }
+    else:
+        module = QwenMLPShard(reader, args.index).eval()
+        input_names = ["hidden_states"]
+        output_names = ["hidden_states_out"]
+        dynamic_axes = {
+            "hidden_states": {0: "sequence"},
             "hidden_states_out": {0: "sequence"},
         }
 

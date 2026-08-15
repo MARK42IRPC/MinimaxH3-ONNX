@@ -4,7 +4,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .h3-workbench/
+.claude/
 outputs/
+exported/
 onnx_models/
 qwen_tokenizer/
 qwen_probe_*.json

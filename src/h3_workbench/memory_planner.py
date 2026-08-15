@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -49,7 +50,17 @@ class ShardBatch:
         }
 
 
+_PROBE_TTL_SECONDS = 2.0
+_last_probe_at = 0.0
+_last_probe_snapshot: MemorySnapshot | None = None
+
+
 def probe_gpu_memory() -> MemorySnapshot:
+    """nvidia-smi subprocess with a short TTL for scheduler hot paths."""
+    global _last_probe_at, _last_probe_snapshot
+    now = time.monotonic()
+    if _last_probe_snapshot is not None and now - _last_probe_at < _PROBE_TTL_SECONDS:
+        return _last_probe_snapshot
     try:
         result = subprocess.run(
             [
@@ -63,9 +74,12 @@ def probe_gpu_memory() -> MemorySnapshot:
             timeout=5,
         )
         name, total_mib, free_mib = [part.strip() for part in result.stdout.splitlines()[0].split(",")]
-        return MemorySnapshot("cuda", int(total_mib) * MIB, int(free_mib) * MIB, name)
+        snapshot = MemorySnapshot("cuda", int(total_mib) * MIB, int(free_mib) * MIB, name)
     except (OSError, ValueError, subprocess.SubprocessError, IndexError):
-        return MemorySnapshot("cpu", 0, 0, "CPU")
+        snapshot = MemorySnapshot("cpu", 0, 0, "CPU")
+    _last_probe_at = now
+    _last_probe_snapshot = snapshot
+    return snapshot
 
 
 def _graph_weight_bytes(directory: Path, graph: str) -> int:

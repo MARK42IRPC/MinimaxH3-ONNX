@@ -22,6 +22,7 @@ from h3_workbench.media_output import (
 )
 from h3_workbench.memory_planner import main_model_shards, plan_shard_batches, probe_gpu_memory
 from h3_workbench.profiles import PROFILE_360P_17F
+from h3_workbench.qwen_persistent import resolve_qwen_directory
 
 
 def _token_ids(value: str) -> np.ndarray:
@@ -67,7 +68,7 @@ def main() -> None:
     workspace = args.workspace.resolve()
     runner = ORTGraphRunner(prefer_cuda=not args.cpu)
     qwen = QwenTextRuntime(
-        workspace / "onnx_models" / "qwen3vl_32b_minimax_h3_nvfp4_awq",
+        resolve_qwen_directory(workspace / "onnx_models"),
         runner,
         args.l1_prefetch_shards,
     )

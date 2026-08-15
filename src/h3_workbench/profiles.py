@@ -14,8 +14,6 @@ def video_vae_output_frames(latent_frames: int) -> int:
     token_drop = 3
     tokens_per_chunk = 5
     temporal_ratio = 4
-    frame_pre_padding = 3
-
     pseudo_total = latent_frames + token_drop
     pad_tokens = (-pseudo_total) % tokens_per_chunk
     pseudo_total += pad_tokens
@@ -40,8 +38,6 @@ def video_latent_frames_for_output(output_frames: int) -> int:
     """Return the next native H3 latent length (2 + 5k) covering the request."""
     if output_frames < 1:
         raise ValueError("output_frames must be positive")
-    if output_frames == 1:
-        return 1
     if output_frames <= 5:
         return 2
     chunks = math.ceil((output_frames - 5) / 17)

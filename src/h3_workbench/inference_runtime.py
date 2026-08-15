@@ -34,10 +34,45 @@ from h3_workbench.memory_planner import (
 )
 from h3_workbench.profiles import GenerationProfile, PROFILE_360P_17F
 from h3_workbench.shard_cache import ShardPrefetchCache, default_prefetch_depth, graph_storage_bytes
-from h3_workbench.qwen_persistent import QwenWeightInputs, persistent_qwen_ready
+from h3_workbench.qwen_persistent import (
+    QwenInt8SourceWeights,
+    QwenWeightInputs,
+    build_persistent_qwen_graphs,
+    int8_virtual_qwen_ready,
+    persistent_qwen_ready,
+)
+from h3_workbench.vram_reservation import other_reserved_bytes
 
 _DLL_DIRECTORY_HANDLES: list[object] = []
 GIB = 1024**3
+HIGH_VRAM_THRESHOLD_BYTES = 12 * GIB
+
+
+def scaled_streaming_max_sessions(user_shards: int, free_bytes: int) -> int:
+    base = min(3, max(1, user_shards + 1))
+    if free_bytes >= 12 * GIB:
+        base = max(base, 6)
+    elif free_bytes >= 6 * GIB:
+        base = max(base, 4)
+    return base
+
+
+def scaled_prefetch_depth(user_shards: int, free_bytes: int) -> int:
+    if free_bytes >= 12 * GIB:
+        return max(user_shards, 4)
+    if free_bytes >= 6 * GIB:
+        return max(user_shards, 3)
+    return user_shards
+
+
+def _resolve_auto_flag(name: str) -> bool | None:
+    """Return True/False for explicit env values and None for auto."""
+    setting = os.environ.get(name, "auto").strip().lower()
+    if setting in {"1", "true", "on", "yes"}:
+        return True
+    if setting in {"0", "false", "off", "no"}:
+        return False
+    return None
 
 
 class _PerformanceInformation(ctypes.Structure):
@@ -137,6 +172,13 @@ def unpack_audio(rows: np.ndarray) -> np.ndarray:
     return rows.reshape(2, frames, 32).transpose(2, 0, 1)[None]
 
 
+def _streamed_normalize(values: np.ndarray, limit: float = 8.0) -> tuple[np.ndarray, float]:
+    """Normalize into the FP16-safe range, mirroring the ORT SDPA graph."""
+    maximum = float(np.max(np.abs(values))) if values.size else 0.0
+    scale = max(1.0, maximum / limit)
+    return np.ascontiguousarray(values / scale, dtype=np.float16), scale
+
+
 def streamed_attention(packed: np.ndarray, use_cuda: bool, query_chunk_tokens: int = 256) -> np.ndarray:
     """Run exact full-sequence attention without materializing an N x N matrix."""
     if packed.ndim == 3 and packed.shape[1] == 56 and packed.shape[2] % 3 == 0:
@@ -157,21 +199,31 @@ def streamed_attention(packed: np.ndarray, use_cuda: bool, query_chunk_tokens: i
     head_dim = width // 56
     device = torch.device("cuda") if use_cuda and torch.cuda.is_available() else torch.device("cpu")
     dtype = torch.float16 if device.type == "cuda" else torch.float32
-    key_tensor = torch.from_numpy(key).view(-1, 56, head_dim).transpose(0, 1).unsqueeze(0).to(device=device, dtype=dtype)
-    value_tensor = torch.from_numpy(value).view(-1, 56, head_dim).transpose(0, 1).unsqueeze(0).to(device=device, dtype=dtype)
+    normalize = device.type == "cuda"
+    # QKV values are only FP16-safe after the model's own normalization in the
+    # common case; turbo AdaLN and long sequences can still exceed FP16 range.
+    # Normalize with compensating scales, exactly as the ORT SDPA graph does.
+    key_np, key_scale = _streamed_normalize(key) if normalize else (key, 1.0)
+    value_np, value_scale = _streamed_normalize(value) if normalize else (value, 1.0)
+    key_tensor = torch.from_numpy(key_np).view(-1, 56, head_dim).transpose(0, 1).unsqueeze(0).to(device=device, dtype=dtype)
+    value_tensor = torch.from_numpy(value_np).view(-1, 56, head_dim).transpose(0, 1).unsqueeze(0).to(device=device, dtype=dtype)
+    del key_np, value_np
     output = np.empty((query.shape[0], width), dtype=np.float32)
     try:
         for start in range(0, query.shape[0], query_chunk_tokens):
             stop = min(start + query_chunk_tokens, query.shape[0])
-            query_tensor = torch.from_numpy(query[start:stop]).view(-1, 56, head_dim).transpose(0, 1).unsqueeze(0)
+            query_np, query_scale = _streamed_normalize(query[start:stop]) if normalize else (query[start:stop], 1.0)
+            query_tensor = torch.from_numpy(query_np).view(-1, 56, head_dim).transpose(0, 1).unsqueeze(0)
             query_tensor = query_tensor.to(device=device, dtype=dtype)
-            attended = torch_functional.scaled_dot_product_attention(query_tensor, key_tensor, value_tensor)
+            scale = query_scale * key_scale / math.sqrt(head_dim) if normalize else None
+            attended = torch_functional.scaled_dot_product_attention(query_tensor, key_tensor, value_tensor, scale=scale)
             rows = attended.squeeze(0).transpose(0, 1).reshape(stop - start, width)
-            output[start:stop] = rows.to(device="cpu", dtype=torch.float32).numpy()
-            del query_tensor, attended, rows
+            rows_cpu = rows.to(device="cpu", dtype=torch.float32).numpy()
+            output[start:stop] = rows_cpu * value_scale if normalize else rows_cpu
+            del query_np, query_tensor, attended, rows, rows_cpu
     finally:
         del key_tensor, value_tensor
-        if device.type == "cuda":
+        if device.type == "cuda" and os.environ.get("H3_SDPA_EMPTY_CACHE", "0") == "1":
             torch.cuda.empty_cache()
     return output
 
@@ -219,14 +271,188 @@ def _ensure_streamed_sdpa_graph(path: Path) -> Path:
     return path
 
 
+def _ensure_device_streamed_sdpa_graph(
+    path: Path,
+    sequence_tokens: int,
+    query_chunk_tokens: int,
+) -> Path:
+    if path.is_file():
+        return path
+    from onnx import TensorProto, helper, numpy_helper
+
+    initializers: list[onnx.TensorProto] = []
+    nodes: list[onnx.NodeProto] = []
+
+    def constant(name: str, value: np.ndarray) -> str:
+        initializers.append(numpy_helper.from_array(np.asarray(value), name))
+        return name
+
+    def sliced(
+        source: str,
+        output: str,
+        starts: list[int],
+        ends: list[int],
+        axes: list[int],
+    ) -> str:
+        prefix = f"{output}_slice"
+        nodes.append(
+            helper.make_node(
+                "Slice",
+                [
+                    source,
+                    constant(f"{prefix}_starts", np.asarray(starts, dtype=np.int64)),
+                    constant(f"{prefix}_ends", np.asarray(ends, dtype=np.int64)),
+                    constant(f"{prefix}_axes", np.asarray(axes, dtype=np.int64)),
+                ],
+                [output],
+            )
+        )
+        return output
+
+    def normalized(source: str, prefix: str) -> tuple[str, str]:
+        absolute = f"{prefix}_absolute"
+        maximum = f"{prefix}_maximum"
+        candidate = f"{prefix}_scale_candidate"
+        scale = f"{prefix}_scale"
+        divided = f"{prefix}_divided"
+        output = f"{prefix}_fp16"
+        nodes.extend(
+            [
+                helper.make_node("Abs", [source], [absolute]),
+                helper.make_node("ReduceMax", [absolute], [maximum], keepdims=0),
+                helper.make_node("Div", [maximum, "normalization_limit"], [candidate]),
+                helper.make_node("Max", [candidate, "one"], [scale]),
+                helper.make_node("Div", [source, scale], [divided]),
+                helper.make_node("Cast", [divided], [output], to=TensorProto.FLOAT16),
+            ]
+        )
+        return output, scale
+
+    sliced("packed", "query_rows", [0], [128], [2])
+    sliced("packed", "key_rows", [128], [256], [2])
+    sliced("packed", "value_rows", [256], [384], [2])
+    nodes.extend(
+        [
+            helper.make_node("Transpose", ["key_rows"], ["key_transposed_rows"], perm=[1, 0, 2]),
+            helper.make_node("Unsqueeze", ["key_transposed_rows", "axis_zero"], ["key_4d"]),
+            helper.make_node("Transpose", ["value_rows"], ["value_transposed_rows"], perm=[1, 0, 2]),
+            helper.make_node("Unsqueeze", ["value_transposed_rows", "axis_zero"], ["value_4d"]),
+        ]
+    )
+    key_fp16, key_scale = normalized("key_4d", "key")
+    value_fp16, value_scale = normalized("value_4d", "value")
+    nodes.append(helper.make_node("Transpose", [key_fp16], ["key_for_scores"], perm=[0, 1, 3, 2]))
+
+    chunk_outputs: list[str] = []
+    for index, start in enumerate(range(0, sequence_tokens, query_chunk_tokens)):
+        stop = min(start + query_chunk_tokens, sequence_tokens)
+        prefix = f"chunk_{index}"
+        query_chunk = sliced("query_rows", f"{prefix}_query_rows", [start], [stop], [0])
+        query_transposed = f"{prefix}_query_transposed"
+        query_4d = f"{prefix}_query_4d"
+        nodes.extend(
+            [
+                helper.make_node("Transpose", [query_chunk], [query_transposed], perm=[1, 0, 2]),
+                helper.make_node("Unsqueeze", [query_transposed, "axis_zero"], [query_4d]),
+            ]
+        )
+        query_fp16, query_scale = normalized(query_4d, f"{prefix}_query")
+        normalized_scores = f"{prefix}_normalized_scores"
+        scores = f"{prefix}_scores"
+        query_key_scale = f"{prefix}_query_key_scale"
+        score_scale = f"{prefix}_score_scale"
+        scaled_scores = f"{prefix}_scaled_scores"
+        probabilities = f"{prefix}_probabilities"
+        probabilities_fp16 = f"{prefix}_probabilities_fp16"
+        normalized_attended = f"{prefix}_normalized_attended"
+        normalized_attended_fp32 = f"{prefix}_normalized_attended_fp32"
+        attended = f"{prefix}_attended"
+        transposed = f"{prefix}_transposed"
+        output = f"{prefix}_output"
+        nodes.extend(
+            [
+                helper.make_node("MatMul", [query_fp16, "key_for_scores"], [normalized_scores]),
+                helper.make_node("Cast", [normalized_scores], [scores], to=TensorProto.FLOAT),
+                helper.make_node("Mul", [query_scale, key_scale], [query_key_scale]),
+                helper.make_node("Mul", [query_key_scale, "inverse_sqrt_head_dim"], [score_scale]),
+                helper.make_node("Mul", [scores, score_scale], [scaled_scores]),
+                helper.make_node("Softmax", [scaled_scores], [probabilities], axis=3),
+                helper.make_node("Cast", [probabilities], [probabilities_fp16], to=TensorProto.FLOAT16),
+                helper.make_node("MatMul", [probabilities_fp16, value_fp16], [normalized_attended]),
+                helper.make_node("Cast", [normalized_attended], [normalized_attended_fp32], to=TensorProto.FLOAT),
+                helper.make_node("Mul", [normalized_attended_fp32, value_scale], [attended]),
+                helper.make_node("Transpose", [attended], [transposed], perm=[0, 2, 1, 3]),
+                helper.make_node("Reshape", [transposed, "output_shape"], [output]),
+            ]
+        )
+        chunk_outputs.append(output)
+    nodes.append(
+        helper.make_node(
+            "Concat" if len(chunk_outputs) > 1 else "Identity",
+            chunk_outputs,
+            ["output"],
+            **({"axis": 0} if len(chunk_outputs) > 1 else {}),
+        )
+    )
+
+    constant("axis_zero", np.asarray([0], dtype=np.int64))
+    constant("normalization_limit", np.asarray(8.0, dtype=np.float32))
+    constant("one", np.asarray(1.0, dtype=np.float32))
+    constant("inverse_sqrt_head_dim", np.asarray(1.0 / math.sqrt(128.0), dtype=np.float32))
+    constant("output_shape", np.asarray([-1, 56 * 128], dtype=np.int64))
+    graph = helper.make_graph(
+        nodes,
+        "h3_device_streamed_sdpa_normalized",
+        [helper.make_tensor_value_info("packed", TensorProto.FLOAT, [sequence_tokens, 56, 384])],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT, [sequence_tokens, 56 * 128])],
+        initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=9)
+    onnx.checker.check_model(model)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    onnx.save(model, path)
+    return path
+
+
 class ORTStreamingAttention:
     """CUDA SDPA fallback that works when the installed PyTorch wheel is CPU-only."""
 
     def __init__(self, directory: Path, runner: "ORTGraphRunner"):
+        self.directory = directory.resolve()
         self.runner = runner
         self.graph_path = _ensure_streamed_sdpa_graph(
             directory / "runtime_streamed_sdpa_fp16_normalized_fp32_softmax_fp16_value.onnx"
         )
+        self._device_sessions: dict[tuple[int, int], ort.InferenceSession] = {}
+
+    def close(self) -> None:
+        self._device_sessions.clear()
+
+    def _device_call(
+        self,
+        packed: ort.OrtValue,
+        query_chunk_tokens: int,
+    ) -> ort.OrtValue:
+        if packed.device_name().lower() != "cuda":
+            raise ValueError("Device SDPA requires a CUDA OrtValue")
+        shape = tuple(int(value) for value in packed.shape())
+        if len(shape) != 3 or shape[1:] != (56, 384):
+            raise ValueError(f"Unexpected packed QKV shape: {shape}")
+        key = (shape[0], query_chunk_tokens)
+        session = self._device_sessions.get(key)
+        if session is None:
+            graph_path = _ensure_device_streamed_sdpa_graph(
+                self.directory / f"runtime_streamed_sdpa_device_s{shape[0]}_c{query_chunk_tokens}.onnx",
+                shape[0],
+                query_chunk_tokens,
+            )
+            session = self.runner.session(graph_path)
+            self._device_sessions[key] = session
+        binding = session.io_binding()
+        binding.bind_ortvalue_input("packed", packed)
+        binding.bind_output("output", "cuda")
+        session.run_with_iobinding(binding)
+        return binding.get_outputs()[0]
 
     @staticmethod
     def _normalize(values: np.ndarray, limit: float = 8.0) -> tuple[np.ndarray, float]:
@@ -236,10 +462,12 @@ class ORTStreamingAttention:
 
     def __call__(
         self,
-        packed: np.ndarray,
+        packed: np.ndarray | ort.OrtValue,
         query_chunk_tokens: int = 256,
         output_dtype: np.dtype | type[np.floating] = np.float32,
-    ) -> np.ndarray:
+    ) -> np.ndarray | ort.OrtValue:
+        if isinstance(packed, ort.OrtValue):
+            return self._device_call(packed, query_chunk_tokens)
         # The long-sequence score workspace can consume most of a 4 GB GPU. A
         # persistent session retains that CUDA arena and slows all later block
         # graphs through WDDM shared-memory migration.
@@ -279,7 +507,6 @@ class ORTStreamingAttention:
                 del query, io_binding
         finally:
             del key_value, value_value, session
-            gc.collect()
         return output.astype(output_dtype, copy=False)
 
 
@@ -372,8 +599,52 @@ class ORTGraphRunner:
         self._l1_prefetch_hits = 0
         self._l1_prefetch_waits = 0
         self._l1_prefetch_wait_seconds = 0.0
+        self._session_cache: dict[Path, ort.InferenceSession] = {}
+        self._session_cache_bytes = 0
+        self._session_cache_budget = 0
+        self._session_cache_hits = 0
+        self._session_cache_misses = 0
+        default_threads = 1 if self.provider == "CUDAExecutionProvider" else 0
+        self.ort_cpu_threads = max(0, int(os.environ.get("H3_ORT_CPU_THREADS", default_threads)))
+        default_spinning = "0" if self.provider == "CUDAExecutionProvider" else "1"
+        self.ort_allow_spinning = os.environ.get("H3_ORT_ALLOW_SPINNING", default_spinning) != "0"
         if self.provider == "CUDAExecutionProvider":
             _preload_cuda_dlls()
+        try:
+            total_vram = probe_gpu_memory().total_bytes
+        except Exception:
+            total_vram = 0
+        self.low_vram_mode = bool(
+            self.provider == "CUDAExecutionProvider"
+            and total_vram > 0
+            and total_vram <= 6 * GIB
+        )
+
+    def set_session_cache_budget(self, budget_bytes: int) -> None:
+        """Bound cross-step session reuse; zero disables and clears the cache."""
+        self._session_cache_budget = max(0, int(budget_bytes))
+        if self._session_cache_budget <= 0:
+            self._session_cache.clear()
+            self._session_cache_bytes = 0
+
+    def cached_session(self, path: Path) -> ort.InferenceSession | None:
+        session = self._session_cache.pop(path, None)
+        if session is None:
+            self._session_cache_misses += 1
+        else:
+            self._session_cache_hits += 1
+        return session
+
+    def release_session(self, path: Path, session: ort.InferenceSession) -> None:
+        if self._session_cache_budget <= 0:
+            return
+        self._session_cache_bytes += graph_storage_bytes(path)
+        self._session_cache[path] = session
+        while self._session_cache_bytes > self._session_cache_budget and self._session_cache:
+            oldest_path, oldest_session = next(iter(self._session_cache.items()))
+            del self._session_cache[oldest_path]
+            self._session_cache_bytes -= graph_storage_bytes(oldest_path)
+            del oldest_session
 
     def session(self, path: Path | None = None, serialized_model: bytes | None = None) -> ort.InferenceSession:
         if path is None and serialized_model is None:
@@ -383,6 +654,13 @@ class ORTGraphRunner:
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
         options.enable_mem_pattern = False
         options.enable_cpu_mem_arena = True
+        if self.ort_cpu_threads > 0:
+            options.intra_op_num_threads = self.ort_cpu_threads
+            options.inter_op_num_threads = 1
+            options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        spinning = "1" if self.ort_allow_spinning else "0"
+        options.add_session_config_entry("session.intra_op.allow_spinning", spinning)
+        options.add_session_config_entry("session.inter_op.allow_spinning", spinning)
         provider_options = [{}]
         if self.provider == "CUDAExecutionProvider":
             provider_options = [{"arena_extend_strategy": "kSameAsRequested", "cudnn_conv_use_max_workspace": "0"}]
@@ -399,12 +677,17 @@ class ORTGraphRunner:
         return session
 
     def run(self, path: Path, inputs: dict[str, np.ndarray]) -> list[np.ndarray]:
-        session = self.session(path)
+        session = self.cached_session(path)
+        if session is None:
+            session = self.session(path)
         try:
             return session.run(None, inputs)
         finally:
-            del session
-            gc.collect()
+            if self._session_cache_budget > 0:
+                self.release_session(path, session)
+            else:
+                del session
+                gc.collect()
 
     def adaptive_session_batches(
         self,
@@ -466,6 +749,20 @@ class ORTGraphRunner:
                                 "batch_size": len(paths),
                             }
                         )
+                    cached = self.cached_session(path)
+                    if cached is not None:
+                        if loading_callback is not None:
+                            loading_callback(
+                                {
+                                    "operation": "Session cache hit",
+                                    "path": path,
+                                    "batch_index": index + 1,
+                                    "batch_size": len(paths),
+                                    **self.cache_stats(),
+                                }
+                            )
+                        sessions.append((path, cached))
+                        continue
                     session_started = time.perf_counter()
                     sessions.append((path, self.session(path)))
                     if loading_callback is not None:
@@ -490,6 +787,10 @@ class ORTGraphRunner:
             try:
                 yield sessions
             finally:
+                if self._session_cache_budget > 0:
+                    for path, session in sessions:
+                        self.release_session(path, session)
+                    sessions.clear()
                 del sessions
                 gc.collect()
 
@@ -502,6 +803,21 @@ class ORTGraphRunner:
         sessions: list[tuple[Path, ort.InferenceSession]] = []
         try:
             for index, path in enumerate(paths):
+                cached = self.cached_session(path)
+                if cached is not None:
+                    if loading_callback is not None:
+                        loading_callback(
+                            {
+                                "operation": "Session cache hit",
+                                "path": path,
+                                "batch_index": index + 1,
+                                "batch_size": len(paths),
+                                "prefetch_ahead": prefetch_ahead,
+                                **self.cache_stats(),
+                            }
+                        )
+                    sessions.append((path, cached))
+                    continue
                 wait_started = time.perf_counter()
                 self.shard_cache.wait(path)
                 if loading_callback is not None:
@@ -561,9 +877,10 @@ class ORTGraphRunner:
         pending: list[tuple[list[Path], int, Future[list[tuple[Path, ort.InferenceSession]]]]] = []
         resident_bytes = 0
         # Session construction is mostly protobuf parsing, CUDA kernel setup,
-        # and weight upload. Two or three independent builders let those CPU
-        # phases overlap the active CUDA graph instead of serializing all gaps.
-        build_workers = max(1, min(depth + 1, 3))
+        # and weight upload. Independent builders let those CPU phases overlap
+        # the active CUDA graph instead of serializing all gaps; high-VRAM
+        # hosts profit from more builders because deeper queues stay full.
+        build_workers = max(1, min(depth + 1, 6))
         executor = ThreadPoolExecutor(max_workers=build_workers, thread_name_prefix="h3-l1-prefetch")
 
         def estimate(paths: list[Path]) -> int:
@@ -653,6 +970,10 @@ class ORTGraphRunner:
                 try:
                     yield sessions
                 finally:
+                    if self._session_cache_budget > 0:
+                        for path, session in sessions:
+                            self.release_session(path, session)
+                        sessions.clear()
                     del sessions
                     resident_bytes -= estimated_bytes
                     gc.collect()
@@ -675,10 +996,17 @@ class ORTGraphRunner:
             "l1_prefetch_hits": self._l1_prefetch_hits,
             "l1_prefetch_waits": self._l1_prefetch_waits,
             "l1_prefetch_wait_seconds": round(self._l1_prefetch_wait_seconds, 3),
+            "session_cache_entries": len(self._session_cache),
+            "session_cache_bytes": self._session_cache_bytes,
+            "session_cache_budget": self._session_cache_budget,
+            "session_cache_hits": self._session_cache_hits,
+            "session_cache_misses": self._session_cache_misses,
         }
 
     def close(self) -> None:
         self.shard_cache.close()
+        self._session_cache.clear()
+        self._session_cache_bytes = 0
 
 
 class QwenTextRuntime:
@@ -688,7 +1016,61 @@ class QwenTextRuntime:
         if not 0 <= l1_prefetch_shards <= 4:
             raise ValueError("l1_prefetch_shards must be from 0 to 4")
         self.l1_prefetch_shards = l1_prefetch_shards
+        self.int8_virtual = QwenInt8SourceWeights(directory) if int8_virtual_qwen_ready(directory) else None
+        if (
+            self.int8_virtual is None
+            and runner.provider == "CUDAExecutionProvider"
+            and not persistent_qwen_ready(directory)
+        ):
+            try:
+                # Task startup builds the runtime graphs once; the per-layer
+                # fallback stays available when the model directory is
+                # read-only or the sources are incomplete.
+                build_persistent_qwen_graphs(directory)
+            except Exception:  # noqa: BLE001 - fall back to per-layer sessions
+                pass
         self.persistent = QwenWeightInputs(directory) if persistent_qwen_ready(directory) else None
+
+    def _encode_int8_virtual(
+        self,
+        token_ids: np.ndarray,
+        callback: Callable[[str, int, int], None] | None,
+    ) -> np.ndarray:
+        assert self.int8_virtual is not None
+        attention = self.runner.session(self.int8_virtual.graph("attention"))
+        mlp = self.runner.session(self.int8_virtual.graph("mlp"))
+        try:
+            hidden = self.int8_virtual.embedding(token_ids)
+            sequence = token_ids.shape[0]
+            positions = np.arange(sequence, dtype=np.float32)
+            inv_freq = 1.0 / (500_000.0 ** (np.arange(0, 128, 2, dtype=np.float32) / 128.0))
+            angles = np.outer(positions, inv_freq)
+            angles = np.concatenate((angles, angles), axis=-1)
+            cosine, sine = np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
+            mask = np.triu(np.full((1, 1, sequence, sequence), -10_000.0, dtype=np.float32), k=1)
+            for layer in range(50):
+                if callback is not None:
+                    callback("Attention", layer + 1, 50)
+                hidden = attention.run(
+                    None,
+                    {
+                        "hidden_states": hidden,
+                        "cosine": cosine,
+                        "sine": sine,
+                        "attention_mask": mask,
+                        **self.int8_virtual.inputs("attention", layer),
+                    },
+                )[0]
+                if callback is not None:
+                    callback("MLP", layer + 1, 50)
+                hidden = mlp.run(
+                    None,
+                    {"hidden_states": hidden, **self.int8_virtual.inputs("mlp", layer)},
+                )[0]
+            return hidden
+        finally:
+            del attention, mlp
+            gc.collect()
 
     def _encode_persistent(
         self,
@@ -757,6 +1139,8 @@ class QwenTextRuntime:
         callback: Callable[[str, int, int], None] | None = None,
         activity_callback: Callable[[dict[str, object]], None] | None = None,
     ) -> np.ndarray:
+        if self.int8_virtual is not None and self.runner.provider == "CUDAExecutionProvider":
+            return self._encode_int8_virtual(token_ids, callback)
         if self.persistent is not None and self.runner.provider == "CUDAExecutionProvider":
             return self._encode_persistent(token_ids, callback)
         if callback is not None:
@@ -804,14 +1188,21 @@ class QwenTextRuntime:
             )
 
         snapshot = probe_gpu_memory()
-        prefetch_budget = max(0, snapshot.free_bytes - 768 * 1024**2)
+        effective_free = max(0, snapshot.free_bytes - other_reserved_bytes())
+        prefetch_budget = max(0, effective_free - 768 * 1024**2)
         host_budget = host_prefetch_budget_bytes()
         if host_budget is not None:
             prefetch_budget = min(prefetch_budget, host_budget)
         # Qwen session construction is storage/CPU bound on this machine and
-        # did not produce L1 hits. It remains opt-in for faster host systems.
-        l1_enabled = os.environ.get("H3_QWEN_L1_PREFETCH", "0") == "1"
-        prefetch_depth = self.l1_prefetch_shards if prefetch_budget > 0 and l1_enabled else 0
+        # did not produce L1 hits on small GPUs. High-VRAM hosts queue enough
+        # groups to overlap builds with execution, so enable there by default.
+        qwen_l1 = _resolve_auto_flag("H3_QWEN_L1_PREFETCH")
+        l1_enabled = (
+            qwen_l1
+            if qwen_l1 is not None
+            else effective_free >= HIGH_VRAM_THRESHOLD_BYTES
+        ) and self.l1_prefetch_shards >= 1
+        prefetch_depth = scaled_prefetch_depth(self.l1_prefetch_shards, effective_free) if prefetch_budget > 0 and l1_enabled else 0
         for session_batch in self.runner.adaptive_session_batches(
             groups,
             loading_callback=loading_activity,
@@ -847,7 +1238,7 @@ class QwenTextRuntime:
         return hidden
 
 
-class H3MainRuntime:
+class _FineGraphRuntime:
     def __init__(
         self,
         directory: Path,
@@ -887,9 +1278,23 @@ class H3MainRuntime:
             and runner.provider == "CUDAExecutionProvider"
             and fp16_attention_output_ready(directory)
         )
+        sdpa_backend = os.environ.get("H3_SDPA_BACKEND", "auto").strip().lower()
+        if sdpa_backend not in {"auto", "torch", "ort"}:
+            raise ValueError("H3_SDPA_BACKEND must be one of: auto, torch, ort")
+        torch_cuda_ready = torch.cuda.is_available()
+        if sdpa_backend == "torch" and not torch_cuda_ready:
+            raise ValueError("H3_SDPA_BACKEND=torch requires a CUDA-enabled PyTorch")
+        self.torch_streamed_attention = (
+            self.streaming_attention
+            and runner.provider == "CUDAExecutionProvider"
+            and torch_cuda_ready
+            and sdpa_backend in {"auto", "torch"}
+        )
         self.ort_streamed_attention = (
             ORTStreamingAttention(directory, runner)
-            if self.streaming_attention and runner.provider == "CUDAExecutionProvider"
+            if self.streaming_attention
+            and runner.provider == "CUDAExecutionProvider"
+            and (sdpa_backend == "ort" or not torch_cuda_ready)
             else None
         )
 
@@ -935,6 +1340,63 @@ class H3MainRuntime:
         self.report_activity("FL2VA Token Refiner", "Final norm")
         return self.runner.run(self.directory / "main_token_refiner_norm.onnx", {"hidden_states": hidden})[0]
 
+    def warm_fixed_sessions(self) -> dict[str, object]:
+        """Build the step-invariant graphs once, during the Qwen encode window.
+
+        Called from a background thread while the text encoder owns the GPU
+        almost idly; the sessions park in the runner's session cache so the
+        first sampling step (and every later step, for embeddings,
+        conditioning, and the head) hits instead of rebuilding.
+        """
+        setting = _resolve_auto_flag("H3_CROSS_PHASE_WARMUP")
+        if setting is False:
+            return {"skipped": "H3_CROSS_PHASE_WARMUP=0"}
+        if self.runner.provider != "CUDAExecutionProvider":
+            return {"skipped": "provider"}
+        snapshot = probe_gpu_memory()
+        effective_free = max(0, snapshot.free_bytes - other_reserved_bytes())
+        if effective_free < HIGH_VRAM_THRESHOLD_BYTES and setting is not True:
+            return {"skipped": "vram", "vram_free_bytes": snapshot.free_bytes}
+        reserve = (
+            streaming_kv_bytes(self.profile)
+            if self.streaming_attention
+            else self.profile.attention_workspace_bytes
+        )
+        budget = max(0, int((effective_free - 768 * 1024**2 - reserve) * 0.5))
+        host_budget = host_prefetch_budget_bytes()
+        if host_budget is not None:
+            budget = min(budget, host_budget)
+        if budget <= 0:
+            return {"skipped": "budget"}
+        self.runner.set_session_cache_budget(budget)
+        paths = [
+            self.directory / "main_embeddings.onnx",
+            self.directory / "main_conditioning.onnx",
+            self.directory / "main_head.onnx",
+            self.directory / "main_token_refiner_norm.onnx",
+            *(
+                self.directory / f"main_token_refiner_block_{index:02d}_{kind}.onnx"
+                for index in range(2)
+                for kind in ("attention", "mlp")
+            ),
+        ]
+        started = time.perf_counter()
+        warmed = 0
+        try:
+            for path in paths:
+                if not path.is_file():
+                    continue
+                session = self.runner.session(path)
+                self.runner.release_session(path, session)
+                warmed += 1
+        finally:
+            gc.collect()
+        return {
+            "warmed_sessions": warmed,
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+            "session_cache_budget_bytes": budget,
+        }
+
     def denoise_step(
         self,
         video_latent: np.ndarray,
@@ -968,19 +1430,23 @@ class H3MainRuntime:
 
         snapshot = probe_gpu_memory()
         latest_vram_free = snapshot.free_bytes
-        self.chunk_sizes = select_fl2va_chunk_sizes(snapshot.free_bytes, self.dynamic_chunks)
+        # Concurrent workbench processes reserve VRAM through a shared
+        # registry; plan against what this process may actually claim.
+        effective_free = max(0, snapshot.free_bytes - other_reserved_bytes())
+        self.chunk_sizes = select_fl2va_chunk_sizes(effective_free, self.dynamic_chunks)
         shards = main_model_shards(self.directory)
-        batches = plan_shard_batches(shards, self.profile, snapshot.free_bytes) if snapshot.free_bytes else []
+        batches = plan_shard_batches(shards, self.profile, effective_free) if effective_free else []
         groups = [[runtime_attention_output_graph(self.directory, name)] for name, _ in shards]
         if self.streaming_attention:
-            # A QKV barrier prevents unsafe reordering. Up to three adjacent
-            # dependency-safe sessions can otherwise share L1 on a 4 GB GPU;
-            # the byte planner remains the final admission control.
-            max_sessions = min(3, max(1, self.l1_prefetch_shards + 1))
+            # A QKV barrier prevents unsafe reordering. Adjacent
+            # dependency-safe sessions can share L1; high-VRAM hosts group
+            # more of them, while the byte planner remains the final
+            # admission control.
+            max_sessions = scaled_streaming_max_sessions(self.l1_prefetch_shards, effective_free)
             streaming_batches = plan_streaming_shard_batches(
                 shards,
                 self.profile,
-                snapshot.free_bytes,
+                effective_free,
                 max_sessions=max_sessions,
             )
             if streaming_batches and self.runner.provider == "CUDAExecutionProvider":
@@ -1015,8 +1481,12 @@ class H3MainRuntime:
                 vram_free_bytes=latest_vram_free,
                 **self.runner.cache_stats(),
             )
-            # No ORT session is resident here, leaving the maximum space for K/V.
-            if self.ort_streamed_attention is not None:
+            # Torch SDPA (FlashAttention on supported hardware) reuses its own
+            # caching allocator, avoiding the per-block session build and the
+            # WDDM arena churn the ORT fallback graph pays on Windows.
+            if self.torch_streamed_attention:
+                attended = streamed_attention(streaming_packed, True, self.attention_query_chunk)
+            elif self.ort_streamed_attention is not None:
                 attended = self.ort_streamed_attention(
                     streaming_packed,
                     self.attention_query_chunk,
@@ -1054,23 +1524,54 @@ class H3MainRuntime:
             if self.streaming_attention
             else self.profile.attention_workspace_bytes
         )
-        prefetch_budget = max(0, snapshot.free_bytes - 768 * 1024**2 - attention_reserve)
+        prefetch_budget = max(0, effective_free - 768 * 1024**2 - attention_reserve)
         host_budget = host_prefetch_budget_bytes()
         if host_budget is not None:
             prefetch_budget = min(prefetch_budget, host_budget)
-        # The native 15s trace recorded zero L1 hits and repeated waits. Keep
-        # active attention buffers in VRAM and retain the effective L2 mmap
-        # cache; session prefetch remains available as an explicit opt-in.
-        l1_enabled = os.environ.get("H3_FL2VA_L1_PREFETCH", "0") == "1"
-        prefetch_depth = self.l1_prefetch_shards if prefetch_budget > 0 and l1_enabled else 0
+        # The native 15s trace recorded zero L1 hits and repeated waits on a
+        # 4 GB GPU, where admission control starves the build queue. High-VRAM
+        # hosts can queue deep enough to overlap builds with execution, so
+        # prefetch auto-enables there unless the user opted out explicitly.
+        fl2va_l1 = _resolve_auto_flag("H3_FL2VA_L1_PREFETCH")
+        l1_enabled = (
+            fl2va_l1
+            if fl2va_l1 is not None
+            else effective_free >= HIGH_VRAM_THRESHOLD_BYTES
+        ) and self.l1_prefetch_shards >= 1
+        prefetch_depth = (
+            scaled_prefetch_depth(self.l1_prefetch_shards, effective_free)
+            if prefetch_budget > 0 and l1_enabled
+            else 0
+        )
+        cache_setting = _resolve_auto_flag("H3_FL2VA_SESSION_CACHE")
+        cache_enabled = (
+            cache_setting
+            if cache_setting is not None
+            else effective_free >= HIGH_VRAM_THRESHOLD_BYTES
+        )
+        # Cached sessions and the prefetch window coexist; halving the shared
+        # budget keeps the attention barrier and byte planner safe.
+        session_cache_budget = (
+            max(0, int(prefetch_budget * 0.5))
+            if cache_enabled
+            and self.runner.provider == "CUDAExecutionProvider"
+            and prefetch_budget > 0
+            else 0
+        )
+        self.runner.set_session_cache_budget(session_cache_budget)
 
         def dynamic_group_planner(paths: list[Path]) -> list[list[Path]]:
             """Re-plan only unexecuted graphs against the current VRAM watermark."""
             nonlocal latest_vram_free
             current_snapshot = probe_gpu_memory()
             latest_vram_free = current_snapshot.free_bytes
-            usable = max(1, latest_vram_free - 768 * 1024**2 - attention_reserve)
-            max_sessions = min(3, max(1, self.l1_prefetch_shards + 1)) if self.streaming_attention else len(paths)
+            current_free = max(0, current_snapshot.free_bytes - other_reserved_bytes())
+            usable = max(1, current_free - 768 * 1024**2 - attention_reserve)
+            max_sessions = (
+                scaled_streaming_max_sessions(self.l1_prefetch_shards, current_free)
+                if self.streaming_attention
+                else len(paths)
+            )
             planned: list[list[Path]] = []
             current: list[Path] = []
             current_bytes = 0
@@ -1441,6 +1942,10 @@ def initial_latents(profile: GenerationProfile, seed: int) -> tuple[np.ndarray, 
     return video, audio
 
 
+# The table-driven runtime is the only exported product main-model path.
+from h3_workbench.schedule_runtime import ScheduleMainRuntime as H3MainRuntime  # noqa: E402
+
+
 def sample_latents(
     runtime: H3MainRuntime,
     video: np.ndarray,
@@ -1448,6 +1953,7 @@ def sample_latents(
     text_states: np.ndarray,
     steps: int = 4,
     callback: Callable[[int, int], None] | None = None,
+    checkpoint_callback: Callable[[int, int, np.ndarray, np.ndarray], None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     sigmas = shifted_flow_sigmas(steps)
     refined_text = runtime.prepare_text(text_states)
@@ -1488,4 +1994,6 @@ def sample_latents(
             raise FloatingPointError(f"Non-finite FL2VA video latent at step {index + 1}: {invalid} invalid values")
         if callback is not None:
             callback(index + 1, steps)
+        if checkpoint_callback is not None:
+            checkpoint_callback(index + 1, steps, video, audio)
     return video, audio

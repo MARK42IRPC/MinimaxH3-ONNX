@@ -31,8 +31,7 @@ class DownloadComponent:
 
 DOWNLOAD_COMPONENTS: tuple[DownloadComponent, ...] = (
     DownloadComponent("qwen", "Qwen 文本编码器", "onnx_models/qwen3vl_32b_minimax_h3_nvfp4_awq", ("qwen3vl_32b_minimax_h3_nvfp4_awq/**",), "text_encoder", True),
-    DownloadComponent("turbo", "FL2VA Turbo 加速版", "onnx_models/minimax_h3_fl2va_pruned_fp8_scaled_accelerated", ("minimax_h3_fl2va_pruned_fp8_scaled_accelerated/**",), "fl2va_transformer", True),
-    DownloadComponent("streaming", "FL2VA 流式基座版", "onnx_models/minimax_h3_fl2va_pruned_fp8_scaled_streaming", ("minimax_h3_fl2va_pruned_fp8_scaled_streaming/**",), "fl2va_transformer"),
+    DownloadComponent("streaming", "FL2VA 流式基座版", "onnx_models/minimax_h3_fl2va_pruned_fp8_scaled_streaming", ("minimax_h3_fl2va_pruned_fp8_scaled_streaming/**",), "fl2va_transformer", True),
     DownloadComponent("video_vae", "Video VAE", "onnx_models/video_vae", ("video_vae/**",), "video_vae", True),
     DownloadComponent("audio_vae", "Audio VAE", "onnx_models/audio_vae", ("audio_vae/**",), "audio_vae", True),
     DownloadComponent("tokenizer", "H3 Tokenizer", "qwen_tokenizer", ("qwen_tokenizer/**",), "tokenizer", True),

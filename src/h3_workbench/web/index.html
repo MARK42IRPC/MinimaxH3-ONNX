@@ -3,140 +3,250 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MiniMax H3 Edge Workbench</title>
+  <meta name="theme-color" content="#202521">
+  <title>MiniMax H3 工作台</title>
   <link rel="stylesheet" href="/assets/styles.css">
 </head>
 <body>
   <header class="topbar">
+    <button class="icon-button mobile-menu-button" id="menuButton" type="button" title="打开导航" aria-label="打开导航" aria-expanded="false">☰</button>
     <div class="brand">
-      <span class="brand-mark">H3</span>
-      <div>
-        <h1>MiniMax H3 Edge Workbench</h1>
+      <span class="brand-mark" aria-hidden="true">H3</span>
+      <div class="brand-copy">
+        <h1>MiniMax H3 工作台</h1>
         <p id="workspacePath">正在读取工作区</p>
       </div>
     </div>
     <div class="top-actions">
-      <span class="health-dot" id="healthDot"></span>
-      <span id="healthText">连接中</span>
-      <button class="icon-button" id="refreshButton" title="刷新" aria-label="刷新">↻</button>
+      <span class="connection"><i class="health-dot" id="healthDot"></i><span id="healthText">连接中</span></span>
+      <button class="icon-button" id="refreshButton" type="button" title="刷新全部数据" aria-label="刷新全部数据">↻</button>
     </div>
   </header>
 
-  <div class="layout">
-    <nav class="sidebar" aria-label="工作台导航">
-      <button class="nav-item active" data-tab="models"><span>01</span>模型</button>
-      <button class="nav-item" data-tab="export"><span>02</span>切片</button>
-      <button class="nav-item" data-tab="inference"><span>03</span>生成</button>
-      <button class="nav-item" data-tab="jobs"><span>04</span>任务</button>
-      <button class="nav-item" data-tab="system"><span>05</span>系统</button>
-      <div class="sidebar-footer">
-        <span>ONNX Opset 20</span>
-        <span>CPU 验证</span>
-      </div>
-    </nav>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <nav class="primary-nav" aria-label="工作台导航">
+        <button class="nav-item active" type="button" data-page="models" aria-current="page">
+          <span class="nav-icon" aria-hidden="true">⬡</span>
+          <span><strong>模型</strong><small>下载与自动切片</small></span>
+        </button>
+        <button class="nav-item" type="button" data-page="inference">
+          <span class="nav-icon" aria-hidden="true">▶</span>
+          <span><strong>推理</strong><small>参数与任务启动</small></span>
+        </button>
+        <button class="nav-item" type="button" data-page="tasks">
+          <span class="nav-icon" aria-hidden="true">≡</span>
+          <span><strong>任务</strong><small>队列与硬件监控</small></span>
+          <span class="nav-badge hidden" id="runningBadge">0</span>
+        </button>
+      </nav>
 
-    <main>
-      <section class="telemetry" aria-label="系统资源">
-        <div><span>GPU</span><strong id="gpuName">--</strong></div>
-        <div><span>显存</span><strong id="gpuMemory">--</strong></div>
-        <div><span>可用内存</span><strong id="ramAvailable">--</strong></div>
-        <div><span>执行后端</span><strong id="providerName">--</strong></div>
+      <section class="runtime-brief" aria-label="运行环境摘要">
+        <div class="brief-heading"><span>运行环境</span><i id="providerDot"></i></div>
+        <strong id="sidebarGpu">正在检测 GPU</strong>
+        <span id="sidebarProvider">ONNX Runtime --</span>
+        <span id="sidebarMemory">内存 --</span>
       </section>
+    </aside>
 
-      <section class="tab-panel active" id="modelsPanel">
-        <div class="section-heading">
+    <button class="sidebar-scrim" id="sidebarScrim" type="button" aria-label="关闭导航"></button>
+
+    <main id="mainContent">
+      <div class="connection-banner hidden" id="connectionBanner" role="alert"></div>
+
+      <section class="page active" id="modelsPage" data-page-panel="models">
+        <header class="page-header">
           <div>
-            <span class="eyebrow">MODEL INVENTORY</span>
-            <h2>本地模型</h2>
-            <p class="section-note">配套模型仓库：<a href="https://www.modelscope.cn/models/Mark42IRPC/Minimax-H3-int8-fl2va-onnx-50CLIPS" target="_blank" rel="noreferrer">ModelScope</a> · <a href="https://github.com/MARK42IRPC/MinimaxH3-ONNX" target="_blank" rel="noreferrer">GitHub 项目</a></p>
+            <span class="eyebrow">MODEL WORKSPACE</span>
+            <h2>模型</h2>
+            <p>下载项目验证过的原始权重，在本机生成推理切片，并按需构建运行时 LoRA 适配器。</p>
           </div>
-          <span class="count" id="modelCount">0 个组件</span>
-        </div>
-        <div class="download-panel">
-          <div class="download-heading"><div><strong>模型完整性与下载</strong><span>按需选择组件，下载支持断点续传</span></div><button class="secondary-button" id="checkModelsButton" type="button">重新检查</button></div>
-          <div class="download-list" id="downloadList"></div>
-          <div class="download-actions"><button class="command-button" id="downloadModelsButton" type="button">下载选中组件</button><span id="downloadSummary">--</span></div>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>文件</th>
-                <th>组件</th>
-                <th>精度</th>
-                <th>大小</th>
-                <th>张量</th>
-                <th>导出范围</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody id="modelsBody"></tbody>
-          </table>
-          <div class="empty-state hidden" id="modelsEmpty">未发现 Safetensors 模型</div>
-        </div>
-      </section>
+          <div class="header-status" id="modelReadiness"><span class="status-dot"></span><span>正在检查模型</span></div>
+        </header>
 
-      <section class="tab-panel" id="exportPanel">
-        <div class="section-heading">
-          <div>
-            <span class="eyebrow">SOURCE TO ONNX</span>
-            <h2>下载原模型并自主切片</h2>
-            <p class="section-note">仅提供本项目实测成功的版本；任务会依次下载、检查、分片导出并验证 ONNX。</p>
+        <div class="overview-grid" id="modelOverview" aria-label="模型状态概览">
+          <div class="metric"><span>必需组件</span><strong id="requiredModelMetric">--</strong><small>用于端到端生成</small></div>
+          <div class="metric"><span>已验证产物</span><strong id="validatedModelMetric">--</strong><small>清单与图文件完整</small></div>
+          <div class="metric"><span>源文件缓存</span><strong id="sourceModelMetric">--</strong><small>原权重与配套文件</small></div>
+          <div class="metric"><span>模型任务</span><strong id="modelTaskMetric">--</strong><small>下载或切片中</small></div>
+        </div>
+
+        <section class="workspace-section">
+          <div class="section-bar">
+            <div>
+              <h3>验证方案</h3>
+              <p>基座模型在本机自动切片；Turbo 只生成动态叠加拓扑，不复制或合并一份主模型。</p>
+            </div>
+            <button class="text-button" id="checkModelsButton" type="button"><span aria-hidden="true">↻</span>重新检查</button>
           </div>
-          <span class="count">ModelScope 断点下载</span>
-        </div>
-        <div class="preset-list" id="exportPresetList"></div>
-        <div class="runtime-warning">原始权重受 MiniMax H3 Community License Agreement 约束。开始前请确认目标磁盘具有“下载文件 + ONNX 产物”所需空间。</div>
-      </section>
-
-      <section class="tab-panel" id="inferencePanel">
-        <div class="section-heading">
-          <div>
-            <span class="eyebrow">GENERATION</span>
-            <h2>对话生成</h2>
+          <div class="preset-list" id="exportPresetList" aria-live="polite">
+            <div class="loading-state"><span class="spinner"></span>正在读取可用方案</div>
           </div>
-          <span class="count" id="inferenceProvider">--</span>
-        </div>
-        <form class="inference-form" id="inferenceForm">
-          <label class="prompt-field">Prompt<textarea id="promptInput" rows="5" placeholder="描述画面、动作、镜头与声音" autocomplete="off"></textarea></label>
-          <label>时序模式<select id="temporalMode"><option value="segmented" selected>低显存分段</option><option value="native">整体长序列</option></select></label>
-          <label>时长（秒）<input id="durationInput" type="number" value="0.7" min="0.1" max="15" step="0.1"></label>
-          <label>采样步数<input id="stepsInput" type="number" value="4" min="1" max="50" step="1"></label>
-          <label>Query 块<select id="queryChunkSelect"><option>64</option><option>128</option><option selected>256</option><option>512</option></select></label>
-          <label>L1 预取<select id="l1PrefetchSelect"><option value="0">关闭</option><option value="1">1 片</option><option value="2" selected>2 片</option><option value="3">3 片</option><option value="4">4 片</option></select></label>
-          <label>Seed<input id="seedInput" type="number" value="1" step="1"></label>
-          <label>宽度<input id="widthInput" type="number" value="640" min="128" max="1024" step="16"></label>
-          <label>高度<input id="heightInput" type="number" value="360" min="128" max="1024" step="8"></label>
-          <button class="command-button" type="submit" id="generateButton">开始生成</button>
-          <details class="advanced-fields">
-            <summary>高级输入</summary>
-            <label class="token-field">Token IDs<input id="tokenIdsInput" placeholder="1,42,1000,151935" autocomplete="off"></label>
-          </details>
-        </form>
-        <dl class="profile-grid" id="profileGrid"></dl>
-        <div class="runtime-warning hidden" id="runtimeWarning"></div>
+          <div class="notice notice-license">
+            <strong>许可与空间</strong>
+            <span id="diskNotice">原始权重受 MiniMax H3 Community License Agreement 约束。任务启动前会检查源文件、切片或适配器产物所需空间。</span>
+          </div>
+        </section>
+
+        <section class="workspace-section">
+          <div class="section-bar">
+            <div>
+              <h3>运行组件</h3>
+              <p>推理链路使用的实际产物状态，绿色表示本地清单和文件均已通过校验。</p>
+            </div>
+            <span class="section-count" id="componentCount">--</span>
+          </div>
+          <div class="component-grid" id="componentGrid"></div>
+          <div class="empty-state hidden" id="componentsEmpty">
+            <strong>暂时无法读取组件清单</strong>
+            <span>刷新后仍无数据时，请检查工作台服务日志。</span>
+          </div>
+        </section>
+
+        <details class="workspace-section source-inventory">
+          <summary>
+            <span><strong>本地原模型</strong><small>查看工作区中已识别的 Safetensors，并可单独执行切片验证</small></span>
+            <span class="section-count" id="modelCount">0 个文件</span>
+          </summary>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>文件</th><th>组件</th><th>精度</th><th>大小</th><th>张量</th><th>切片范围</th><th><span class="sr-only">操作</span></th></tr></thead>
+              <tbody id="modelsBody"></tbody>
+            </table>
+            <div class="empty-state hidden" id="modelsEmpty"><strong>没有识别到原模型</strong><span>可从上方验证方案启动下载。</span></div>
+          </div>
+        </details>
       </section>
 
-      <section class="tab-panel" id="jobsPanel">
-        <div class="section-heading">
+      <section class="page" id="inferencePage" data-page-panel="inference">
+        <header class="page-header">
           <div>
-            <span class="eyebrow">JOB QUEUE</span>
+            <span class="eyebrow">INFERENCE</span>
+            <h2>推理</h2>
+            <p>设置生成参数，预检模型与硬件条件，然后将任务加入队列。</p>
+          </div>
+          <div class="header-status neutral" id="inferenceProvider"><span class="status-dot"></span><span>正在预检</span></div>
+        </header>
+
+        <div class="inference-layout">
+          <form class="inference-form" id="inferenceForm">
+            <section class="form-section prompt-section">
+              <div class="form-section-heading"><div><h3>生成内容</h3><p>描述主体、动作、镜头、环境与声音。</p></div><span id="promptCounter">0 / 4000</span></div>
+              <label class="field prompt-field"><span>提示词</span><textarea id="promptInput" rows="7" maxlength="4000" placeholder="例如：雨后的城市街道，镜头缓慢向前移动，远处传来电车声……" autocomplete="off"></textarea></label>
+            </section>
+
+            <section class="form-section">
+              <div class="form-section-heading"><div><h3>输出规格</h3><p>时长会换算为目标帧数，输出按 24 FPS 编码。</p></div></div>
+              <div class="field-grid columns-3">
+                <label class="field"><span>画面规格</span><select id="resolutionPreset"><option value="640x360" selected>640 × 360 · 16:9</option><option value="768x432">768 × 432 · 16:9</option><option value="512x512">512 × 512 · 1:1</option><option value="custom">自定义</option></select></label>
+                <label class="field"><span>时长（秒）</span><input id="durationInput" type="number" value="0.7" min="0.1" max="15" step="0.1" inputmode="decimal"></label>
+                <label class="field"><span>采样步数</span><input id="stepsInput" type="number" value="4" min="1" max="50" step="1" inputmode="numeric"></label>
+              </div>
+              <fieldset class="mode-field">
+                <legend>时序模式</legend>
+                <div class="segmented-control">
+                  <label><input type="radio" name="temporalMode" value="segmented" checked><span><strong>低显存分段</strong><small>长视频拆为多个 17 帧片段</small></span></label>
+                  <label><input type="radio" name="temporalMode" value="native"><span><strong>整体长序列</strong><small>保持完整时间序列，显存需求更高</small></span></label>
+                </div>
+              </fieldset>
+            </section>
+
+            <details class="form-section advanced-section">
+              <summary><span><strong>高级参数</strong><small>注意力分块、预取与手动 Token 输入</small></span><span aria-hidden="true">⌄</span></summary>
+              <div class="advanced-content">
+                <div class="field-grid columns-3">
+                  <label class="field"><span>随机种子</span><input id="seedInput" type="number" value="1" step="1" inputmode="numeric"></label>
+                  <label class="field"><span>Query 分块</span><select id="queryChunkSelect"><option>32</option><option>64</option><option>128</option><option selected>256</option><option>512</option></select></label>
+                  <label class="field"><span>L1 预取</span><select id="l1PrefetchSelect"><option value="0">关闭</option><option value="1">1 个切片</option><option value="2" selected>2 个切片</option><option value="3">3 个切片</option><option value="4">4 个切片</option></select></label>
+                  <label class="field custom-size"><span>宽度</span><input id="widthInput" type="number" value="640" min="128" max="1024" step="16" inputmode="numeric"></label>
+                  <label class="field custom-size"><span>高度</span><input id="heightInput" type="number" value="360" min="128" max="1024" step="8" inputmode="numeric"></label>
+                </div>
+                <label class="field"><span>Token IDs <small>仅在没有提示词时使用，逗号分隔，最多 192 个</small></span><input id="tokenIdsInput" placeholder="1, 42, 1000, 151935" autocomplete="off"></label>
+              </div>
+            </details>
+
+            <div class="submit-bar">
+              <div><strong id="submitSummary">等待参数预检</strong><span id="submitHint">模型满足条件后即可启动</span></div>
+              <button class="primary-button" type="submit" id="generateButton" disabled><span aria-hidden="true">▶</span>启动推理任务</button>
+            </div>
+          </form>
+
+          <aside class="inference-sidebar">
+            <section class="side-panel">
+              <div class="side-panel-heading"><h3>启动预检</h3><span id="preflightSummary">--</span></div>
+              <div class="preflight-list" id="preflightList"><div class="loading-state compact"><span class="spinner"></span>正在检查</div></div>
+            </section>
+            <section class="side-panel">
+              <div class="side-panel-heading"><h3>执行计划</h3><span>估算</span></div>
+              <dl class="profile-grid" id="profileGrid"></dl>
+            </section>
+            <div class="notice hidden" id="runtimeWarning"></div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="page" id="tasksPage" data-page-panel="tasks">
+        <header class="page-header tasks-header">
+          <div>
+            <span class="eyebrow">TASKS & TELEMETRY</span>
             <h2>任务</h2>
+            <p>观察队列进度、执行阶段与实时硬件负载。</p>
           </div>
-          <span class="count" id="jobCount">0 个任务</span>
-        </div>
-        <div class="jobs-list" id="jobsList"></div>
-        <div class="empty-state" id="jobsEmpty">暂无任务</div>
-      </section>
+          <div class="header-actions">
+            <span class="last-updated" id="lastUpdated">尚未更新</span>
+            <button class="text-button" id="refreshTasksButton" type="button"><span aria-hidden="true">↻</span>刷新</button>
+          </div>
+        </header>
 
-      <section class="tab-panel" id="systemPanel">
-        <div class="section-heading">
-          <div>
-            <span class="eyebrow">RUNTIME</span>
-            <h2>运行环境</h2>
-          </div>
+        <div class="task-summary" aria-label="任务统计">
+          <div><span>运行中</span><strong id="runningCount">0</strong></div>
+          <div><span>排队</span><strong id="queuedCount">0</strong></div>
+          <div><span>已完成</span><strong id="completedCount">0</strong></div>
+          <div><span>失败</span><strong id="failedCount">0</strong></div>
         </div>
-        <dl class="system-grid" id="systemGrid"></dl>
+
+        <section class="telemetry-section">
+          <div class="section-bar telemetry-heading">
+            <div><h3>硬件状态</h3><p id="telemetrySource">等待硬件采样</p></div>
+            <div class="live-indicator idle" id="telemetryLive"><i></i><span>待机</span></div>
+          </div>
+          <div class="chart-grid">
+            <article class="chart-card">
+              <div class="chart-heading"><div><h4>计算负载</h4><span>最近 3 分钟</span></div><strong id="utilizationValue">--</strong></div>
+              <div class="chart-wrap"><canvas id="utilizationChart" aria-label="GPU 与 CPU 使用率折线图"></canvas><div class="chart-empty" id="utilizationEmpty">等待采样</div></div>
+              <div class="chart-legend"><span><i class="legend-gpu"></i>GPU</span><span><i class="legend-cpu"></i>CPU</span><span>0–100%</span></div>
+            </article>
+            <article class="chart-card">
+              <div class="chart-heading"><div><h4>内存占用</h4><span>设备与系统内存</span></div><strong id="memoryValue">--</strong></div>
+              <div class="chart-wrap"><canvas id="memoryChart" aria-label="显存与系统内存占用折线图"></canvas><div class="chart-empty" id="memoryEmpty">等待采样</div></div>
+              <div class="chart-legend"><span><i class="legend-vram"></i>显存</span><span><i class="legend-ram"></i>内存</span><span>0–100%</span></div>
+            </article>
+            <article class="chart-card">
+              <div class="chart-heading"><div><h4>存储吞吐</h4><span>系统磁盘读写</span></div><strong id="diskValue">--</strong></div>
+              <div class="chart-wrap"><canvas id="diskChart" aria-label="磁盘读写速率折线图"></canvas><div class="chart-empty" id="diskEmpty">等待采样</div></div>
+              <div class="chart-legend"><span><i class="legend-read"></i>读取</span><span><i class="legend-write"></i>写入</span><span id="diskScale">自动量程</span></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="workspace-section task-workspace">
+          <div class="section-bar task-list-heading">
+            <div><h3>任务队列</h3><p id="jobCount">0 个任务</p></div>
+            <div class="filter-tabs" role="group" aria-label="任务筛选">
+              <button class="active" type="button" data-job-filter="all">全部</button>
+              <button type="button" data-job-filter="active">进行中</button>
+              <button type="button" data-job-filter="completed">已完成</button>
+              <button type="button" data-job-filter="failed">失败</button>
+            </div>
+          </div>
+          <div class="task-content">
+            <div class="jobs-list" id="jobsList"></div>
+            <div class="empty-state" id="jobsEmpty"><strong>暂无任务</strong><span>从模型页或推理页启动一个任务后，进度会显示在这里。</span></div>
+            <aside class="job-inspector" id="jobInspector">
+              <div class="inspector-empty"><span aria-hidden="true">≡</span><strong>选择一个任务</strong><p>查看当前阶段、缓存状态、运行日志和产物。</p></div>
+            </aside>
+          </div>
+        </section>
       </section>
     </main>
   </div>

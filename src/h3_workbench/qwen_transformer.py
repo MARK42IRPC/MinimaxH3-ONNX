@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import gc
+import json
+import math
 from pathlib import Path
 
-import ml_dtypes
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from safetensors import safe_open
 
-from h3_workbench.main_transformer import FrozenLinear, rms_norm
+from h3_workbench.main_transformer import FrozenLinear, _StreamingSafeTensorFile, rms_norm
 
 HIDDEN_SIZE = 5120
 INTERMEDIATE_SIZE = 25600
@@ -19,6 +19,7 @@ QUERY_HEADS = 64
 KV_HEADS = 8
 KV_REPEAT = QUERY_HEADS // KV_HEADS
 NORM_EPS = 1e-6
+CONVROT_FORMAT = "int8_tensorwise"
 E2M1_LUT = np.asarray(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
     dtype=np.float32,
@@ -63,24 +64,75 @@ def dequantize_nvfp4_array(
 
 class QwenCheckpointReader:
     def __init__(self, path: Path):
-        np.float8_e4m3fn = ml_dtypes.float8_e4m3fn  # type: ignore[attr-defined]
-        np.bfloat16 = ml_dtypes.bfloat16  # type: ignore[attr-defined]
-        self._file = safe_open(str(path), framework="numpy")
-        self._keys = set(self._file.keys())
+        self._file = _StreamingSafeTensorFile(path)
+        probe = "model.layers.0.self_attn.q_proj"
+        if self._file.has_tensor(f"{probe}.weight_scale_2"):
+            self.source_quantization = "nvfp4_awq"
+        elif self._file.has_tensor(f"{probe}.weight_scale"):
+            config = self._quantization_config(probe)
+            self.source_quantization = (
+                "int8_tensorwise_convrot" if config is not None and config.get("convrot") is True
+                else "int8_per_channel"
+            )
+        else:
+            raise ValueError(f"Unsupported Qwen checkpoint quantization: {path.name}")
 
     def tensor(self, key: str, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         array = self._file.get_tensor(key)
         if dtype == torch.int8:
-            return torch.from_numpy(np.asarray(array, dtype=np.int8)).contiguous()
+            return torch.from_numpy(np.asarray(array, dtype=np.int8).copy()).contiguous()
         target = np.float16 if dtype == torch.float16 else np.float32
-        return torch.from_numpy(np.asarray(array, dtype=target)).to(dtype).contiguous()
+        return torch.from_numpy(np.asarray(array, dtype=target).copy()).to(dtype).contiguous()
 
     def optional_tensor(self, key: str, dtype: torch.dtype = torch.float32) -> torch.Tensor | None:
-        if key not in self._keys:
+        if not self._file.has_tensor(key):
             return None
         return self.tensor(key, dtype)
 
+    def raw_tensor(self, key: str) -> np.ndarray:
+        """Return one native-dtype tensor for graph repacking without a full map."""
+        return self._file.get_tensor(key)
+
+    def _quantization_config(self, prefix: str) -> dict[str, object] | None:
+        key = f"{prefix}.comfy_quant"
+        if not self._file.has_tensor(key):
+            return None
+        raw = np.asarray(self._file.get_tensor(key), dtype=np.uint8).tobytes().rstrip(b"\0")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid Comfy quantization metadata for {prefix}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"Invalid Comfy quantization metadata for {prefix}")
+        return value
+
+    def convrot_group_size(self, prefix: str) -> int | None:
+        config = self._quantization_config(prefix)
+        if self.source_quantization != "int8_tensorwise_convrot":
+            return None
+        if config is None or config.get("format") != CONVROT_FORMAT or config.get("convrot") is not True:
+            raise ValueError(f"Missing INT8 ConvRot metadata for {prefix}")
+        group_size = int(config.get("convrot_groupsize", 0))
+        if group_size < 4 or group_size & (group_size - 1) or math.log(group_size, 4) % 1:
+            raise ValueError(f"Invalid ConvRot group size for {prefix}: {group_size}")
+        return group_size
+
     def dequant_weight(self, prefix: str) -> torch.Tensor:
+        if self.source_quantization in {"int8_per_channel", "int8_tensorwise_convrot"}:
+            weight = self._file.get_tensor(f"{prefix}.weight")
+            scales = self._file.get_tensor(f"{prefix}.weight_scale")
+            if weight.dtype != np.int8 or scales.shape not in {(weight.shape[0],), (weight.shape[0], 1)}:
+                raise ValueError(f"Invalid per-channel INT8 tensors for {prefix}")
+            row_scales = np.asarray(scales, dtype=np.float32).reshape(weight.shape[0], 1)
+            converted = np.empty(weight.shape, dtype=np.float16)
+            for start in range(0, weight.shape[0], 256):
+                stop = min(start + 256, weight.shape[0])
+                converted[start:stop] = np.asarray(weight[start:stop], dtype=np.float32) * row_scales[start:stop]
+            result = torch.from_numpy(converted).contiguous()
+            del weight, scales, row_scales, converted
+            gc.collect()
+            return result
+
         packed = self._file.get_tensor(f"{prefix}.weight")
         blocked_scales = self._file.get_tensor(f"{prefix}.weight_scale")
         scale = float(self._file.get_tensor(f"{prefix}.weight_scale_2"))
@@ -92,28 +144,71 @@ class QwenCheckpointReader:
 
 
 class SmoothedLinear(nn.Module):
-    def __init__(self, weight: torch.Tensor, pre_quant_scale: torch.Tensor | None):
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        pre_quant_scale: torch.Tensor | None,
+        convrot_group_size: int | None = None,
+    ):
         super().__init__()
         self.linear = FrozenLinear(weight, compute_fp32=True)
         if pre_quant_scale is None:
             self.register_parameter("pre_quant_scale", None)
         else:
             self.pre_quant_scale = nn.Parameter(pre_quant_scale.float(), requires_grad=False)
+        if convrot_group_size is None:
+            self.register_buffer("convrot_hadamard", None, persistent=False)
+            self.convrot_group_size = 0
+        else:
+            self.register_buffer(
+                "convrot_hadamard",
+                regular_hadamard(convrot_group_size),
+                persistent=False,
+            )
+            self.convrot_group_size = convrot_group_size
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         if self.pre_quant_scale is not None:
             inputs = inputs.float() * self.pre_quant_scale
+        if self.convrot_hadamard is not None:
+            original_shape = inputs.shape
+            groups = original_shape[-1] // self.convrot_group_size
+            grouped = inputs.reshape(-1, groups, self.convrot_group_size)
+            inputs = torch.matmul(grouped, self.convrot_hadamard.to(inputs)).reshape(original_shape)
         return self.linear(inputs)
+
+
+def regular_hadamard(size: int) -> torch.Tensor:
+    """Return the normalized regular Hadamard matrix used by Comfy ConvRot."""
+    if size < 4 or size & (size - 1) or math.log(size, 4) % 1:
+        raise ValueError(f"Regular Hadamard size must be a power of 4, got {size}")
+    h4 = torch.tensor(
+        [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
+        dtype=torch.float32,
+    )
+    result = h4
+    current = 4
+    while current < size:
+        result = torch.kron(result, h4)
+        current *= 4
+    return result / math.sqrt(size)
 
 
 class QwenEmbedding(nn.Module):
     def __init__(self, reader: QwenCheckpointReader):
         super().__init__()
-        self.weight = nn.Parameter(reader.tensor("model.embed_tokens.weight", torch.int8), requires_grad=False)
-        self.scale = nn.Parameter(reader.tensor("model.embed_tokens.weight_scale"), requires_grad=False)
+        scale = reader.optional_tensor("model.embed_tokens.weight_scale")
+        weight_dtype = torch.int8 if scale is not None else torch.float16
+        self.weight = nn.Parameter(reader.tensor("model.embed_tokens.weight", weight_dtype), requires_grad=False)
+        if scale is None:
+            self.register_parameter("scale", None)
+        else:
+            self.scale = nn.Parameter(scale, requires_grad=False)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         rows = F.embedding(token_ids.long(), self.weight).float()
+        if self.scale is None:
+            return rows
         scales = F.embedding(token_ids.long(), self.scale).float()
         return rows * scales
 
@@ -192,8 +287,27 @@ class QwenDownShard(nn.Module):
         return hidden_states.float() + self.down(F.silu(gate.float()) * up.float())
 
 
+class QwenMLPShard(nn.Module):
+    """One-layer MLP boundary used to measure launch and transfer reduction."""
+
+    def __init__(self, reader: QwenCheckpointReader, index: int):
+        super().__init__()
+        prefix = f"model.layers.{index}"
+        self.norm = nn.Parameter(reader.tensor(f"{prefix}.post_attention_layernorm.weight"), requires_grad=False)
+        self.gate = _load_linear(reader, f"{prefix}.mlp.gate_proj")
+        self.up = _load_linear(reader, f"{prefix}.mlp.up_proj")
+        self.down = _load_linear(reader, f"{prefix}.mlp.down_proj")
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        normalized = rms_norm(hidden_states.float(), self.norm, NORM_EPS)
+        gate = self.gate(normalized)
+        up = self.up(normalized)
+        return hidden_states.float() + self.down(F.silu(gate.float()) * up.float())
+
+
 def _load_linear(reader: QwenCheckpointReader, prefix: str) -> SmoothedLinear:
     return SmoothedLinear(
         reader.dequant_weight(prefix),
         reader.optional_tensor(f"{prefix}.pre_quant_scale"),
+        reader.convrot_group_size(prefix),
     )
