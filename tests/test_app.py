@@ -24,6 +24,8 @@ def test_export_presets_expose_direct_source_and_local_product_state() -> None:
     assert payload["download_mode"] == "direct_http_range"
     qwen = next(item for item in payload["presets"] if item["id"] == "qwen")
     assert qwen["source"]["url"].startswith("https://")
+    assert qwen["source"]["repo_id"] == "Comfy-Org/MiniMax-H3"
+    assert qwen["source"]["path"] == "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
     assert qwen["output_dir"].endswith("_int8_virtual")
     assert qwen["output_size_bytes"] < 1024**2
     assert qwen["status"] in {"download_required", "source_ready", "ready"}

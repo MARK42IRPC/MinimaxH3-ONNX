@@ -7,7 +7,7 @@ from urllib.parse import quote
 OFFICIAL_REPO = "Comfy-Org/MiniMax-H3"
 TURBO_REPO = "larryvrh/MiniMax-H3-Turbo-Lora"
 SUPPORT_REPO = "Mark42IRPC/Minimax-H3-int8-fl2va-onnx-50CLIPS"
-TOKENIZER_REPO = "Qwen/Qwen3-VL-32B-Instruct"
+TOKENIZER_REPO = SUPPORT_REPO
 
 
 def _hugging_face_url(repo_id: str, path: str) -> str:
@@ -69,9 +69,9 @@ EXPORT_PRESETS: tuple[ExportPreset, ...] = (
         "tokenizer",
         SourceAsset(
             TOKENIZER_REPO,
-            "tokenizer.json",
+            "qwen_tokenizer/tokenizer.json",
             7032403,
-            _hugging_face_url(TOKENIZER_REPO, "tokenizer.json"),
+            _modelscope_url(TOKENIZER_REPO, "qwen_tokenizer/tokenizer.json"),
             role="tokenizer",
         ),
         "qwen_tokenizer",
@@ -80,23 +80,23 @@ EXPORT_PRESETS: tuple[ExportPreset, ...] = (
         extra_sources=(
             SourceAsset(
                 TOKENIZER_REPO,
-                "tokenizer_config.json",
+                "qwen_tokenizer/tokenizer_config.json",
                 11003,
-                _hugging_face_url(TOKENIZER_REPO, "tokenizer_config.json"),
+                _modelscope_url(TOKENIZER_REPO, "qwen_tokenizer/tokenizer_config.json"),
                 role="tokenizer",
             ),
             SourceAsset(
                 TOKENIZER_REPO,
-                "vocab.json",
+                "qwen_tokenizer/vocab.json",
                 2776833,
-                _hugging_face_url(TOKENIZER_REPO, "vocab.json"),
+                _modelscope_url(TOKENIZER_REPO, "qwen_tokenizer/vocab.json"),
                 role="tokenizer",
             ),
             SourceAsset(
                 TOKENIZER_REPO,
-                "merges.txt",
+                "qwen_tokenizer/merges.txt",
                 1671839,
-                _hugging_face_url(TOKENIZER_REPO, "merges.txt"),
+                _modelscope_url(TOKENIZER_REPO, "qwen_tokenizer/merges.txt"),
                 role="tokenizer",
             ),
         ),
@@ -109,7 +109,7 @@ EXPORT_PRESETS: tuple[ExportPreset, ...] = (
             OFFICIAL_REPO,
             "vae/minimax_h3_audio_vae_fp32.safetensors",
             605254808,
-            _hugging_face_url(OFFICIAL_REPO, "vae/minimax_h3_audio_vae_fp32.safetensors"),
+            _modelscope_url(OFFICIAL_REPO, "vae/minimax_h3_audio_vae_fp32.safetensors"),
         ),
         "onnx_models/audio_vae",
         261860256,
@@ -123,7 +123,7 @@ EXPORT_PRESETS: tuple[ExportPreset, ...] = (
             OFFICIAL_REPO,
             "vae/minimax_h3_video_vae_fp16.safetensors",
             5207808496,
-            _hugging_face_url(OFFICIAL_REPO, "vae/minimax_h3_video_vae_fp16.safetensors"),
+            _modelscope_url(OFFICIAL_REPO, "vae/minimax_h3_video_vae_fp16.safetensors"),
         ),
         "onnx_models/video_vae",
         4982896191,
@@ -134,10 +134,10 @@ EXPORT_PRESETS: tuple[ExportPreset, ...] = (
         "Qwen VL 编码器",
         "text_encoder",
         SourceAsset(
-            SUPPORT_REPO,
-            "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+            OFFICIAL_REPO,
+            "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
             27141342152,
-            _modelscope_url(SUPPORT_REPO, "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
+            _modelscope_url(OFFICIAL_REPO, "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
         ),
         "onnx_models/qwen3vl_32b_minimax_h3_int8_virtual",
         200000,
@@ -151,7 +151,7 @@ EXPORT_PRESETS: tuple[ExportPreset, ...] = (
             OFFICIAL_REPO,
             "diffusion_models/minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
             20958205608,
-            _hugging_face_url(OFFICIAL_REPO, "diffusion_models/minimax_h3_fl2va_pruned_fp8_scaled.safetensors"),
+            _modelscope_url(OFFICIAL_REPO, "diffusion_models/minimax_h3_fl2va_pruned_fp8_scaled.safetensors"),
         ),
         "onnx_models/minimax_h3_fl2va_pruned_fp8_scaled_streaming",
         40764106323,

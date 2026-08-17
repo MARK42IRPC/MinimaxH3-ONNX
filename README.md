@@ -2,7 +2,7 @@
 
 Local model inventory, staged ONNX export, numerical validation, and a lightweight WebUI for MiniMax H3 edge experiments.
 
-Companion ONNX model package: [ModelScope](https://www.modelscope.cn/models/Mark42IRPC/Minimax-H3-int8-fl2va-onnx-50CLIPS). The WebUI can inspect installed components and enqueue selected ModelScope downloads. This GitHub repository intentionally does not contain the multi-hundred-gigabyte ONNX artifacts.
+Small companion assets: [ModelScope](https://www.modelscope.cn/models/Mark42IRPC/Minimax-H3-int8-fl2va-onnx-50CLIPS). The WebUI downloads the H3 tokenizer and Turbo timestep grid from this collection, while large source checkpoints come from the official [Comfy-Org/MiniMax-H3 files](https://www.modelscope.cn/models/Comfy-Org/MiniMax-H3/files). This GitHub repository intentionally does not contain the multi-hundred-gigabyte model artifacts.
 
 The current exporter supports the Comfy-Org H3 VAE and FL2VA Transformer checkpoints:
 
@@ -18,7 +18,7 @@ The FL2VA Transformer is split into input projections, two token-refiner Attenti
 
 On Windows, run `install.bat` once. It creates the Python 3.11 environment and installs the locked dependencies, including the official PyTorch CUDA 12.6 wheel. The installer detects a usable NVIDIA device with `nvidia-smi` and adds the optional `gpu` extra (`cuda-python`, CuPy, and CUTLASS) automatically. Set `H3_INSTALL_GPU=0` before running it to skip those optional tools, or `H3_INSTALL_GPU=1` to force them. Installation ends with Torch CUDA and ONNX Runtime provider checks; ONNX Runtime remains the primary sharded graph backend and `CPUExecutionProvider` remains available as a fallback.
 
-The WebUI's `切片` page can reproduce the validated package directly from ModelScope. It exposes only the tested Comfy-Org source variants. The Turbo v4 preset also downloads Larryvrh's `minimax_h3_turbo_v4_step600_ema.safetensors` and the validated `h3_silu_temb_grid.safetensors` support file before exporting the complete 259/259 LoRA path.
+The WebUI's `切片` page can reproduce the validated package directly from ModelScope. Large VAE, Qwen INT8, and FL2VA source checkpoints are downloaded from the official Comfy-Org ModelScope repository. The tokenizer and validated `h3_silu_temb_grid.safetensors` support file come from the companion collection. The Turbo v4 preset still downloads Larryvrh's custom `minimax_h3_turbo_v4_step600_ema.safetensors` because that exact adapter is not published in the official repository.
 
 ```powershell
 uv sync --locked --extra dev --no-editable
