@@ -14,6 +14,7 @@ import numpy as np
 import onnxruntime as ort
 
 from h3_workbench.profiles import GenerationProfile, PROFILE_360P_17F
+from h3_workbench.device_profile import torch_cuda_architecture_supported
 from h3_workbench.shard_planner import SCHEDULE_FORMAT, validate_runtime_schedule
 
 
@@ -112,10 +113,13 @@ class ScheduleMainRuntime:
                 for shard in self.schedule["shards"]
                 for graph in shard["graphs"]
             }
-            prefetch_depth = max(0, min(4, int(os.environ.get("H3_WEIGHT_PREFETCH_DEPTH", "3"))))
+            prefetch_depth = max(
+                0,
+                min(12, int(os.environ.get("H3_WEIGHT_PREFETCH_DEPTH", "8"))),
+            )
             prefetch_workers = max(
                 1,
-                min(3, int(os.environ.get("H3_WEIGHT_PREFETCH_WORKERS", "2"))),
+                min(4, int(os.environ.get("H3_WEIGHT_PREFETCH_WORKERS", "3"))),
             )
             persistent = PersistentWeightRuntime(
                 self.directory,
@@ -176,13 +180,29 @@ class ScheduleMainRuntime:
             getattr(runner, "provider", "CPUExecutionProvider") == "CUDAExecutionProvider"
         )
         self._sdpa_backend = "numpy"
+        self._sdpa_fallback_reason: str | None = None
         if cuda_provider:
             import torch
 
             torch_cuda_ready = torch.cuda.is_available()
             if requested_sdpa_backend == "torch" and not torch_cuda_ready:
                 raise ValueError("H3_SDPA_BACKEND=torch requires a CUDA-enabled PyTorch")
-            use_torch = torch_cuda_ready and (
+            device_index = int(getattr(runner, "device_index", 0))
+            torch_architecture_ready = (
+                torch_cuda_ready and torch_cuda_architecture_supported(device_index)
+            )
+            if requested_sdpa_backend == "torch" and not torch_architecture_ready:
+                try:
+                    properties = torch.cuda.get_device_properties(device_index)
+                    architecture = f"sm_{properties.major}{properties.minor}"
+                except (RuntimeError, AttributeError, IndexError):
+                    architecture = "the selected CUDA architecture"
+                raise ValueError(
+                    "H3_SDPA_BACKEND=torch is unavailable: the installed PyTorch build "
+                    f"does not contain kernels for {architecture}. Install a PyTorch build "
+                    "supporting this GPU or set H3_SDPA_BACKEND=ort."
+                )
+            use_torch = torch_architecture_ready and (
                 requested_sdpa_backend == "torch"
                 or (
                     requested_sdpa_backend == "auto"
@@ -192,6 +212,15 @@ class ScheduleMainRuntime:
             if use_torch:
                 self._sdpa_backend = "torch"
             else:
+                if requested_sdpa_backend == "auto" and torch_cuda_ready and not torch_architecture_ready:
+                    try:
+                        properties = torch.cuda.get_device_properties(device_index)
+                        architecture = f"sm_{properties.major}{properties.minor}"
+                    except (RuntimeError, AttributeError, IndexError):
+                        architecture = "the selected CUDA architecture"
+                    self._sdpa_fallback_reason = (
+                        f"torch build lacks {architecture}; selected ORT SDPA"
+                    )
                 from h3_workbench.inference_runtime import ORTStreamingAttention
 
                 self._ort_streamed_attention = ORTStreamingAttention(self.directory, runner)
@@ -323,6 +352,7 @@ class ScheduleMainRuntime:
             ),
             "sdpa_seconds": round(float(self._metrics["sdpa_seconds"]), 3),
             "sdpa_backend": self._sdpa_backend,
+            "sdpa_fallback_reason": self._sdpa_fallback_reason,
             "device_sdpa": self._device_sdpa,
             "attention_query_chunk_max": self.attention_query_chunk,
             "attention_query_chunk_counts": dict(sorted(self._attention_chunks.items())),
@@ -536,6 +566,7 @@ class ScheduleMainRuntime:
         persistent_upload_seconds = 0.0
         persistent_prefetched = False
         persistent_device_resident = False
+        persistent_prefetch_metrics: dict[str, int | float] = {}
         if persistent is None:
             session = self._session(step["shard"])
         else:
@@ -577,6 +608,9 @@ class ScheduleMainRuntime:
                 self._metrics["persistent_prefetch_uses"] += 1
             if persistent_device_resident:
                 self._metrics["persistent_device_weight_runs"] += 1
+            prefetch_metrics = getattr(persistent, "prefetch_metrics", None)
+            if callable(prefetch_metrics):
+                persistent_prefetch_metrics = prefetch_metrics()
         selected = {
             port: self._read(binding, external, constants, buffers)
             for port, binding in step["inputs"].items()
@@ -713,6 +747,7 @@ class ScheduleMainRuntime:
             weight_upload_seconds=(
                 round(persistent_upload_seconds, 3) if persistent is not None else None
             ),
+            **persistent_prefetch_metrics,
         )
         return self._shape_context(arguments, feeds, context)
 
@@ -734,7 +769,12 @@ class ScheduleMainRuntime:
 
             text_count = int(np.asarray(values["text_states"]).shape[0])
             sigma_video = float(values["sigma_video"])
-            times, modulation = modulation_ids(self.profile, text_count, sigma_video)
+            times, modulation = modulation_ids(
+                self.profile,
+                text_count,
+                sigma_video,
+                external.get("conditioned_video_indices", ()),
+            )
             from h3_workbench.inference_runtime import time_shift_sigma
 
             outputs = {
@@ -795,6 +835,7 @@ class ScheduleMainRuntime:
                         getattr(self.runner, "provider", "CPUExecutionProvider")
                         == "CUDAExecutionProvider",
                         query_chunk,
+                        int(getattr(self.runner, "device_index", 0)),
                     )
                 )
             }
@@ -873,9 +914,15 @@ class ScheduleMainRuntime:
                         candidates.append(future_step["graph"])
                         if len(candidates) == self._persistent_weights.prefetch_depth:
                             break
-                for graph in candidates:
-                    if self._persistent_weights.prefetch(graph):
-                        self._metrics["persistent_prefetches"] += 1
+                prefetch_many = getattr(self._persistent_weights, "prefetch_many", None)
+                if callable(prefetch_many):
+                    self._metrics["persistent_prefetches"] += int(
+                        prefetch_many(candidates)
+                    )
+                else:
+                    for graph in candidates:
+                        if self._persistent_weights.prefetch(graph):
+                            self._metrics["persistent_prefetches"] += 1
             if step["kind"] == "graph":
                 dimension_context = self._run_graph(
                     step,
@@ -901,12 +948,14 @@ class ScheduleMainRuntime:
         text_states: np.ndarray,
         sigma_video: float,
         text_is_refined: bool = False,
+        conditioned_video_indices: tuple[int, ...] = (),
     ) -> tuple[np.ndarray, np.ndarray]:
         refined = text_states if text_is_refined else self.prepare_text(text_states)
         external = {
             "video_latent": video_latent,
             "audio_latent": audio_latent,
             "sigma_video": float(sigma_video),
+            "conditioned_video_indices": conditioned_video_indices,
         }
         external, _ = self._execute_phase("denoise", external, {"text_states": refined})
         return np.asarray(external["video_velocity"]), np.asarray(external["audio_velocity"])

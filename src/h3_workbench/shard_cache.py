@@ -15,7 +15,7 @@ from google.protobuf.message import DecodeError
 
 GIB = 1024**3
 DEFAULT_PREFETCH_DEPTH = 16
-READ_CHUNK_BYTES = 8 * 1024**2
+READ_CHUNK_BYTES = 32 * 1024**2
 
 
 @dataclass
@@ -86,20 +86,38 @@ def default_prefetch_depth() -> int:
 class ShardPrefetchCache:
     """Bounded SSD-to-RAM read-ahead backed by the operating system page cache."""
 
-    def __init__(self, budget_bytes: int | None = None, prefetch_depth: int = DEFAULT_PREFETCH_DEPTH):
+    def __init__(
+        self,
+        budget_bytes: int | None = None,
+        prefetch_depth: int = DEFAULT_PREFETCH_DEPTH,
+        prefetch_workers: int | None = None,
+    ):
         self._auto_budget = budget_bytes is None
         self._budget_cap = default_l2_cache_bytes() if budget_bytes is None else max(0, budget_bytes)
         self.budget_bytes = self._budget_cap
         self.prefetch_depth = max(1, prefetch_depth)
+        if prefetch_workers is None:
+            try:
+                prefetch_workers = int(os.environ.get("H3_L2_PREFETCH_WORKERS", "2"))
+            except ValueError:
+                prefetch_workers = 2
+        self.prefetch_workers = max(1, min(4, prefetch_workers))
         self._entries: OrderedDict[Path, _CacheEntry] = OrderedDict()
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="h3-shard-prefetch")
+        self._executor = ThreadPoolExecutor(
+            max_workers=self.prefetch_workers,
+            thread_name_prefix="h3-shard-prefetch",
+        )
         self._lock = threading.Lock()
+        self._metrics_lock = threading.Lock()
         self._closed = False
         self._hits = 0
         self._waits = 0
         self._wait_seconds = 0.0
         self._budget_adjustments = 0
         self._pressure_evictions = 0
+        self._active_reads = 0
+        self._read_ahead_bytes = 0
+        self._read_ahead_seconds = 0.0
         try:
             self._memory_reserve_bytes = max(
                 1 * GIB,
@@ -109,7 +127,7 @@ class ShardPrefetchCache:
             self._memory_reserve_bytes = 8 * GIB
 
     @staticmethod
-    def _warm(path: Path) -> list[_MappedFile]:
+    def _read_files(path: Path) -> list[_MappedFile]:
         mapped: list[_MappedFile] = []
         try:
             for item in graph_files(path):
@@ -128,6 +146,21 @@ class ShardPrefetchCache:
             for item in mapped:
                 item.close()
             raise
+
+    def _warm(self, path: Path) -> list[_MappedFile]:
+        started = time.perf_counter()
+        with self._metrics_lock:
+            self._active_reads += 1
+        try:
+            mapped = self._read_files(path)
+        finally:
+            elapsed = time.perf_counter() - started
+            with self._metrics_lock:
+                self._active_reads -= 1
+                self._read_ahead_seconds += elapsed
+        with self._metrics_lock:
+            self._read_ahead_bytes += graph_storage_bytes(path)
+        return mapped
 
     def stage(self, paths: list[Path]) -> None:
         with self._lock:
@@ -225,7 +258,7 @@ class ShardPrefetchCache:
     def snapshot(self) -> dict[str, int | float]:
         with self._lock:
             entries = list(self._entries.values())
-            return {
+            result = {
                 "l2_budget_bytes": self.budget_bytes,
                 "l2_staged_bytes": sum(entry.size_bytes for entry in entries),
                 "l2_entries": len(entries),
@@ -237,6 +270,16 @@ class ShardPrefetchCache:
                 "l2_budget_adjustments": self._budget_adjustments,
                 "l2_pressure_evictions": self._pressure_evictions,
             }
+        with self._metrics_lock:
+            result.update(
+                {
+                    "l2_prefetch_workers": self.prefetch_workers,
+                    "l2_active_reads": self._active_reads,
+                    "l2_read_ahead_bytes": self._read_ahead_bytes,
+                    "l2_read_ahead_seconds": round(self._read_ahead_seconds, 3),
+                }
+            )
+        return result
 
     def _remove_locked(self, path: Path) -> None:
         entry = self._entries.pop(path)

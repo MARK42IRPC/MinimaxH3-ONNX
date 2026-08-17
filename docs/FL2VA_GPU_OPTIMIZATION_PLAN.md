@@ -651,7 +651,62 @@ load seconds.
 L2 read-ahead now has a resizable budget. When host available memory drops, it
 evicts the oldest mmap entries and reports budget adjustments and pressure
 evictions. When the weight hot set is active, automatic L2 read-ahead is capped
-at 2 GiB so page warming cannot consume the memory reserved for ORT sessions,
-activations, and the next uncached graph. This addresses the observed failure
-mode where SSD activity became low but available RAM approached zero and GPU
-gaps grew instead of shrinking.
+at 3 GiB so multiple complete uncached shards can remain ahead while pressure
+control still preserves the system reserve.
+
+## 2026-08-15 Stable SSD-to-RAM Window and Video Encoder Tiles
+
+The four-step `840511ec2461` trace exposed a bursty host pipeline: process reads
+peaked at about 1.45 GB/s, but only 22.1% of sampling telemetry intervals read
+more than 10 MB/s. The old persistent queue retained only three graphs. It
+usually reported zero foreground weight wait, but it did not use the remaining
+host RAM to create a durable future window and each refill appeared as a short
+physical-I/O spike.
+
+The persistent path now plans eight future graphs by default (up to twelve),
+with a byte admission budget in addition to the graph-count limit. Two L2
+workers read consecutive files into the Windows page cache; three weight
+workers wait on that read-ahead and then copy RAM-to-RAM into reusable pinned
+or pageable buffers. A 32 GiB host therefore divides available memory among
+the cross-step hot set, a 3 GiB read-ahead window, a bounded pending-weight
+window, and a 4 GiB live reserve. Metrics include queue depth, reserved bytes,
+read-ahead bytes/entries/active workers, hits, waits, and cumulative wait time.
+The implementation and scheduler tests pass; a post-restart production trace
+is still required before claiming a wall-clock improvement.
+
+## 2026-08-16 Progressive Video Encoder Pipeline
+
+The monolithic temporal ONNX encoder is retired from super-resolution. Its
+361 MB graph repeated all 2376 nodes for every spatial tile, retained about
+3.8 GiB on the 4 GiB RTX 3050, and encoded the `h3-sr-cef5559b99d4` trace in
+1017.39 seconds versus 145.01 seconds for the decoder.
+
+The replacement product is `progressive_staged_cuda_v1`: stage 0 normalizes
+pixels and runs level 0, stage 1 runs level 1, the tail runs levels 2-5 on the
+stitched `/4` activation, and the head produces moments. Early stages use
+bounded spatial tiles and stitch after each downsample, so later levels execute
+once on the compact canvas. All causal Conv3d weights are exported as equivalent
+per-time-tap Conv2d operations; validation against the reference encoder reaches
+cosine 1.0 and relative L2 `6.15e-4` on the export fixture.
+
+Fixed stage 0/1 shapes use TensorRT FP16 engine caches; tail/head remain on CUDA
+EP because their shapes vary with output resolution. Stage sessions are prefetched
+while the previous stage computes. A 17-frame 736x960 runtime gate completed in
+26.70 seconds with 2750 MiB peak VRAM and 62.6% average GPU utilization, versus
+63.04 seconds for staged CUDA alone. Segmented inputs are encoded once and sliced
+into 7-token windows at a 5-token stride when the combined FP16 canvas is at most
+1.5 GiB. `H3_VAE_TENSORRT=0` disables TensorRT for comparison; PyTorch automatic
+fallback is deliberately disabled.
+
+## Planned: Cooperative WebUI Task Cancellation
+
+Add a stop control for queued and running WebUI jobs. This requires a backend
+cancel endpoint and a per-job cancellation token; the button alone must not
+pretend that a task stopped. Long-running loops will check the token between
+text layers, VAE temporal/spatial tiles, FL2VA shards and sampling steps, and
+decoder tiles. Cancellation must enter the normal cleanup path so sessions,
+persistent weights, mapped files, CUDA buffers, reservations, monitor threads,
+and temporary outputs are released. The terminal job state will distinguish
+`cancelled` from `failed`, make repeated cancellation idempotent, and prevent a
+cancelled queued job from starting. API and UI tests must cover queued cancel,
+running cancel, repeated cancel, cleanup, and button state transitions.

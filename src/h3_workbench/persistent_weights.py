@@ -769,6 +769,7 @@ class PersistentWeightRuntime:
         self._sessions: dict[str, Any] = {}
         self._weights: dict[str, LoadedWeights] = {}
         self._pending: dict[str, Future[LoadedWeights]] = {}
+        self._pending_sizes: dict[str, int] = {}
         self._prefetch_depth = max(0, prefetch_depth)
         requested_workers = 2 if prefetch_workers is None else prefetch_workers
         self._prefetch_workers = max(
@@ -818,14 +819,41 @@ class PersistentWeightRuntime:
             else None
         )
         shard_cache = getattr(runner, "shard_cache", None)
+        self._shard_cache = shard_cache
         if (
             self._ram_cache_candidates
             and shard_cache is not None
             and "H3_L2_CACHE_GIB" not in os.environ
         ):
-            # RAM-resident weights and mmap read-ahead must share one host
-            # budget. Two GiB is enough to keep several uncached shards ahead.
-            shard_cache.set_budget(min(shard_cache.budget_bytes, 2 * GIB))
+            # RAM-resident weights and SSD read-ahead share the host budget.
+            # Keep a few complete uncached shards hot instead of reducing the
+            # cache to a single graph-sized burst.
+            try:
+                l2_cap = max(1.0, float(os.environ.get("H3_WEIGHT_L2_CACHE_GIB", "3")))
+            except ValueError:
+                l2_cap = 3.0
+            shard_cache.set_budget(min(shard_cache.budget_bytes, int(l2_cap * GIB)))
+        try:
+            prefetch_reserve = max(
+                2 * GIB,
+                int(float(os.environ.get("H3_WEIGHT_PREFETCH_RESERVE_GIB", "4")) * GIB),
+            )
+        except ValueError:
+            prefetch_reserve = 4 * GIB
+        available_host = int(psutil.virtual_memory().available)
+        calculated_prefetch_budget = max(
+            0,
+            available_host - self._ram_cache_budget - prefetch_reserve,
+        )
+        try:
+            prefetch_cap = max(
+                0,
+                int(float(os.environ.get("H3_WEIGHT_PREFETCH_RAM_GIB", "8")) * GIB),
+            )
+        except ValueError:
+            prefetch_cap = 8 * GIB
+        self._prefetch_budget_bytes = min(calculated_prefetch_budget, prefetch_cap)
+        self._prefetch_reserved_bytes = 0
         device_setting = os.environ.get("H3_DEVICE_WEIGHT_PREFETCH", "auto").strip().lower()
         if device_setting not in {"auto", "0", "1"}:
             raise ValueError("H3_DEVICE_WEIGHT_PREFETCH must be auto, 0, or 1")
@@ -903,7 +931,7 @@ class PersistentWeightRuntime:
                 "persistent_device_prefetch_slot_limit": self._device_slot_limit,
             }
         with self._ram_cache_lock:
-            return {
+            metrics: dict[str, int | float | bool] = {
                 **device,
                 "persistent_ram_cache_enabled": bool(self._ram_cache_candidates),
                 "persistent_ram_cache_budget_bytes": self._ram_cache_budget,
@@ -916,7 +944,45 @@ class PersistentWeightRuntime:
                 "persistent_ram_cache_hits": self._ram_cache_hits,
                 "persistent_ram_cache_misses": self._ram_cache_misses,
                 "persistent_ram_cache_load_seconds": round(self._ram_cache_load_seconds, 3),
+                "persistent_prefetch_depth": self._prefetch_depth,
+                "persistent_prefetch_workers": self._prefetch_workers,
+                "persistent_prefetch_budget_bytes": self._prefetch_budget_bytes,
+                "persistent_prefetch_queue_depth": len(self._pending),
+                "persistent_prefetch_reserved_bytes": self._prefetch_reserved_bytes,
             }
+        shard_cache = self._shard_cache
+        if shard_cache is not None:
+            metrics.update(
+                {
+                    f"persistent_{key}": value
+                    for key, value in shard_cache.snapshot().items()
+                }
+            )
+        return metrics
+
+    def prefetch_metrics(self) -> dict[str, int | float]:
+        result: dict[str, int | float] = {
+            "prefetch_queue_depth": len(self._pending),
+            "prefetch_reserved_bytes": self._prefetch_reserved_bytes,
+            "prefetch_budget_bytes": self._prefetch_budget_bytes,
+        }
+        shard_cache = self._shard_cache
+        if shard_cache is None:
+            return result
+        snapshot = shard_cache.snapshot()
+        result.update(
+            {
+                "ssd_read_ahead_bytes": snapshot["l2_staged_bytes"],
+                "ssd_read_ahead_entries": snapshot["l2_entries"],
+                "ssd_read_ahead_ready": snapshot["l2_ready"],
+                "ssd_read_ahead_active": snapshot["l2_active_reads"],
+                "ssd_read_ahead_total_bytes": snapshot["l2_read_ahead_bytes"],
+                "ssd_prefetch_hits": snapshot["l2_hits"],
+                "ssd_prefetch_waits": snapshot["l2_waits"],
+                "ssd_prefetch_wait_seconds": snapshot["l2_wait_seconds"],
+            }
+        )
+        return result
 
     def prime_ram_cache(self) -> dict[str, int | float | bool]:
         """Queue the selected task working set before the first denoise graph."""
@@ -967,6 +1033,7 @@ class PersistentWeightRuntime:
                 self._ram_cache_misses += 1
                 self._ram_cache_load_seconds += loaded.load_seconds
             return loaded
+        self._wait_for_ssd_read_ahead(graph)
         loaded = LoadedWeights(
             self.graph_paths[graph],
             self.topology_inputs[kind],
@@ -1016,9 +1083,59 @@ class PersistentWeightRuntime:
             self._device_metrics["persistent_device_prefetch_bytes"] += loaded.device_bytes
         return loaded
 
+    def _wait_for_ssd_read_ahead(self, graph: str) -> None:
+        """Ensure the persistent graph is in the host read-ahead window.
+
+        Persistent weights are copied into an owned host buffer rather than
+        consumed directly from a mmap. Without this barrier the weight worker
+        bypasses ``ShardPrefetchCache`` and every graph causes its own short
+        SSD burst. The shard cache warms the file once, then this copy is a
+        RAM-to-RAM operation while the next files continue warming in order.
+        """
+        cache = self._shard_cache
+        if cache is None:
+            return
+        try:
+            cache.wait(self.graph_paths[graph])
+        except Exception:
+            # Read-ahead is an optimization. If mmap/read-ahead cannot warm a
+            # file (for example on a filesystem without mmap support), retain
+            # the original direct file-read path and let it report its error.
+            return
+
     def supports(self, graph: str) -> bool:
         kind = _graph_kind(graph)
         return kind in self.topology_inputs and graph in self.graph_paths
+
+    def _host_prefetch_kind_busy(self, kind: str) -> bool:
+        """Return whether a non-RAM-prefetched graph already owns this pool key.
+
+        ``HostWeightPool`` deliberately keeps one reusable buffer per graph kind.
+        A loaded future retains that buffer until the consumer releases it, so
+        allowing two same-kind futures into the executor can deadlock: a later
+        future may acquire the buffer while the earlier future is still waiting
+        for it. RAM-cache candidates do not use ``HostWeightPool`` and are
+        intentionally excluded from this check.
+        """
+        return any(_graph_kind(name) == kind for name in (*self._pending, *self._weights))
+
+    def prefetch_many(self, graphs: list[str]) -> int:
+        """Queue a stable future window and warm its source files in order."""
+        unique = list(dict.fromkeys(graph for graph in graphs if self.supports(graph)))
+        if not unique or self._prefetch_depth == 0:
+            return 0
+        read_ahead_paths = [
+            self.graph_paths[graph]
+            for graph in unique
+            if graph not in self._ram_cache_candidates
+        ]
+        if self._shard_cache is not None and read_ahead_paths:
+            self._shard_cache.stage(read_ahead_paths)
+        scheduled = 0
+        for graph in unique:
+            if self.prefetch(graph, _stage=False):
+                scheduled += 1
+        return scheduled
 
     def session(self, graph: str) -> tuple[Any, bool, float]:
         kind = _graph_kind(graph)
@@ -1041,7 +1158,7 @@ class PersistentWeightRuntime:
         if session is not None:
             del session
 
-    def prefetch(self, graph: str) -> bool:
+    def prefetch(self, graph: str, _stage: bool = True) -> bool:
         if not self.supports(graph) or self._prefetch_depth == 0:
             return False
         kind = _graph_kind(graph)
@@ -1056,10 +1173,26 @@ class PersistentWeightRuntime:
                     return False
                 self._ram_pending[graph] = executor.submit(self._load_weights, graph, kind)
             return True
+        # Only one normal (host-pool backed) future per kind may be in flight.
+        # The pool has one buffer per kind; serializing these futures prevents a
+        # later graph from holding that buffer while the earlier graph waits for
+        # it. Different kinds continue to prefetch in parallel.
+        if self._host_prefetch_kind_busy(kind):
+            return False
+        if _stage and self._shard_cache is not None:
+            self._shard_cache.stage([self.graph_paths[graph]])
+        estimated_bytes = max(1, int(graph_storage_bytes(self.graph_paths[graph]) * 1.05))
         if len(self._weights) + len(self._pending) >= self._prefetch_depth:
+            return False
+        if (
+            self._prefetch_budget_bytes <= 0
+            or self._prefetch_reserved_bytes + estimated_bytes > self._prefetch_budget_bytes
+        ):
             return False
         if graph in self._weights or graph in self._pending:
             return False
+        self._prefetch_reserved_bytes += estimated_bytes
+        self._pending_sizes[graph] = estimated_bytes
         self._pending[graph] = self._executor.submit(
             self._load_weights,
             graph,
@@ -1096,11 +1229,19 @@ class PersistentWeightRuntime:
             pending = self._pending.pop(graph, None)
         prefetched = pending is not None
         wait_started = time.perf_counter()
-        loaded = (
-            pending.result()
-            if pending is not None
-            else self._load_weights(graph, kind)
-        )
+        try:
+            loaded = (
+                pending.result()
+                if pending is not None
+                else self._load_weights(graph, kind)
+            )
+        except Exception:
+            reserved = self._pending_sizes.pop(graph, 0)
+            self._prefetch_reserved_bytes = max(
+                0,
+                self._prefetch_reserved_bytes - reserved,
+            )
+            raise
         wait_seconds = time.perf_counter() - wait_started
         feeds = loaded.feeds()
         upload_wait_seconds = float(getattr(loaded, "upload_wait_seconds", 0.0))
@@ -1132,6 +1273,11 @@ class PersistentWeightRuntime:
             if graph in self._ram_cache_candidates:
                 # The task-level cache owns this object across sampling steps.
                 return
+            reserved = self._pending_sizes.pop(graph, 0)
+            self._prefetch_reserved_bytes = max(
+                0,
+                self._prefetch_reserved_bytes - reserved,
+            )
             device_resident = loaded.device_resident
             loaded.close()
             if device_resident:
@@ -1142,6 +1288,8 @@ class PersistentWeightRuntime:
         self._sessions.clear()
         pending = list(self._pending.values())
         self._pending.clear()
+        self._pending_sizes.clear()
+        self._prefetch_reserved_bytes = 0
         ram_pending = list(self._ram_pending.values())
         self._ram_pending.clear()
         self._executor.shutdown(wait=True, cancel_futures=True)

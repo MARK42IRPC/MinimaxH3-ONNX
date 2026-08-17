@@ -16,6 +16,7 @@ from h3_workbench.persistent_weights import (
     device_prefetch_admitted,
     initializer_weight_inputs,
 )
+from h3_workbench.shard_cache import ShardPrefetchCache
 
 
 def test_dynamic_adapter_graph_kinds_cover_refiner_and_head() -> None:
@@ -118,6 +119,77 @@ def test_persistent_runtime_prefetches_and_releases_one_graph(tmp_path: Path) ->
     runtime.release("main_block_00_mlp")
     assert runtime.prefetch("main_block_00_mlp")
     runtime.close()
+
+
+def test_persistent_runtime_warms_a_multi_graph_ssd_window(tmp_path: Path) -> None:
+    sources: dict[str, Path] = {}
+    for index, kind in enumerate(("attention_qkv", "attention_output", "mlp")):
+        source = tmp_path / f"source_{index}.onnx"
+        _external_model(source)
+        build_persistent_topology(source, tmp_path / PERSISTENT_TOPOLOGIES[kind])
+        sources[f"main_block_00_{kind}"] = source
+
+    class Runner:
+        provider = "CPUExecutionProvider"
+
+        def __init__(self) -> None:
+            self.shard_cache = ShardPrefetchCache(
+                budget_bytes=1024**2,
+                prefetch_depth=3,
+                prefetch_workers=2,
+            )
+
+    runner = Runner()
+    runtime = PersistentWeightRuntime(
+        tmp_path,
+        runner,
+        sources,
+        prefetch_depth=3,
+        prefetch_workers=2,
+    )
+
+    assert runtime.prefetch_many(list(sources)) == 3
+    first_graph = next(iter(sources))
+    runtime.weights(first_graph)
+    snapshot = runtime.prefetch_metrics()
+
+    assert snapshot["prefetch_queue_depth"] == 2
+    assert snapshot["prefetch_reserved_bytes"] > 0
+    assert snapshot["ssd_read_ahead_entries"] == 3
+    assert snapshot["ssd_read_ahead_total_bytes"] > 0
+    runtime.release(first_graph)
+    runtime.close()
+    runner.shard_cache.close()
+
+
+def test_persistent_runtime_serializes_same_kind_host_prefetches(tmp_path: Path) -> None:
+    source = tmp_path / "source.onnx"
+    _external_model(source)
+    topology = tmp_path / PERSISTENT_TOPOLOGIES["mlp"]
+    build_persistent_topology(source, topology)
+    runtime = PersistentWeightRuntime(
+        tmp_path,
+        object(),
+        {
+            "main_block_00_mlp": source,
+            "main_block_01_mlp": source,
+        },
+        prefetch_depth=3,
+        prefetch_workers=2,
+    )
+
+    try:
+        assert runtime.prefetch("main_block_00_mlp")
+        # Both graphs use the single reusable MLP host buffer. Do not enqueue
+        # the second future until the first graph has released that buffer.
+        assert not runtime.prefetch("main_block_01_mlp")
+        runtime.weights("main_block_00_mlp")
+        runtime.release("main_block_00_mlp")
+        assert runtime.prefetch("main_block_01_mlp")
+        runtime.weights("main_block_01_mlp")
+        runtime.release("main_block_01_mlp")
+    finally:
+        runtime.close()
 
 
 def test_adapter_topology_override_loads_inline_source_initializers(tmp_path: Path) -> None:
@@ -254,6 +326,10 @@ def test_cuda_runtime_reuses_selected_host_ram_weights_across_steps(
     monkeypatch.setenv("H3_PINNED_WEIGHTS", "0")
     monkeypatch.setenv("H3_WEIGHT_RAM_CACHE_GIB", "1")
     monkeypatch.setenv("H3_WEIGHT_RAM_RESERVE_GIB", "8")
+    monkeypatch.setattr(
+        "h3_workbench.persistent_weights.psutil.virtual_memory",
+        lambda: type("Memory", (), {"available": 16 * 1024**3})(),
+    )
 
     class Runner:
         provider = "CUDAExecutionProvider"

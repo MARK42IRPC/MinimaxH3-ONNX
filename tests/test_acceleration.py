@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 from safetensors.torch import save_file
 
@@ -11,6 +12,19 @@ def test_six_step_shifted_flow_schedule() -> None:
     assert sigmas[0] == 1.0
     assert sigmas[-1] == 0.0
     assert np.all(np.diff(sigmas) < 0)
+
+
+def test_shifted_flow_schedule_can_start_from_conditioning_sigma() -> None:
+    sigmas = shifted_flow_sigmas(4, start_sigma=0.35)
+
+    assert sigmas[0] == 0.35
+    assert sigmas[-1] == 0.0
+    assert np.all(np.diff(sigmas) < 0)
+
+
+def test_shifted_flow_schedule_rejects_invalid_start_sigma() -> None:
+    with pytest.raises(ValueError, match="start_sigma"):
+        shifted_flow_sigmas(4, start_sigma=1.1)
 
 
 def test_lora_merger_applies_b_times_a(tmp_path) -> None:

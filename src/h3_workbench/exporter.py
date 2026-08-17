@@ -223,6 +223,300 @@ class VideoEncoder(nn.Module):
         return (mean - latent_mean) / latent_std
 
 
+class VideoTemporalEncoder(nn.Module):
+    """Export the full causal encoder moments for one reference clip."""
+
+    def __init__(self, model: MiniMaxH3VideoVAE):
+        super().__init__()
+        self.encoder = model.encoder
+        self.quant_conv = model.quant_conv
+        self.register_buffer("pixel_mean", model.pixel_mean)
+        self.register_buffer("pixel_std", model.pixel_std)
+
+    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+        normalized = (pixels + 1.0) * 0.5
+        normalized = (normalized - self.pixel_mean.to(normalized)) / self.pixel_std.to(normalized)
+        return self.quant_conv(self.encoder(normalized))
+
+
+def _causal_conv3d_as_conv2d(conv: nn.Module, values: torch.Tensor) -> torch.Tensor:
+    """Evaluate a causal Conv3d as batched per-frame Conv2d taps."""
+    temporal_pad, height_pad, width_pad = getattr(conv, "causal_padding", (0, 0, 0))
+    if height_pad or width_pad:
+        values = torch.nn.functional.pad(
+            values,
+            (width_pad, width_pad, height_pad, height_pad, 0, 0),
+            mode="reflect",
+        )
+    if temporal_pad:
+        values = torch.nn.functional.pad(values, (0, 0, 0, 0, temporal_pad * 2, 0))
+
+    weight = conv.weight
+    temporal_kernel = int(weight.shape[2])
+    temporal_stride = int(conv.stride[0])
+    output_frames = (int(values.shape[2]) - temporal_kernel) // temporal_stride + 1
+    result: torch.Tensor | None = None
+    for tap in range(temporal_kernel):
+        frames = values[:, :, tap : tap + output_frames * temporal_stride : temporal_stride]
+        batch, channels, frame_count, height, width = frames.shape
+        frames_2d = frames.permute(0, 2, 1, 3, 4).reshape(
+            batch * frame_count, channels, height, width
+        )
+        tap_output = torch.nn.functional.conv2d(
+            frames_2d,
+            weight[:, :, tap],
+            conv.bias if tap == temporal_kernel - 1 else None,
+            stride=tuple(int(value) for value in conv.stride[1:]),
+            dilation=tuple(int(value) for value in conv.dilation[1:]),
+            groups=int(conv.groups),
+        )
+        tap_output = tap_output.view(
+            batch,
+            frame_count,
+            int(weight.shape[0]),
+            tap_output.shape[-2],
+            tap_output.shape[-1],
+        ).permute(0, 2, 1, 3, 4)
+        result = tap_output if result is None else result + tap_output
+    assert result is not None
+    return result.contiguous()
+
+
+def _encoder_resnet_block(block: nn.Module, values: torch.Tensor) -> torch.Tensor:
+    hidden = _causal_conv3d_as_conv2d(
+        block.conv1,
+        torch.nn.functional.silu(block.norm1(values)),
+    )
+    hidden = _causal_conv3d_as_conv2d(
+        block.conv2,
+        torch.nn.functional.silu(block.norm2(hidden)),
+    )
+    if block.in_channels != block.out_channels:
+        values = _causal_conv3d_as_conv2d(block.nin_shortcut, values)
+    return hidden + values
+
+
+def _encoder_downsample(downsample: nn.Module, values: torch.Tensor) -> torch.Tensor:
+    if downsample.space_stride == 2:
+        values = torch.nn.functional.pad(values, (0, 1, 0, 1, 0, 0), mode="reflect")
+    return _causal_conv3d_as_conv2d(downsample.conv, values)
+
+
+def _encoder_level(level: nn.Module, values: torch.Tensor) -> torch.Tensor:
+    hidden = values
+    for block in level.block:
+        hidden = _encoder_resnet_block(block, hidden)
+    if hasattr(level, "downsample"):
+        hidden = _encoder_downsample(level.downsample, hidden)
+    return hidden
+
+
+class VideoEncoderPrelude(nn.Module):
+    """Normalize pixels and run the first spatial downsampling level."""
+
+    def __init__(self, model: MiniMaxH3VideoVAE):
+        super().__init__()
+        self.conv_in = model.encoder.conv_in
+        self.level = model.encoder.down[0]
+        self.register_buffer("pixel_mean", model.pixel_mean)
+        self.register_buffer("pixel_std", model.pixel_std)
+
+    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+        normalized = (pixels + 1.0) * 0.5
+        normalized = (normalized - self.pixel_mean.to(normalized)) / self.pixel_std.to(normalized)
+        hidden = _causal_conv3d_as_conv2d(self.conv_in, normalized)
+        return _encoder_level(self.level, hidden)
+
+
+class VideoEncoderLate(nn.Module):
+    """Run the second downsampling level after the large stage is stitched."""
+
+    def __init__(self, model: MiniMaxH3VideoVAE):
+        super().__init__()
+        self.level = model.encoder.down[1]
+
+    def forward(self, activation: torch.Tensor) -> torch.Tensor:
+        return _encoder_level(self.level, activation)
+
+
+class VideoEncoderTail(nn.Module):
+    """Finish levels 2-5 on the compact /4 activation canvas."""
+
+    def __init__(self, model: MiniMaxH3VideoVAE):
+        super().__init__()
+        self.levels = nn.ModuleList(list(model.encoder.down[2:]))
+
+    def forward(self, activation: torch.Tensor) -> torch.Tensor:
+        hidden = activation
+        for level in self.levels:
+            hidden = _encoder_level(level, hidden)
+        return hidden
+
+
+class VideoEncoderHead(nn.Module):
+    """Produce distribution moments after the device-resident encoder stages."""
+
+    def __init__(self, model: MiniMaxH3VideoVAE):
+        super().__init__()
+        self.norm_out = model.encoder.norm_out
+        self.conv_out = model.encoder.conv_out
+        self.quant_conv = model.quant_conv
+
+    def forward(self, activation: torch.Tensor) -> torch.Tensor:
+        hidden = torch.nn.functional.silu(self.norm_out(activation))
+        hidden = _causal_conv3d_as_conv2d(self.conv_out, hidden)
+        return _causal_conv3d_as_conv2d(self.quant_conv, hidden)
+
+
+def _export_staged_video_encoder(
+    model: MiniMaxH3VideoVAE,
+    output_dir: Path,
+    pixels: torch.Tensor,
+    callback: ProgressCallback | None = None,
+) -> tuple[dict[str, Any], dict[str, dict[str, float]]]:
+    prelude = VideoEncoderPrelude(model)
+    late = VideoEncoderLate(model)
+    tail = VideoEncoderTail(model)
+    head = VideoEncoderHead(model)
+    prelude_path = output_dir / "video_encoder_prelude.onnx"
+    late_path = output_dir / "video_encoder_late.onnx"
+    tail_path = output_dir / "video_encoder_tail.onnx"
+    head_path = output_dir / "video_encoder_head.onnx"
+
+    with torch.inference_mode():
+        expected_reference = VideoTemporalEncoder(model)(pixels)
+        expected_prelude = prelude(pixels)
+        expected_late = late(expected_prelude)
+        expected_tail = tail(expected_late)
+        expected_moments = head(expected_tail)
+
+    _progress(callback, 0.18, "Exporting staged Video VAE encoder prelude")
+    _export_graph(
+        prelude,
+        (pixels,),
+        prelude_path,
+        ["pixels"],
+        ["stage0_activation"],
+        dynamic_axes={
+            "pixels": {0: "batch", 3: "height", 4: "width"},
+            "stage0_activation": {0: "batch", 3: "stage0_height", 4: "stage0_width"},
+        },
+    )
+    _progress(callback, 0.42, "Exporting staged Video VAE encoder late blocks")
+    _export_graph(
+        late,
+        (expected_prelude,),
+        late_path,
+        ["stage0_activation"],
+        ["stage1_activation"],
+        dynamic_axes={
+            "stage0_activation": {0: "batch", 3: "stage0_height", 4: "stage0_width"},
+            "stage1_activation": {0: "batch", 3: "stage1_height", 4: "stage1_width"},
+        },
+    )
+    _progress(callback, 0.58, "Exporting staged Video VAE encoder compact tail")
+    _export_graph(
+        tail,
+        (expected_late,),
+        tail_path,
+        ["stage1_activation"],
+        ["tail_activation"],
+        dynamic_axes={
+            "stage1_activation": {0: "batch", 3: "stage1_height", 4: "stage1_width"},
+            "tail_activation": {0: "batch", 3: "latent_height", 4: "latent_width"},
+        },
+    )
+    _progress(callback, 0.68, "Exporting staged Video VAE encoder head")
+    _export_graph(
+        head,
+        (expected_tail,),
+        head_path,
+        ["tail_activation"],
+        ["moments"],
+        dynamic_axes={
+            "tail_activation": {0: "batch", 3: "latent_height", 4: "latent_width"},
+            "moments": {0: "batch", 3: "latent_height", 4: "latent_width"},
+        },
+    )
+
+    _progress(callback, 0.78, "Validating staged Video VAE encoder chain")
+    actual_prelude = _ort_run(prelude_path, {"pixels": pixels.detach().cpu().numpy()})[0]
+    actual_late = _ort_run(late_path, {"stage0_activation": actual_prelude})[0]
+    actual_tail = _ort_run(tail_path, {"stage1_activation": actual_late})[0]
+    actual_moments = _ort_run(head_path, {"tail_activation": actual_tail})[0]
+    validation = {
+        "stage0": _metrics(expected_prelude, actual_prelude),
+        "stage1": _metrics(expected_late, actual_late),
+        "tail": _metrics(expected_tail, actual_tail),
+        "head": _metrics(expected_moments, actual_moments),
+        "reference": _metrics(expected_reference, actual_moments),
+    }
+    _require_close(
+        "Video encoder stage 0",
+        validation["stage0"],
+        max_abs=0.125,
+        min_cosine=0.999,
+        max_relative_l2=2e-3,
+    )
+    _require_close(
+        "Video encoder stage 1",
+        validation["stage1"],
+        max_abs=0.25,
+        min_cosine=0.999,
+        max_relative_l2=3e-3,
+    )
+    _require_close(
+        "Video encoder compact tail",
+        validation["tail"],
+        max_abs=0.25,
+        min_cosine=0.999,
+        max_relative_l2=3e-3,
+    )
+    _require_close("Video encoder staged chain", validation["head"], max_abs=2e-2, min_cosine=0.999)
+    _require_close(
+        "Video encoder Conv2d decomposition",
+        validation["reference"],
+        max_abs=5e-2,
+        min_cosine=0.999,
+        max_relative_l2=2e-3,
+    )
+
+    descriptor = {
+        "layout": "progressive_staged_cuda_v1",
+        "graphs": {
+            "prelude": prelude_path.name,
+            "late": late_path.name,
+            "tail": tail_path.name,
+            "head": head_path.name,
+        },
+        "clip_frames": model.clip_length,
+        "token_drop": model.token_drop,
+        "spatial_ratio": model.vae_ratio,
+        "temporal_tokens": int(expected_moments.shape[2]),
+        "channels": {
+            "prelude": int(expected_prelude.shape[1]),
+            "late": int(expected_late.shape[1]),
+            "tail": int(expected_tail.shape[1]),
+            "moments": int(expected_moments.shape[1]),
+        },
+        "validation": validation,
+        "validation_passed": True,
+    }
+    del (
+        prelude,
+        late,
+        tail,
+        head,
+        expected_reference,
+        expected_prelude,
+        expected_late,
+        expected_tail,
+        expected_moments,
+    )
+    gc.collect()
+    return descriptor, validation
+
+
 class VideoDecoderPrelude(nn.Module):
     def __init__(self, model: MiniMaxH3VideoVAE, latent_shape: tuple[int, int, int] = (5, 16, 16)):
         super().__init__()
@@ -379,10 +673,21 @@ def export_video(
 
     with torch.inference_mode():
         expected_encoded = encoder(pixels)
+        temporal_pixels = torch.randn(1, 3, model.clip_length, 32, 32, dtype=torch.float16).clamp(-1, 1)
         hidden, rotary = prelude(latents)
 
     _progress(callback, 0.06, "Exporting video encoder")
     _export_graph(encoder, (pixels,), encoder_path, ["pixels"], ["latents"])
+    temporal_encoder, encoder_stage_validation = _export_staged_video_encoder(
+        model,
+        output_dir,
+        temporal_pixels,
+        (
+            (lambda value, message: _progress(callback, 0.07 + 0.07 * value, message))
+            if callback is not None
+            else None
+        ),
+    )
     _progress(callback, 0.14, "Exporting video decoder prelude")
     _export_graph(prelude, (latents,), prelude_path, ["latents"], ["hidden_states", "rotary_table"])
 
@@ -425,6 +730,8 @@ def export_video(
     prelude_outputs = _ort_run(prelude_path, {"latents": latents.cpu().numpy()})
     validation: dict[str, Any] = {
         "encoder": _metrics(expected_encoded, actual_encoded),
+        "temporal_encoder": encoder_stage_validation["head"],
+        "encoder_stages": encoder_stage_validation,
         "prelude_hidden": _metrics(prelude(latents)[0], prelude_outputs[0]),
         "prelude_rotary": _metrics(prelude(latents)[1], prelude_outputs[1]),
         "blocks": block_metrics,
@@ -452,9 +759,17 @@ def export_video(
             "tile_pixels": list(tile_pixels_shape),
             "output_frames": 17,
             "temporal_warmup_frames": 3,
+            "encoder_clip_frames": model.clip_length,
         },
         "blocks": blocks,
-        "graphs": [encoder_path.name, prelude_path.name, *block_graphs, head_path.name],
+        "graphs": [
+            encoder_path.name,
+            *temporal_encoder["graphs"].values(),
+            prelude_path.name,
+            *block_graphs,
+            head_path.name,
+        ],
+        "temporal_encoder": temporal_encoder,
         "validation": validation,
         "validation_passed": True,
     }
@@ -478,6 +793,54 @@ def export_video(
         _write_manifest(output_dir, manifest)
     _progress(callback, 1.0, "Video VAE sharded export and validation completed")
     return manifest
+
+
+def export_video_temporal_encoder(
+    path: Path,
+    output_dir: Path,
+    callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    """Add the staged, device-resident temporal encoder to a Video VAE product."""
+    from h3_workbench.media_output import load_video_vae_for_encoding
+
+    _progress(callback, 0.05, "Loading Video VAE encoder weights")
+    model = load_video_vae_for_encoding(path, prefer_cuda=torch.cuda.is_available())
+    device = next(model.parameters()).device
+    pixels = torch.randn(
+        1,
+        3,
+        model.clip_length,
+        32,
+        32,
+        dtype=torch.float16,
+        device=device,
+    ).clamp(-1, 1)
+    if device.type == "cuda":
+        pixels = pixels.contiguous(memory_format=torch.channels_last_3d)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    descriptor, validation = _export_staged_video_encoder(model, output_dir, pixels, callback)
+
+    manifest_path = output_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    stage_graphs = list(descriptor["graphs"].values())
+    graphs = [
+        graph
+        for graph in manifest.get("graphs", [])
+        if graph != "video_encoder_temporal.onnx" and graph not in stage_graphs
+    ]
+    insertion = 1 if graphs and graphs[0] == "video_encoder.onnx" else 0
+    graphs[insertion:insertion] = stage_graphs
+    manifest["graphs"] = graphs
+    manifest.setdefault("profiles", {})["encoder_clip_frames"] = model.clip_length
+    manifest.setdefault("validation", {})["temporal_encoder"] = validation["head"]
+    manifest["validation"]["encoder_stages"] = validation
+    manifest["temporal_encoder"] = descriptor
+    _write_manifest(output_dir, manifest)
+    del model
+    gc.collect()
+    _progress(callback, 1.0, "Staged Video VAE encoder is ready")
+    return manifest["temporal_encoder"]
 
 
 def export_video_long_temporal_graphs(
@@ -1333,6 +1696,9 @@ def _main() -> None:
     long_video_parser = subparsers.add_parser("export-video-long")
     long_video_parser.add_argument("checkpoint", type=Path)
     long_video_parser.add_argument("--output", type=Path, required=True)
+    encoder_parser = subparsers.add_parser("export-video-encoder")
+    encoder_parser.add_argument("checkpoint", type=Path)
+    encoder_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
     if args.command == "inspect":
@@ -1342,6 +1708,15 @@ def _main() -> None:
     started = time.monotonic()
     if args.command == "export-video-long":
         result = export_video_long_temporal_graphs(
+            args.checkpoint.resolve(),
+            args.output.resolve(),
+            lambda value, message: print(f"[{value:6.1%}] {message}", flush=True),
+        )
+        result["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    if args.command == "export-video-encoder":
+        result = export_video_temporal_encoder(
             args.checkpoint.resolve(),
             args.output.resolve(),
             lambda value, message: print(f"[{value:6.1%}] {message}", flush=True),

@@ -162,6 +162,26 @@ def _torch_rows() -> dict[int, dict[str, Any]]:
         return {}
 
 
+def torch_cuda_architecture_supported(index: int = 0) -> bool:
+    """Return whether the installed PyTorch build contains this GPU's CUDA kernels.
+
+    ``torch.cuda.is_available()`` only tells us that CUDA can be initialized. It
+    does not mean that the wheel was compiled for the visible GPU. This matters
+    for newer cards such as Blackwell, where an older wheel can initialize CUDA
+    and then fail on the first convolution or SDPA call with ``no kernel image``.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+        properties = torch.cuda.get_device_properties(index)
+        architecture = f"sm_{properties.major}{properties.minor}"
+        return architecture in set(torch.cuda.get_arch_list())
+    except (ImportError, RuntimeError, AttributeError, IndexError):
+        return False
+
+
 def _available_cuda_provider() -> bool:
     try:
         import onnxruntime as ort

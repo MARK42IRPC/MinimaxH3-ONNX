@@ -34,6 +34,10 @@
           <span class="nav-icon" aria-hidden="true">▶</span>
           <span><strong>推理</strong><small>参数与任务启动</small></span>
         </button>
+        <button class="nav-item" type="button" data-page="super-resolution">
+          <span class="nav-icon" aria-hidden="true">◇</span>
+          <span><strong>超分</strong><small>视频条件重建</small></span>
+        </button>
         <button class="nav-item" type="button" data-page="tasks">
           <span class="nav-icon" aria-hidden="true">≡</span>
           <span><strong>任务</strong><small>队列与硬件监控</small></span>
@@ -135,6 +139,37 @@
               <label class="field prompt-field"><span>提示词</span><textarea id="promptInput" rows="7" maxlength="4000" placeholder="例如：雨后的城市街道，镜头缓慢向前移动，远处传来电车声……" autocomplete="off"></textarea></label>
             </section>
 
+            <section class="form-section frame-conditioning-section">
+              <div class="form-section-heading"><div><h3>帧条件</h3><p>选择生成边界，图片会编码到 Video VAE 潜空间。</p></div><span id="frameConditionStatus">纯文本</span></div>
+              <fieldset class="mode-field frame-mode-field">
+                <legend>生成模式</legend>
+                <div class="segmented-control conditioning-mode-control">
+                  <label><input type="radio" name="conditioningMode" value="text" checked><span><strong>纯文本</strong><small>无帧条件</small></span></label>
+                  <label><input type="radio" name="conditioningMode" value="first"><span><strong>首帧</strong><small>固定起点</small></span></label>
+                  <label><input type="radio" name="conditioningMode" value="last"><span><strong>尾帧</strong><small>固定终点</small></span></label>
+                  <label><input type="radio" name="conditioningMode" value="first_last"><span><strong>首尾帧</strong><small>双端约束</small></span></label>
+                </div>
+              </fieldset>
+              <div class="frame-condition-grid hidden" id="frameConditionInputs">
+                <div class="frame-input hidden" id="startFramePanel">
+                  <div class="frame-input-heading"><div><strong>首帧图片</strong><span>START</span></div><button class="frame-clear-button hidden" id="startFrameClear" type="button" title="移除首帧图片" aria-label="移除首帧图片">×</button></div>
+                  <div class="frame-preview"><img class="hidden" id="startFramePreview" alt="首帧图片预览"><span id="startFramePlaceholder">未选择图片</span></div>
+                  <div class="frame-input-footer">
+                    <label class="frame-file-button"><input id="startFrameFile" type="file" accept="image/png,image/jpeg,image/webp,image/bmp"><span>选择图片</span></label>
+                    <span class="frame-file-status" id="startFrameFileStatus">等待输入</span>
+                  </div>
+                </div>
+                <div class="frame-input hidden" id="endFramePanel">
+                  <div class="frame-input-heading"><div><strong>尾帧图片</strong><span>END</span></div><button class="frame-clear-button hidden" id="endFrameClear" type="button" title="移除尾帧图片" aria-label="移除尾帧图片">×</button></div>
+                  <div class="frame-preview"><img class="hidden" id="endFramePreview" alt="尾帧图片预览"><span id="endFramePlaceholder">未选择图片</span></div>
+                  <div class="frame-input-footer">
+                    <label class="frame-file-button"><input id="endFrameFile" type="file" accept="image/png,image/jpeg,image/webp,image/bmp"><span>选择图片</span></label>
+                    <span class="frame-file-status" id="endFrameFileStatus">等待输入</span>
+                  </div>
+                </div>
+              </div>
+            </section>
+
             <section class="form-section">
               <div class="form-section-heading"><div><h3>输出规格</h3><p>时长会换算为目标帧数，输出按 24 FPS 编码。</p></div></div>
               <div class="field-grid columns-3">
@@ -189,6 +224,89 @@
               <dl class="profile-grid" id="profileGrid"></dl>
             </section>
             <div class="notice hidden" id="runtimeWarning"></div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="page" id="superResolutionPage" data-page-panel="super-resolution">
+        <header class="page-header">
+          <div>
+            <span class="eyebrow">VIDEO SUPER-RESOLUTION</span>
+            <h2>超分</h2>
+            <p>读取输入视频提示词，将时空块放大后编码为条件 latent，再复用 FL2VA 推理链。</p>
+          </div>
+          <div class="header-status neutral" id="superResolutionProvider"><span class="status-dot"></span><span>正在预检</span></div>
+        </header>
+
+        <div class="inference-layout">
+          <form class="inference-form" id="superResolutionForm">
+            <section class="form-section">
+              <div class="form-section-heading"><div><h3>输入视频</h3><p>视频会放入工作区缓存，处理阶段以 RGB 帧驻留主内存。</p></div><span id="superPromptSource">未探测</span></div>
+              <label class="field"><span>工作区路径</span><input id="superSourcePath" type="text" placeholder="例如：inputs/clip.mp4 或 .h3-workbench/inputs/clip.mp4" autocomplete="off"></label>
+              <div class="field-grid columns-2 super-source-actions">
+                <label class="file-field"><span>选择本机视频</span><input id="superVideoFile" type="file" accept="video/*"></label>
+                <button class="text-button" type="button" id="superProbeButton"><span aria-hidden="true">⌕</span>探测视频</button>
+              </div>
+              <div class="notice hidden" id="superVideoNotice"></div>
+            </section>
+
+            <section class="form-section prompt-section">
+              <div class="form-section-heading"><div><h3>条件提示词</h3><p>留空时使用视频 sidecar 或 MP4 comment 中的 prompt。</p></div><span id="superPromptCounter">0 / 4000</span></div>
+              <label class="field prompt-field"><span>提示词</span><textarea id="superPromptInput" rows="6" maxlength="4000" placeholder="可手动覆盖输入视频中的提示词" autocomplete="off"></textarea></label>
+            </section>
+
+            <section class="form-section">
+              <div class="form-section-heading"><div><h3>超分参数</h3><p>空间输出为输入尺寸乘倍率；时间长度和帧率保持输入视频。</p></div></div>
+              <div class="field-grid columns-3">
+                <label class="field"><span>超分倍率</span><select id="superScaleInput"><option value="1">1.0 ×</option><option value="1.5">1.5 ×</option><option value="2" selected>2.0 ×</option><option value="3">3.0 ×</option><option value="4">4.0 ×</option></select></label>
+                <label class="field"><span>插值模式</span><select id="superInterpolationInput"><option value="bicubic" selected>Bicubic · 空间 + 时间线性</option><option value="bilinear">Bilinear · 空间 + 时间线性</option><option value="trilinear">Trilinear · 三维连续</option><option value="nearest">Nearest · 最近邻</option></select></label>
+                <label class="field"><span>采样步数</span><input id="superStepsInput" type="number" value="4" min="1" max="50" step="1" inputmode="numeric"></label>
+              </div>
+              <fieldset class="mode-field">
+                <legend>处理方式</legend>
+                <div class="segmented-control">
+                  <label><input type="radio" name="superProcessingMode" value="segmented" checked><span><strong>视频分片</strong><small>17 帧一段，低显存，段间可能有轻微跳变</small></span></label>
+                  <label><input type="radio" name="superProcessingMode" value="direct"><span><strong>直接推理</strong><small>完整视频一次处理，时间一致性更好，显存需求更高</small></span></label>
+                </div>
+              </fieldset>
+              <label class="range-field"><span><strong>噪声混合强度</strong><output id="superNoiseValue">0.35</output></span><input id="superNoiseInput" type="range" min="0" max="1" value="0.35" step="0.01"></label>
+              <fieldset class="mode-field acceleration-field">
+                <legend>加速 LoRA</legend>
+                <label class="toggle-field">
+                  <input id="superAccelerationLoraInput" type="checkbox">
+                  <span class="toggle-control" aria-hidden="true"><i></i></span>
+                  <span class="toggle-copy"><strong>加载 Turbo v4 加速 LoRA</strong><small>手动开启，仅支持 4–8 步</small></span>
+                </label>
+              </fieldset>
+            </section>
+
+            <details class="form-section advanced-section">
+              <summary><span><strong>高级参数</strong><small>随机种子、注意力分块与预取</small></span><span aria-hidden="true">⌄</span></summary>
+              <div class="advanced-content">
+                <div class="field-grid columns-3">
+                  <label class="field"><span>随机种子</span><input id="superSeedInput" type="number" value="1" step="1" inputmode="numeric"></label>
+                  <label class="field"><span>Query 分块上限</span><select id="superQueryChunkSelect"><option>32</option><option>64</option><option>128</option><option>256</option><option selected>512</option></select></label>
+                  <label class="field"><span>L1 预取</span><select id="superL1PrefetchSelect"><option value="0">关闭</option><option value="1">1 个切片</option><option value="2" selected>2 个切片</option><option value="3">3 个切片</option><option value="4">4 个切片</select></label>
+                </div>
+              </div>
+            </details>
+
+            <div class="submit-bar">
+              <div><strong id="superSubmitSummary">等待输入视频</strong><span id="superSubmitHint">探测视频后显示输出计划</span></div>
+              <button class="primary-button" type="submit" id="superGenerateButton" disabled><span aria-hidden="true">◇</span>启动超分任务</button>
+            </div>
+          </form>
+
+          <aside class="inference-sidebar">
+            <section class="side-panel">
+              <div class="side-panel-heading"><h3>输入与输出</h3><span>规格</span></div>
+              <dl class="profile-grid" id="superVideoProfile"><div><dt>输入</dt><dd>--</dd></div></dl>
+            </section>
+            <section class="side-panel">
+              <div class="side-panel-heading"><h3>启动预检</h3><span id="superPreflightSummary">--</span></div>
+              <div class="preflight-list" id="superPreflightList"><div class="loading-state compact">等待视频探测</div></div>
+            </section>
+            <div class="notice hidden" id="superRuntimeWarning"></div>
           </aside>
         </div>
       </section>

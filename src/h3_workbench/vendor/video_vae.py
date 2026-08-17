@@ -1,6 +1,7 @@
 # MiniMax H3 video VAE: 3D causal CNN encoder + ViT3D decoder.
 
 import math
+import time
 
 import torch
 import torch.nn as nn
@@ -513,17 +514,46 @@ class MiniMaxH3VideoVAE(nn.Module):
             return torch.cat([blended, b[tuple(slice_b_rest)]], dim=dim)
         return blended
 
-    def tiled_encode(self, x):
+    def tiled_encode(self, x, callback=None):
         height, width = x.shape[-2], x.shape[-1]
         y_idx, y_len, y_overlap = self.split_tiles(height)
         x_idx, x_len, x_overlap = self.split_tiles(width)
 
         rows = []
+        total_tiles = len(y_idx) * len(x_idx)
+        tile_number = 0
         for i_pos, i_len in zip(y_idx, y_len):
             row = []
             for j_pos, j_len in zip(x_idx, x_len):
+                tile_number += 1
+                tile_started = time.perf_counter()
+                if callback is not None:
+                    callback(
+                        {
+                            "event": "tile_start",
+                            "tile": tile_number,
+                            "tiles": total_tiles,
+                            "row": len(rows) + 1,
+                            "rows": len(y_idx),
+                            "column": len(row) + 1,
+                            "columns": len(x_idx),
+                        }
+                    )
                 tile = x[..., i_pos:i_pos + i_len, j_pos:j_pos + j_len]
                 row.append(self._encode_moments(tile))
+                if callback is not None:
+                    callback(
+                        {
+                            "event": "tile_complete",
+                            "tile": tile_number,
+                            "tiles": total_tiles,
+                            "row": len(rows) + 1,
+                            "rows": len(y_idx),
+                            "column": len(row) + 1,
+                            "columns": len(x_idx),
+                            "elapsed_seconds": time.perf_counter() - tile_started,
+                        }
+                    )
             rows.append(row)
 
         latent_y_overlap = [o // self.vae_ratio for o in y_overlap]
@@ -584,15 +614,30 @@ class MiniMaxH3VideoVAE(nn.Module):
 
     # temporal chunking
 
-    def encode_temporal(self, x, device):
+    def encode_temporal(self, x, device, callback=None):
         # chunked input io: x may live on the CPU, clips move to the device as they encode
         z_list = []
-        for i in range(math.ceil(x.shape[2] / self.clip_length)):
-            clip_x = x[:, :, i * self.clip_length:(i + 1) * self.clip_length, :, :].to(device)
+        temporal_chunks = math.ceil(x.shape[2] / self.clip_length)
+        for i in range(temporal_chunks):
+            if callback is not None:
+                callback(
+                    {
+                        "event": "temporal_clip_start",
+                        "temporal_clip": i + 1,
+                        "temporal_clips": temporal_chunks,
+                    }
+                )
+            clip_x = x[
+                :, :, i * self.clip_length:(i + 1) * self.clip_length, :, :
+            ].to(device, non_blocking=True)
             if clip_x.shape[2] < self.clip_length:
                 pad_frames = clip_x[:, :, -1:].repeat(1, 1, self.clip_length - clip_x.shape[2], 1, 1)
                 clip_x = torch.cat([clip_x, pad_frames], dim=2)
-            z_list.append(self._adaptive_encode(self._normalize_pixels(clip_x)))
+            normalized = self._normalize_pixels(clip_x)
+            if self.tiling:
+                z_list.append(self.tiled_encode(normalized, callback=callback))
+            else:
+                z_list.append(self._encode_moments(normalized))
 
         z = torch.cat(z_list, dim=2)
         if self.token_drop > 0:
@@ -712,7 +757,7 @@ class MiniMaxH3VideoVAE(nn.Module):
         return dec
 
 
-    def encode(self, x, device=None):
+    def encode(self, x, device=None, callback=None):
         # x: [B, 3, T, H, W] in [-1, 1] -> normalized latents [B, 24, T_lat, H/16, W/16]
         if x.ndim == 4:
             x = x.unsqueeze(2)
@@ -723,7 +768,7 @@ class MiniMaxH3VideoVAE(nn.Module):
             moments = self._adaptive_encode(self._normalize_pixels(x.to(device)))
             moments = moments[:, :, -1:, :, :]
         else:
-            moments = self.encode_temporal(x, device)
+            moments = self.encode_temporal(x, device, callback=callback)
 
         mean = torch.chunk(moments.float(), 2, dim=1)[0]
 

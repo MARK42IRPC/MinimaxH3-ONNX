@@ -8,9 +8,9 @@ import os
 import sys
 from typing import Any
 import time
-from collections.abc import Callable
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as torch_functional
 
 from h3_workbench.acceleration import shifted_flow_sigmas
-from h3_workbench.device_profile import selected_device_index
+from h3_workbench.device_profile import selected_device_index, torch_cuda_architecture_supported
 from h3_workbench.fl2va_runtime_graphs import (
     fp16_attention_output_ready,
     is_attention_output_graph,
@@ -46,6 +46,9 @@ from h3_workbench.qwen_persistent import (
 from h3_workbench.vram_reservation import other_reserved_bytes
 
 _DLL_DIRECTORY_HANDLES: list[object] = []
+_TENSORRT_DLL_HANDLES: list[object] = []
+_CUDA_DLLS_PRELOADED = False
+_TENSORRT_DLLS_PRELOADED = False
 GIB = 1024**3
 HIGH_VRAM_THRESHOLD_BYTES = 12 * GIB
 
@@ -120,31 +123,66 @@ def host_prefetch_budget_bytes(reserve_bytes: int = 4 * GIB) -> int | None:
 
 
 def _preload_cuda_dlls() -> None:
+    global _CUDA_DLLS_PRELOADED
+    if _CUDA_DLLS_PRELOADED:
+        return
+
+    torch_lib: Path | None = None
+    use_torch_cuda_runtime = False
     if os.name == "nt" and hasattr(os, "add_dll_directory"):
-        cuda_root = os.environ.get("CUDA_PATH")
-        if cuda_root:
-            cuda_bin = Path(cuda_root) / "bin"
-            if cuda_bin.is_dir():
-                _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(cuda_bin)))
-        site_packages = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
-        package_bins = [
-            site_packages / "cublas" / "bin",
-            site_packages / "cuda_nvrtc" / "bin",
-            site_packages / "cudnn" / "bin",
-        ]
-        for directory in package_bins:
-            if directory.is_dir():
-                _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(directory)))
-        win_dll = getattr(ctypes, "WinDLL", None)
-        tensor_ir = site_packages / "cudnn" / "bin" / "cudnn_engines_tensor_ir64_9.dll"
-        if win_dll is not None and tensor_ir.is_file():
-            try:
-                win_dll(str(tensor_ir))
-            except OSError:
-                pass
+        torch_lib = Path(torch.__file__).resolve().parent / "lib"
+        use_torch_cuda_runtime = (
+            bool(torch.version.cuda)
+            and str(torch.version.cuda).startswith("12.")
+            and (torch_lib / "cudnn64_9.dll").is_file()
+        )
+        if use_torch_cuda_runtime and torch_lib.is_dir():
+            # PyTorch 2.10+cu126 bundles a coherent CUDA/cuDNN set. Mixing it
+            # with the separately installed nvidia-cudnn-cu12 wheel can load
+            # mismatched cuDNN engine and backend DLLs in the same process.
+            _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(torch_lib)))
+        else:
+            cuda_root = os.environ.get("CUDA_PATH")
+            if cuda_root:
+                cuda_bin = Path(cuda_root) / "bin"
+                if cuda_bin.is_dir():
+                    _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(cuda_bin)))
+            site_packages = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
+            package_bins = [
+                site_packages / "cublas" / "bin",
+                site_packages / "cuda_nvrtc" / "bin",
+                site_packages / "cudnn" / "bin",
+            ]
+            for directory in package_bins:
+                if directory.is_dir():
+                    _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(directory)))
     preload = getattr(ort, "preload_dlls", None)
     if preload is not None:
-        preload(directory="")
+        # directory=None lets ONNX Runtime select torch/lib when a CUDA
+        # PyTorch is already imported; the empty string explicitly selects
+        # the nvidia site-package wheels and is unsafe in the torch branch.
+        preload(directory=None if use_torch_cuda_runtime else "")
+    _CUDA_DLLS_PRELOADED = True
+
+
+def _preload_tensorrt_dlls() -> None:
+    global _TENSORRT_DLLS_PRELOADED
+    if _TENSORRT_DLLS_PRELOADED:
+        return
+    if os.name == "nt" and hasattr(os, "add_dll_directory"):
+        directory = Path(sys.prefix) / "Lib" / "site-packages" / "tensorrt_libs"
+        if directory.is_dir():
+            _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(directory)))
+            for name in (
+                "nvinfer_10.dll",
+                "nvinfer_plugin_10.dll",
+                "nvinfer_builder_resource_10.dll",
+                "nvonnxparser_10.dll",
+            ):
+                path = directory / name
+                if path.is_file():
+                    _TENSORRT_DLL_HANDLES.append(ctypes.WinDLL(str(path)))
+    _TENSORRT_DLLS_PRELOADED = True
 
 
 def time_shift_sigma(sigma: float, from_shift: float, to_shift: float) -> float:
@@ -181,7 +219,12 @@ def _streamed_normalize(values: np.ndarray, limit: float = 8.0) -> tuple[np.ndar
     return np.ascontiguousarray(values / scale, dtype=np.float16), scale
 
 
-def streamed_attention(packed: np.ndarray, use_cuda: bool, query_chunk_tokens: int = 256) -> np.ndarray:
+def streamed_attention(
+    packed: np.ndarray,
+    use_cuda: bool,
+    query_chunk_tokens: int = 256,
+    device_index: int | None = None,
+) -> np.ndarray:
     """Run exact full-sequence attention without materializing an N x N matrix."""
     if packed.ndim == 3 and packed.shape[1] == 56 and packed.shape[2] % 3 == 0:
         query, key, value = np.split(packed, 3, axis=2)
@@ -199,7 +242,10 @@ def streamed_attention(packed: np.ndarray, use_cuda: bool, query_chunk_tokens: i
     if width % 56:
         raise ValueError(f"Packed QKV width is not divisible by 56 heads: {width}")
     head_dim = width // 56
-    device = torch.device("cuda") if use_cuda and torch.cuda.is_available() else torch.device("cpu")
+    if use_cuda and torch.cuda.is_available():
+        device = torch.device("cuda" if device_index is None else f"cuda:{device_index}")
+    else:
+        device = torch.device("cpu")
     dtype = torch.float16 if device.type == "cuda" else torch.float32
     normalize = device.type == "cuda"
     # QKV values are only FP16-safe after the model's own normalization in the
@@ -599,17 +645,38 @@ def packed_position_ids(profile: GenerationProfile, text_tokens: int) -> np.ndar
     return np.concatenate((text, audio, video.reshape(-1, 3)), axis=0)
 
 
-def modulation_ids(profile: GenerationProfile, text_tokens: int, sigma_video: float) -> tuple[np.ndarray, np.ndarray]:
+def modulation_ids(
+    profile: GenerationProfile,
+    text_tokens: int,
+    sigma_video: float,
+    conditioned_video_indices: Sequence[int] = (),
+) -> tuple[np.ndarray, np.ndarray]:
+    conditioned = tuple(int(index) for index in conditioned_video_indices)
+    if len(set(conditioned)) != len(conditioned):
+        raise ValueError("Conditioned video indices must be unique")
+    if any(index < 0 or index >= profile.video_latent_frames for index in conditioned):
+        raise ValueError("Conditioned video index exceeds the profile latent sequence")
+
     sigma_audio = time_shift_sigma(sigma_video, 12.0, 3.0)
     time_video, time_audio = 1.0 - sigma_video, 1.0 - sigma_audio
-    unique_times = np.asarray(sorted({time_video, time_audio}), dtype=np.float32)
+    timestep_values = {time_video, time_audio}
+    if conditioned:
+        timestep_values.add(1.0)
+    unique_times = np.asarray(sorted(timestep_values), dtype=np.float32)
     video_row = int(np.argmin(np.abs(unique_times - time_video))) * 3
     audio_row = int(np.argmin(np.abs(unique_times - time_audio))) * 3
+    video_ids = np.full(profile.video_tokens, video_row, dtype=np.int64)
+    if conditioned:
+        clean_row = int(np.argmin(np.abs(unique_times - 1.0))) * 3
+        tokens_per_frame = profile.video_tokens // profile.video_latent_frames
+        for index in conditioned:
+            start = index * tokens_per_frame
+            video_ids[start : start + tokens_per_frame] = clean_row
     ids = np.concatenate(
         (
             np.full(text_tokens, video_row + 1, dtype=np.int64),
             np.full(profile.audio_tokens, audio_row + 2, dtype=np.int64),
-            np.full(profile.video_tokens, video_row, dtype=np.int64),
+            video_ids,
         )
     )
     return unique_times, ids
@@ -639,6 +706,9 @@ class ORTGraphRunner:
         self._cuda_compute_stream: Any | None = None
         self.cuda_unified_stream_enabled = False
         self.cuda_unified_stream_reason: str | None = None
+        self.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        self.enable_mem_pattern = False
+        self.cudnn_conv_use_max_workspace = False
         default_threads = 1 if self.provider == "CUDAExecutionProvider" else 0
         self.ort_cpu_threads = max(0, int(os.environ.get("H3_ORT_CPU_THREADS", default_threads)))
         default_spinning = "0" if self.provider == "CUDAExecutionProvider" else "1"
@@ -697,8 +767,8 @@ class ORTGraphRunner:
             raise ValueError("Either path or serialized_model is required")
         options = ort.SessionOptions()
         options.log_severity_level = 3
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-        options.enable_mem_pattern = False
+        options.graph_optimization_level = self.graph_optimization_level
+        options.enable_mem_pattern = self.enable_mem_pattern
         options.enable_cpu_mem_arena = True
         if self.ort_cpu_threads > 0:
             options.intra_op_num_threads = self.ort_cpu_threads
@@ -711,7 +781,7 @@ class ORTGraphRunner:
         if self.provider == "CUDAExecutionProvider":
             cuda_options = {
                 "arena_extend_strategy": "kSameAsRequested",
-                "cudnn_conv_use_max_workspace": "0",
+                "cudnn_conv_use_max_workspace": "1" if self.cudnn_conv_use_max_workspace else "0",
                 "device_id": str(self.device_index),
             }
             if self._cuda_compute_stream is not None:
@@ -1348,17 +1418,27 @@ class _FineGraphRuntime:
         torch_cuda_ready = torch.cuda.is_available()
         if sdpa_backend == "torch" and not torch_cuda_ready:
             raise ValueError("H3_SDPA_BACKEND=torch requires a CUDA-enabled PyTorch")
+        torch_architecture_ready = (
+            torch_cuda_ready
+            and torch_cuda_architecture_supported(int(getattr(runner, "device_index", 0)))
+        )
+        if sdpa_backend == "torch" and not torch_architecture_ready:
+            raise ValueError(
+                "H3_SDPA_BACKEND=torch is unavailable because the installed PyTorch build "
+                "does not contain kernels for the selected CUDA architecture; use "
+                "H3_SDPA_BACKEND=ort or install a compatible PyTorch build"
+            )
         self.torch_streamed_attention = (
             self.streaming_attention
             and runner.provider == "CUDAExecutionProvider"
-            and torch_cuda_ready
+            and torch_architecture_ready
             and sdpa_backend in {"auto", "torch"}
         )
         self.ort_streamed_attention = (
             ORTStreamingAttention(directory, runner)
             if self.streaming_attention
             and runner.provider == "CUDAExecutionProvider"
-            and (sdpa_backend == "ort" or not torch_cuda_ready)
+            and (sdpa_backend == "ort" or not torch_architecture_ready)
             else None
         )
 
@@ -1468,6 +1548,7 @@ class _FineGraphRuntime:
         text_states: np.ndarray,
         sigma_video: float,
         text_is_refined: bool = False,
+        conditioned_video_indices: Sequence[int] = (),
     ) -> tuple[np.ndarray, np.ndarray]:
         text_hidden = text_states if text_is_refined else self.prepare_text(text_states)
         self.report_activity("FL2VA", "Input embeddings")
@@ -1482,7 +1563,12 @@ class _FineGraphRuntime:
             },
         )
         hidden = np.concatenate((text_hidden, audio_hidden, video_hidden), axis=0).astype(np.float32)
-        times, mod_ids = modulation_ids(self.profile, text_hidden.shape[0], sigma_video)
+        times, mod_ids = modulation_ids(
+            self.profile,
+            text_hidden.shape[0],
+            sigma_video,
+            conditioned_video_indices,
+        )
         positions = packed_position_ids(self.profile, text_hidden.shape[0])
         self.report_activity("FL2VA", "Timestep and RoPE")
         conditioning_outputs = self.runner.run(
@@ -1549,7 +1635,12 @@ class _FineGraphRuntime:
             # caching allocator, avoiding the per-block session build and the
             # WDDM arena churn the ORT fallback graph pays on Windows.
             if self.torch_streamed_attention:
-                attended = streamed_attention(streaming_packed, True, self.attention_query_chunk)
+                attended = streamed_attention(
+                    streaming_packed,
+                    True,
+                    self.attention_query_chunk,
+                    int(getattr(self.runner, "device_index", 0)),
+                )
             elif self.ort_streamed_attention is not None:
                 attended = self.ort_streamed_attention(
                     streaming_packed,
@@ -1561,6 +1652,7 @@ class _FineGraphRuntime:
                     streaming_packed,
                     self.runner.provider == "CUDAExecutionProvider",
                     self.attention_query_chunk,
+                    int(getattr(self.runner, "device_index", 0)),
                 )
             _finite_guard(f"block {block} SDPA", attended)
 
@@ -2010,6 +2102,45 @@ def initial_latents(profile: GenerationProfile, seed: int) -> tuple[np.ndarray, 
     return video, audio
 
 
+@dataclass(frozen=True)
+class VideoLatentCondition:
+    """Clean image latents pinned to sparse video slots during denoising."""
+
+    indices: tuple[int, ...]
+    clean: np.ndarray
+
+    def __post_init__(self) -> None:
+        if not self.indices or len(set(self.indices)) != len(self.indices):
+            raise ValueError("Video latent condition indices must be non-empty and unique")
+        if any(index < 0 for index in self.indices):
+            raise ValueError("Video latent condition indices must be non-negative")
+        if self.clean.ndim != 5:
+            raise ValueError("Video latent condition clean tensor must be 5D")
+        if self.clean.shape[2] != len(self.indices):
+            raise ValueError("Video latent condition tensor length must match its indices")
+        if not np.isfinite(self.clean).all():
+            raise ValueError("Video latent condition tensor must be finite")
+
+    def _validate_target(self, target: np.ndarray) -> None:
+        if target.ndim != 5:
+            raise ValueError("Conditioned video latent must be a 5D tensor")
+        if max(self.indices) >= target.shape[2]:
+            raise ValueError("Video latent condition index exceeds the sample length")
+        expected = (target.shape[0], target.shape[1], len(self.indices), target.shape[3], target.shape[4])
+        if self.clean.shape != expected:
+            raise ValueError(f"Video latent condition shape {self.clean.shape} does not match {expected}")
+
+    def apply_clean(self, target: np.ndarray) -> None:
+        self._validate_target(target)
+        index = np.asarray(self.indices, dtype=np.intp)
+        target[:, :, index, :, :] = self.clean
+
+    def mask_velocity(self, velocity: np.ndarray) -> None:
+        self._validate_target(velocity)
+        index = np.asarray(self.indices, dtype=np.intp)
+        velocity[:, :, index, :, :] = 0.0
+
+
 # The table-driven runtime is the only exported product main-model path.
 from h3_workbench.schedule_runtime import ScheduleMainRuntime as H3MainRuntime  # noqa: E402
 
@@ -2022,19 +2153,31 @@ def sample_latents(
     steps: int = 4,
     callback: Callable[[int, int], None] | None = None,
     checkpoint_callback: Callable[[int, int, np.ndarray, np.ndarray], None] | None = None,
+    start_sigma: float = 1.0,
+    video_condition: VideoLatentCondition | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    sigmas = shifted_flow_sigmas(steps)
+    sigmas = shifted_flow_sigmas(steps, start_sigma=start_sigma)
+    if start_sigma == 0.0:
+        # A zero-noise super-resolution request is intentionally a pure H3
+        # Video VAE reconstruction. Running FL2VA here would regenerate the
+        # clip even though the caller supplied a clean conditioning latent.
+        if video_condition is not None:
+            video_condition.apply_clean(video)
+        return video, audio
     refined_text = runtime.prepare_text(text_states)
     for index, (sigma, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:], strict=True)):
+        if video_condition is not None:
+            video_condition.apply_clean(video)
         runtime.sampling_step = index + 1
         runtime.sampling_steps = steps
+        denoise_kwargs: dict[str, object] = {"text_is_refined": True}
+        if video_condition is not None:
+            denoise_kwargs["conditioned_video_indices"] = video_condition.indices
         video_velocity, audio_velocity = runtime.denoise_step(
-            video,
-            audio,
-            refined_text,
-            sigma,
-            text_is_refined=True,
+            video, audio, refined_text, sigma, **denoise_kwargs
         )
+        if video_condition is not None:
+            video_condition.mask_velocity(video_velocity)
         if not np.isfinite(video_velocity).all():
             invalid = int((~np.isfinite(video_velocity)).sum())
             raise FloatingPointError(f"Non-finite FL2VA video velocity at step {index + 1}: {invalid} invalid values")
@@ -2046,6 +2189,8 @@ def sample_latents(
             )
         video_delta = sigma_next - sigma
         video = video + video_delta * video_velocity
+        if video_condition is not None:
+            video_condition.apply_clean(video)
         if audio_velocity_finite:
             audio_sigma = time_shift_sigma(sigma, 12.0, 3.0)
             audio_sigma_next = time_shift_sigma(sigma_next, 12.0, 3.0)

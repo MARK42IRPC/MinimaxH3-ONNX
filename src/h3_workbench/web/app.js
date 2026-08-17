@@ -12,6 +12,14 @@ const state = {
   modelWorkspace: null,
   jobs: [],
   profiles: [],
+  frameImages: {
+    start: { path: null, info: null, previewUrl: null, uploading: false, error: null, fileName: null, uploadId: 0 },
+    end: { path: null, info: null, previewUrl: null, uploading: false, error: null, fileName: null, uploadId: 0 },
+  },
+  frameUploadSerial: 0,
+  superVideo: null,
+  superPromptEdited: false,
+  superUploadActive: false,
   loaded: { system: false, models: false, presets: false, jobs: false, profiles: false },
   activePage: "models",
   jobFilter: "all",
@@ -138,6 +146,13 @@ async function api(path, options = {}) {
   return response.json();
 }
 
+function fileUploadHeaders(file) {
+  return {
+    "x-filename": encodeURIComponent(file.name),
+    "Content-Type": file.type || "application/octet-stream",
+  };
+}
+
 function componentLabel(component) {
   const labels = {
     audio_vae: "Audio VAE",
@@ -177,6 +192,7 @@ function jobStatusLabel(status) {
 function jobKindLabel(job) {
   const labels = {
     inference: "推理生成",
+    super_resolution: "视频超分",
     download_export: "下载并自动切片",
     export: "本地模型切片",
     download: "模型下载",
@@ -444,6 +460,121 @@ function temporalMode() {
   return $('input[name="temporalMode"]:checked')?.value || "segmented";
 }
 
+function conditioningMode() {
+  return $('input[name="conditioningMode"]:checked')?.value || "text";
+}
+
+function activeFrameRoles(mode = conditioningMode()) {
+  if (mode === "first") return ["start"];
+  if (mode === "last") return ["end"];
+  if (mode === "first_last") return ["start", "end"];
+  return [];
+}
+
+function conditioningModeLabel(mode = conditioningMode()) {
+  return { text: "纯文本", first: "首帧", last: "尾帧", first_last: "首尾帧" }[mode] || "纯文本";
+}
+
+function renderFrameConditions() {
+  const mode = conditioningMode();
+  const active = activeFrameRoles(mode);
+  const inputs = $("#frameConditionInputs");
+  inputs.classList.toggle("hidden", active.length === 0);
+
+  for (const role of ["start", "end"]) {
+    const item = state.frameImages[role];
+    const enabled = active.includes(role);
+    const panel = $(`#${role}FramePanel`);
+    const preview = $(`#${role}FramePreview`);
+    const placeholder = $(`#${role}FramePlaceholder`);
+    const fileInput = $(`#${role}FrameFile`);
+    const clearButton = $(`#${role}FrameClear`);
+    const status = $(`#${role}FrameFileStatus`);
+    panel.classList.toggle("hidden", !enabled);
+    preview.classList.toggle("hidden", !item.previewUrl);
+    placeholder.classList.toggle("hidden", Boolean(item.previewUrl));
+    if (item.previewUrl && preview.src !== item.previewUrl) preview.src = item.previewUrl;
+    if (!item.previewUrl) preview.removeAttribute("src");
+    fileInput.disabled = item.uploading;
+    clearButton.classList.toggle("hidden", !item.previewUrl && !item.path && !item.error);
+    if (item.uploading) status.textContent = "正在上传";
+    else if (item.error) status.textContent = "上传失败";
+    else if (item.info) status.textContent = `${item.info.width} × ${item.info.height}`;
+    else status.textContent = "等待输入";
+    status.title = item.error || item.path || "";
+    placeholder.textContent = item.uploading ? "正在上传图片" : item.error ? "图片不可用" : "未选择图片";
+  }
+
+  const ready = active.every((role) => state.frameImages[role].path && !state.frameImages[role].uploading);
+  const uploading = active.some((role) => state.frameImages[role].uploading);
+  const loaded = active.filter((role) => state.frameImages[role].path).length;
+  $("#frameConditionStatus").textContent = active.length === 0
+    ? "纯文本"
+    : uploading
+      ? "上传中"
+      : ready
+        ? `${conditioningModeLabel(mode)} · 已就绪`
+        : `${loaded} / ${active.length} 张`;
+  return { mode, active, ready, uploading };
+}
+
+function clearFrameImage(role) {
+  const current = state.frameImages[role];
+  if (current.previewUrl) URL.revokeObjectURL(current.previewUrl);
+  state.frameImages[role] = {
+    path: null,
+    info: null,
+    previewUrl: null,
+    uploading: false,
+    error: null,
+    fileName: null,
+    uploadId: ++state.frameUploadSerial,
+  };
+  $(`#${role}FrameFile`).value = "";
+  renderProfiles();
+}
+
+async function uploadFrameImage(role, file) {
+  if (!file) return;
+  if (file.size > 32 * 1024 ** 2) {
+    showToast("图片不能超过 32 MiB", true);
+    return;
+  }
+  const previous = state.frameImages[role];
+  if (previous.previewUrl) URL.revokeObjectURL(previous.previewUrl);
+  const uploadId = ++state.frameUploadSerial;
+  state.frameImages[role] = {
+    path: null,
+    info: null,
+    previewUrl: URL.createObjectURL(file),
+    uploading: true,
+    error: null,
+    fileName: file.name,
+    uploadId,
+  };
+  renderProfiles();
+  try {
+    const payload = await api("/api/images/upload", {
+      method: "POST",
+      headers: fileUploadHeaders(file),
+      body: file,
+    });
+    if (state.frameImages[role].uploadId !== uploadId) return;
+    state.frameImages[role].path = payload.path;
+    state.frameImages[role].info = payload.image;
+    showToast(`${role === "start" ? "首帧" : "尾帧"}图片已上传`);
+  } catch (error) {
+    if (state.frameImages[role].uploadId !== uploadId) return;
+    state.frameImages[role].error = error.message;
+    showToast("图片上传失败：" + error.message, true);
+  } finally {
+    if (state.frameImages[role].uploadId === uploadId) {
+      state.frameImages[role].uploading = false;
+      renderProfiles();
+    }
+  }
+}
+
 function parsedTokenIds() {
   const raw = $("#tokenIdsInput").value.trim();
   if (!raw) return { values: [], valid: true };
@@ -467,6 +598,7 @@ function renderProfiles() {
   const provider = $("#inferenceProvider");
   const prompt = $("#promptInput").value.trim();
   const tokens = parsedTokenIds();
+  const frameCondition = renderFrameConditions();
   $("#promptCounter").textContent = `${$("#promptInput").value.length} / 4000`;
 
   if (!profile) {
@@ -510,7 +642,8 @@ function renderProfiles() {
   const dimensionsReady = width >= 128 && width <= 1024 && height >= 128 && height <= 1024;
   const componentsKnown = state.loaded.presets;
   const mediaReady = !componentsKnown || (videoReady === true && audioReady === true);
-  const canStart = Boolean(profile.generation_ready && mainReady && stepScheduleReady && contentReady && tokenizerReady && dimensionsReady && mediaReady);
+  const frameConditionReady = frameCondition.ready;
+  const canStart = Boolean(profile.generation_ready && mainReady && stepScheduleReady && contentReady && tokenizerReady && dimensionsReady && mediaReady && frameConditionReady);
 
   provider.className = `header-status ${profile.cuda_provider_available ? "" : "warning"}`.trim();
   provider.querySelector("span:last-child").textContent = profile.cuda_provider_available ? "CUDA 推理" : "CPU 推理（较慢）";
@@ -522,6 +655,7 @@ function renderProfiles() {
     ["Turbo v4 动态 LoRA", !accelerationRequested ? "手动关闭，使用流式基座" : !turboSteps ? "已开启，但仅支持 4–8 步" : adapterReady ? "手动开启，将动态叠加" : "已开启，但运行时适配器未就绪", stepScheduleReady ? "passed" : "failed", accelerationActive ? "启用" : stepScheduleReady ? "未启用" : "阻塞"],
     ["Video / Audio VAE", !componentsKnown ? "组件状态尚未返回" : mediaReady ? "编码与解码组件均可用" : "缺少 Video VAE 或 Audio VAE", !componentsKnown ? "warning" : mediaReady ? "passed" : "failed", !componentsKnown ? "待检查" : mediaReady ? "通过" : "阻塞"],
     ["文本输入", contentReady && tokenizerReady ? (prompt ? "Tokenizer 与提示词可用" : `${tokens.values.length} 个 Token IDs`) : !tokens.valid ? tokens.message : prompt ? "Tokenizer 文件不完整" : "请输入提示词或 Token IDs", contentReady && tokenizerReady ? "passed" : "failed", contentReady && tokenizerReady ? "通过" : "阻塞"],
+    ["帧条件", frameCondition.active.length === 0 ? "纯文本模式，不使用图片条件" : frameConditionReady ? `${conditioningModeLabel(frameCondition.mode)}条件已上传` : frameCondition.uploading ? "条件图片正在上传" : `还需 ${frameCondition.active.filter((role) => !state.frameImages[role].path).length} 张条件图片`, frameConditionReady ? "passed" : "failed", frameConditionReady ? conditioningModeLabel(frameCondition.mode) : "阻塞"],
     ["输出规格", dimensionsReady ? `${width} × ${height}，${targetFrames} 帧` : "宽高必须在 128–1024 之间", dimensionsReady ? "passed" : "failed", dimensionsReady ? "通过" : "阻塞"],
   ];
   $("#preflightList").innerHTML = checks.map((row) => preflightRow(...row)).join("");
@@ -533,6 +667,7 @@ function renderProfiles() {
     ["预计时长", `${(targetFrames / profile.fps).toFixed(2)} 秒 @ ${profile.fps} FPS`],
     ["主模型", "FL2VA 流式基座"],
     ["运行时适配", accelerationActive ? "Turbo v4 动态 LoRA" : "未启用"],
+    ["生成模式", conditioningModeLabel(frameCondition.mode)],
     ["时序", mode === "native" ? `${latentFrames} latent / 整体` : `${segments} 段 / ${segments * steps} 次去噪`],
     ["注意力", `${sequenceTokens} tokens / query ${queryChunk}`],
     ["CPU QKV 缓存", formatBytes(qkvCpuBytes)],
@@ -546,6 +681,7 @@ function renderProfiles() {
   if (accelerationRequested && turboSteps && !adapterReady) notices.push("已手动开启 Turbo v4 加速 LoRA，但适配器未就绪，请先在模型页生成适配器。");
   if (!baseReady && adapterReady) notices.push("动态 LoRA 不能独立运行，请先完成 FL2VA 流式基座。");
   if (mode === "segmented" && segments > 1) notices.push("分段模式尚未接入首帧续接，多段画面可能出现跳变。");
+  if (frameCondition.mode === "first_last" && mode === "segmented" && segments > 1) notices.push("首尾条件分别作用于第一段和最后一段；整体长序列能提供更强的双端关联。");
   if (mode === "native" && targetFrames > profile.frames) notices.push("长序列 Video VAE 会使用 GPU 时间窗口解码。");
   if (steps < 4) notices.push("当前步数使用流式基座；低步数可能导致画面语义或音频数值不稳定。");
   const warning = $("#runtimeWarning");
@@ -568,6 +704,202 @@ function updateResolutionPreset() {
     $("#heightInput").value = String(height);
   }
   renderProfiles();
+}
+
+function renderSuperResolution() {
+  const provider = $("#superResolutionProvider");
+  const info = state.superVideo;
+  const profile = state.profiles[0];
+  const prompt = $("#superPromptInput").value.trim();
+  const scale = Number($("#superScaleInput").value);
+  const steps = Number($("#superStepsInput").value);
+  const noise = Number($("#superNoiseInput").value);
+  const processingMode = document.querySelector('input[name="superProcessingMode"]:checked')?.value || "segmented";
+  $("#superNoiseValue").textContent = noise.toFixed(2);
+  $("#superPromptCounter").textContent = $("#superPromptInput").value.length + " / 4000";
+
+  if (!info) {
+    provider.className = "header-status neutral";
+    provider.querySelector("span:last-child").textContent = state.superUploadActive ? "正在上传视频" : "等待输入视频";
+    $("#superVideoProfile").innerHTML = "<div><dt>输入</dt><dd>--</dd></div>";
+    $("#superPreflightList").innerHTML = '<div class="loading-state compact">等待视频探测</div>';
+    $("#superPreflightSummary").textContent = "--";
+    $("#superGenerateButton").disabled = true;
+    $("#superSubmitSummary").textContent = "等待输入视频";
+    $("#superSubmitHint").textContent = "探测视频后显示输出计划";
+    return;
+  }
+  if (!profile) {
+    provider.className = "header-status neutral";
+    provider.querySelector("span:last-child").textContent = "正在读取模型配置";
+    $("#superGenerateButton").disabled = true;
+    $("#superSubmitSummary").textContent = "正在读取模型配置";
+    $("#superSubmitHint").textContent = "模型配置返回后显示启动预检";
+    return;
+  }
+
+  const outputWidth = Math.round(info.width * scale);
+  const outputHeight = Math.round(info.height * scale);
+  const dimensionsReady = outputWidth <= 2048 && outputHeight <= 2048 && outputWidth * outputHeight <= 4194304;
+  const turboSteps = steps >= 4 && steps <= 8;
+  const accelerationRequested = $("#superAccelerationLoraInput").checked;
+  const adapterReady = Boolean(profile && profile.acceleration_ready);
+  const baseReady = Boolean(profile && profile.main_ready);
+  const promptReady = Boolean(prompt || info.prompt);
+  const videoReady = Boolean(profile && profile.video_vae_ready) && presetProductReady("video_vae");
+  const tokenizerReady = Boolean(profile && profile.tokenizer_ready);
+  const componentsKnown = state.loaded.profiles && state.loaded.presets;
+  const contentReady = promptReady && tokenizerReady;
+  const accelerationReady = !accelerationRequested || (turboSteps && adapterReady);
+  const processingReady = processingMode !== "direct" || info.frames <= 360;
+  const canStart = Boolean(
+    componentsKnown && profile && baseReady && videoReady && contentReady && dimensionsReady && accelerationReady && processingReady,
+  );
+  const fps = finite(info.fps);
+  const duration = fps ? info.frames / fps : info.duration_seconds;
+  $("#superVideoProfile").innerHTML = [
+    ["输入", info.width + " × " + info.height + " · " + info.frames + " 帧"],
+    ["输出", outputWidth + " × " + outputHeight + " · " + info.frames + " 帧"],
+    ["帧率", (fps === null ? "--" : fps.toFixed(3)) + " FPS"],
+    ["时长", duration.toFixed(2) + " 秒"],
+    ["音频", info.has_audio ? "保留原音轨" : "无音轨"],
+    ["提示词", info.prompt ? (info.prompt_source || "metadata") : "需手动输入"],
+  ].map(([key, value]) => "<div><dt>" + escapeHtml(key) + "</dt><dd title=\"" + escapeHtml(value) + "\">" + escapeHtml(value) + "</dd></div>").join("");
+
+  provider.className = "header-status " + (profile.cuda_provider_available ? "" : "warning");
+  provider.querySelector("span:last-child").textContent = profile.cuda_provider_available ? "CUDA 推理" : "CPU 推理（较慢）";
+  const checks = [
+    ["执行后端", profile.cuda_provider_available ? "CUDAExecutionProvider 可用" : "将使用 CPUExecutionProvider", profile.cuda_provider_available ? "passed" : "warning", profile.cuda_provider_available ? "CUDA" : "CPU"],
+    ["Qwen 文本编码器", profile.qwen_ready ? "验证产物可用" : "缺少或未通过验证", profile.qwen_ready ? "passed" : "failed", profile.qwen_ready ? "通过" : "阻塞"],
+    ["FL2VA 流式基座", baseReady ? "50 Block 基座产物可用" : "缺少或未通过验证", baseReady ? "passed" : "failed", baseReady ? "通过" : "阻塞"],
+    ["Video VAE", videoReady ? "编码与解码产物可用" : "缺少或未通过验证", videoReady ? "passed" : "failed", videoReady ? "通过" : "阻塞"],
+    ["条件提示词", contentReady ? (prompt ? "使用手动提示词" : "使用视频 metadata prompt") : tokenizerReady ? "未找到 prompt" : "Tokenizer 文件不完整", contentReady ? "passed" : "failed", contentReady ? "通过" : "阻塞"],
+    ["输出规格", dimensionsReady ? outputWidth + " × " + outputHeight : "超过 2048 px 或 4 MP 限制", dimensionsReady ? "passed" : "failed", dimensionsReady ? "通过" : "阻塞"],
+    ["处理方式", processingReady ? (processingMode === "direct" ? "完整视频直接推理" : "17 帧分片推理") : "直接推理最多支持 360 帧", processingReady ? "passed" : "failed", processingReady ? "通过" : "阻塞"],
+    ["Turbo v4 LoRA", !accelerationRequested ? "手动关闭" : !turboSteps ? "仅支持 4–8 步" : adapterReady ? "手动开启，适配器可用" : "适配器未就绪", accelerationReady ? "passed" : "failed", accelerationReady && accelerationRequested ? "启用" : accelerationReady ? "关闭" : "阻塞"],
+  ];
+  $("#superPreflightList").innerHTML = checks.map((row) => preflightRow(...row)).join("");
+  $("#superPreflightSummary").textContent = checks.filter((row) => row[2] === "passed").length + " / " + checks.length + " 通过";
+
+  const segmentFrames = 17;
+  const segments = Math.ceil(info.frames / segmentFrames);
+  $("#superSubmitSummary").textContent = canStart ? outputWidth + " × " + outputHeight + " · " + info.frames + " 帧 · " + steps + " 步" : "预检尚未通过";
+  $("#superSubmitHint").textContent = canStart
+    ? (processingMode === "direct" ? "完整视频直接推理" : segments + " 段视频分片") + " · 噪声 " + noise.toFixed(2) + " · " + $("#superInterpolationInput").value
+    : "处理所有阻塞项后即可启动";
+  const warnings = [];
+  if (outputWidth > 1024 || outputHeight > 1024) warnings.push("输出超过 1024 px，RTX 3050 需要较小 Query 分块并可能显著变慢。");
+  if (outputWidth * outputHeight > 1048576) warnings.push("当前输出超过 1 MP，任务会把输入帧驻留主内存。");
+  if (processingMode === "direct") warnings.push("直接推理会把完整视频放入一个 FL2VA 时间序列，显存和注意力开销显著增加。");
+  if (!processingReady) warnings.push("直接推理最多支持 360 帧，请切换到视频分片。");
+  if (accelerationRequested && !turboSteps) warnings.push("Turbo v4 加速 LoRA 仅支持 4–8 步。");
+  if (accelerationRequested && turboSteps && !adapterReady) warnings.push("已开启 Turbo v4，但适配器尚未就绪。");
+  const warning = $("#superRuntimeWarning");
+  warning.classList.toggle("hidden", warnings.length === 0);
+  warning.textContent = warnings.join(" ");
+  $("#superGenerateButton").disabled = !canStart || state.superUploadActive;
+}
+
+async function probeSuperVideo() {
+  const path = $("#superSourcePath").value.trim();
+  if (!path) {
+    showToast("请输入工作区内的视频路径，或先选择本机视频", true);
+    return;
+  }
+  const button = $("#superProbeButton");
+  button.disabled = true;
+  try {
+    const info = await api("/api/media/probe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    state.superVideo = info;
+    if (!state.superPromptEdited && !$("#superPromptInput").value.trim() && info.prompt) {
+      $("#superPromptInput").value = info.prompt;
+    }
+    $("#superPromptSource").textContent = info.prompt ? "来源：" + (info.prompt_source || "metadata") : "未找到 metadata prompt";
+    $("#superVideoNotice").classList.add("hidden");
+    renderSuperResolution();
+  } catch (error) {
+    state.superVideo = null;
+    const notice = $("#superVideoNotice");
+    notice.classList.remove("hidden");
+    notice.textContent = error.message;
+    renderSuperResolution();
+    showToast("视频探测失败：" + error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function uploadSuperVideo(file) {
+  if (!file) return;
+  state.superUploadActive = true;
+  renderSuperResolution();
+  try {
+    const payload = await api("/api/media/upload", {
+      method: "POST",
+      headers: fileUploadHeaders(file),
+      body: file,
+    });
+    $("#superSourcePath").value = payload.path;
+    state.superVideo = payload.video;
+    if (!state.superPromptEdited && !$("#superPromptInput").value.trim() && payload.video.prompt) {
+      $("#superPromptInput").value = payload.video.prompt;
+    }
+    $("#superPromptSource").textContent = payload.video.prompt ? "来源：" + (payload.video.prompt_source || "metadata") : "未找到 metadata prompt";
+    showToast("视频已上传并完成元数据探测");
+  } catch (error) {
+    showToast("视频上传失败：" + error.message, true);
+  } finally {
+    state.superUploadActive = false;
+    renderSuperResolution();
+  }
+}
+
+async function startSuperResolution(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!form.reportValidity()) return;
+  if (!state.superVideo) {
+    showToast("请先探测输入视频", true);
+    return;
+  }
+  const prompt = $("#superPromptInput").value.trim();
+  if (!prompt && !state.superVideo.prompt) {
+    showToast("视频没有 metadata prompt，请手动输入提示词", true);
+    return;
+  }
+  const button = $("#superGenerateButton");
+  button.disabled = true;
+  try {
+    const job = await api("/api/jobs/super-resolution", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source_path: $("#superSourcePath").value.trim(),
+        prompt: prompt || null,
+        scale: Number($("#superScaleInput").value),
+        interpolation: $("#superInterpolationInput").value,
+        noise_strength: Number($("#superNoiseInput").value),
+        processing_mode: document.querySelector('input[name="superProcessingMode"]:checked')?.value || "segmented",
+        steps: Number($("#superStepsInput").value),
+        use_acceleration_lora: $("#superAccelerationLoraInput").checked,
+        seed: Number($("#superSeedInput").value),
+        attention_query_chunk: Number($("#superQueryChunkSelect").value),
+        l1_prefetch_shards: Number($("#superL1PrefetchSelect").value),
+      }),
+    });
+    state.selectedJobId = job.id;
+    showToast("超分任务已加入队列");
+    await loadJobs();
+    switchPage("tasks");
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    renderSuperResolution();
+  }
 }
 
 function activitySummary(job) {
@@ -692,7 +1024,7 @@ function activityItems(job) {
 }
 
 function artifactLinks(job) {
-  if (job.kind !== "inference") return "";
+  if (!["inference", "super_resolution"].includes(job.kind)) return "";
   const links = [];
   if (job.status === "completed") links.push(`<a class="link-button" href="/api/jobs/${encodeURIComponent(job.id)}/output">↓ 下载 MP4</a>`);
   if (job.result?.metadata) links.push(`<a class="link-button" href="/api/jobs/${encodeURIComponent(job.id)}/metadata">{} 元数据</a>`);
@@ -1066,6 +1398,7 @@ async function refreshAll({ quiet = false } = {}) {
     renderSystem();
     renderModelPage();
     renderProfiles();
+    renderSuperResolution();
     renderJobs();
     setConnection(failures.length === 0, failures.length ? `${failures.length} 个接口不可用` : "服务正常");
     if (failures.length && !quiet) showToast(`部分数据刷新失败：${failures[0]}`, true);
@@ -1123,12 +1456,17 @@ async function startInference(event) {
   if (!form.reportValidity()) return;
   const prompt = $("#promptInput").value.trim();
   const tokens = parsedTokenIds();
+  const frameCondition = renderFrameConditions();
   if (!tokens.valid) {
     showToast(tokens.message, true);
     return;
   }
   if (!prompt && tokens.values.length === 0) {
     showToast("请输入提示词或 Token IDs", true);
+    return;
+  }
+  if (!frameCondition.ready) {
+    showToast("请先上传当前模式需要的条件图片", true);
     return;
   }
   const button = $("#generateButton");
@@ -1147,6 +1485,9 @@ async function startInference(event) {
         height: Number($("#heightInput").value),
         duration_seconds: Number($("#durationInput").value),
         temporal_mode: temporalMode(),
+        conditioning_mode: frameCondition.mode,
+        start_image_path: frameCondition.active.includes("start") ? state.frameImages.start.path : null,
+        end_image_path: frameCondition.active.includes("end") ? state.frameImages.end.path : null,
         attention_query_chunk: Number($("#queryChunkSelect").value),
         l1_prefetch_shards: Number($("#l1PrefetchSelect").value),
       }),
@@ -1168,7 +1509,7 @@ function closeSidebar() {
 }
 
 function switchPage(page) {
-  if (!["models", "inference", "tasks"].includes(page)) page = "models";
+  if (!["models", "inference", "super-resolution", "tasks"].includes(page)) page = "models";
   state.activePage = page;
   $$(".nav-item").forEach((item) => {
     const active = item.dataset.page === page;
@@ -1202,6 +1543,26 @@ function bindEvents() {
   $("#checkModelsButton").addEventListener("click", () => refreshAll());
   $("#refreshTasksButton").addEventListener("click", () => loadJobs({ announceErrors: true }));
   $("#inferenceForm").addEventListener("submit", startInference);
+  $$("input[name=\"conditioningMode\"]").forEach((input) => input.addEventListener("change", renderProfiles));
+  $("#startFrameFile").addEventListener("change", (event) => uploadFrameImage("start", event.target.files[0]));
+  $("#endFrameFile").addEventListener("change", (event) => uploadFrameImage("end", event.target.files[0]));
+  $("#startFrameClear").addEventListener("click", () => clearFrameImage("start"));
+  $("#endFrameClear").addEventListener("click", () => clearFrameImage("end"));
+  $("#superResolutionForm").addEventListener("submit", startSuperResolution);
+  $("#superProbeButton").addEventListener("click", probeSuperVideo);
+  $("#superSourcePath").addEventListener("change", () => {
+    state.superVideo = null;
+    renderSuperResolution();
+  });
+  $("#superVideoFile").addEventListener("change", (event) => uploadSuperVideo(event.target.files[0]));
+  $("#superPromptInput").addEventListener("input", () => {
+    state.superPromptEdited = true;
+    renderSuperResolution();
+  });
+  ["#superScaleInput", "#superInterpolationInput", "#superStepsInput", "#superNoiseInput", "#superSeedInput", "#superQueryChunkSelect", "#superL1PrefetchSelect"]
+    .forEach((selector) => $(selector).addEventListener("input", renderSuperResolution));
+  $("#superAccelerationLoraInput").addEventListener("change", renderSuperResolution);
+  $$('input[name="superProcessingMode"]').forEach((input) => input.addEventListener("change", renderSuperResolution));
   $("#resolutionPreset").addEventListener("change", updateResolutionPreset);
   ["#promptInput", "#tokenIdsInput", "#durationInput", "#stepsInput", "#seedInput", "#queryChunkSelect", "#l1PrefetchSelect"]
     .forEach((selector) => $(selector).addEventListener("input", renderProfiles));
@@ -1226,14 +1587,19 @@ function bindEvents() {
   $$("[data-job-filter]").forEach((button) => button.addEventListener("click", () => setJobFilter(button.dataset.jobFilter)));
   window.addEventListener("resize", scheduleCharts, { passive: true });
   window.addEventListener("hashchange", () => switchPage(window.location.hash.slice(1)));
-  window.addEventListener("beforeunload", () => telemetryEventSource?.close());
+  window.addEventListener("beforeunload", () => {
+    telemetryEventSource?.close();
+    for (const item of Object.values(state.frameImages)) {
+      if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+    }
+  });
 }
 
 async function initialize() {
   bindEvents();
   updateResolutionPreset();
   const initialPage = window.location.hash.slice(1);
-  switchPage(["models", "inference", "tasks"].includes(initialPage) ? initialPage : "models");
+  switchPage(["models", "inference", "super-resolution", "tasks"].includes(initialPage) ? initialPage : "models");
   await refreshAll({ quiet: true });
   connectTelemetryStream();
   pollTelemetry();

@@ -405,6 +405,66 @@ def test_cuda_runtime_rejects_unavailable_requested_torch_sdpa(
         ScheduleMainRuntime(tmp_path, Runner())
 
 
+def test_auto_sdpa_falls_back_when_torch_lacks_selected_architecture(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    (tmp_path / "schedule.json").write_text(json.dumps(_schedule()), encoding="utf-8")
+    monkeypatch.setattr(
+        "h3_workbench.schedule_runtime.validate_runtime_schedule",
+        lambda schedule, directory: None,
+    )
+    monkeypatch.setenv("H3_PERSISTENT_WEIGHTS", "0")
+    monkeypatch.setenv("H3_SDPA_BACKEND", "auto")
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("h3_workbench.schedule_runtime.torch_cuda_architecture_supported", lambda index: False)
+
+    class StreamingAttention:
+        def __init__(self, directory, runner) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        "h3_workbench.inference_runtime.ORTStreamingAttention",
+        StreamingAttention,
+    )
+
+    class Runner(_Runner):
+        provider = "CUDAExecutionProvider"
+        device_index = 0
+        low_vram_mode = False
+
+    runtime = ScheduleMainRuntime(tmp_path, Runner())
+
+    assert runtime.metrics()["sdpa_backend"] == "ort"
+    assert "torch build lacks" in runtime.metrics()["sdpa_fallback_reason"]
+    runtime.close()
+
+
+def test_explicit_torch_sdpa_rejects_unsupported_architecture(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    (tmp_path / "schedule.json").write_text(json.dumps(_schedule()), encoding="utf-8")
+    monkeypatch.setattr(
+        "h3_workbench.schedule_runtime.validate_runtime_schedule",
+        lambda schedule, directory: None,
+    )
+    monkeypatch.setenv("H3_PERSISTENT_WEIGHTS", "0")
+    monkeypatch.setenv("H3_SDPA_BACKEND", "torch")
+    monkeypatch.setattr("torch.cuda.is_available", lambda: True)
+    monkeypatch.setattr("h3_workbench.schedule_runtime.torch_cuda_architecture_supported", lambda index: False)
+
+    class Runner(_Runner):
+        provider = "CUDAExecutionProvider"
+        device_index = 0
+
+    with pytest.raises(ValueError, match="does not contain kernels"):
+        ScheduleMainRuntime(tmp_path, Runner())
+
+
 def test_runtime_rejects_invalid_sdpa_backend(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("H3_SDPA_BACKEND", "invalid")
 
@@ -589,12 +649,18 @@ def test_dynamic_adapter_builds_silu_and_head_embeddings(monkeypatch) -> None:
     runtime.profile = object()
     runtime._turbo_adapter = Adapter()
     runtime._validate_graph_outputs = False
-    monkeypatch.setattr(
-        "h3_workbench.inference_runtime.modulation_ids",
-        lambda profile, text_count, sigma: (
+    conditioned_calls: list[tuple[int, ...]] = []
+
+    def fake_modulation_ids(profile, text_count, sigma, conditioned_video_indices=()):
+        conditioned_calls.append(tuple(conditioned_video_indices))
+        return (
             np.asarray([0.25, 0.75], dtype=np.float32),
             np.asarray([0, 1], dtype=np.int64),
-        ),
+        )
+
+    monkeypatch.setattr(
+        "h3_workbench.inference_runtime.modulation_ids",
+        fake_modulation_ids,
     )
     monkeypatch.setattr(
         "h3_workbench.inference_runtime.patchify_video",
@@ -640,10 +706,12 @@ def test_dynamic_adapter_builds_silu_and_head_embeddings(monkeypatch) -> None:
             "video": np.zeros((1,), dtype=np.float32),
             "audio": np.zeros((1,), dtype=np.float32),
             "sigma": 0.5,
+            "conditioned_video_indices": (0, 4),
         },
         constants,
         {},
     )
+    assert conditioned_calls == [(0, 4)]
 
     assert len(calls) == 1
     assert constants["silu_timestep_embedding"].shape == (2, 2688)

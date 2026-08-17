@@ -1,14 +1,18 @@
+import json
+import time
+from pathlib import Path
+
 import numpy as np
 import onnx
 import onnxruntime as ort
 import pytest
 import torch
-import time
-from pathlib import Path
 from onnx import TensorProto, helper
 
 from h3_workbench.inference_runtime import (
     ORTGraphRunner,
+    VideoLatentCondition,
+    _preload_cuda_dlls,
     _ensure_device_streamed_sdpa_graph,
     _ensure_streamed_sdpa_graph,
     host_prefetch_budget_bytes,
@@ -25,15 +29,24 @@ from h3_workbench.inference_runtime import (
     unpatchify_video,
 )
 from h3_workbench.media_output import (
+    ONNXVideoVAEEncoder,
     _assemble_video_vae_tiles,
     _pad_video_latents_to_tile,
     _release_io_binding,
     _split_tiles,
+    _video_vae_encoder_overlap,
     _video_vae_temporal_windows,
     decode_video_latents_onnx,
+    select_video_vae_encoder_backend,
+    video_vae_temporal_encoder_ready,
 )
 from h3_workbench.media_output import decode_audio_latents_onnx
-from h3_workbench.profiles import PROFILE_360P_17F, video_latent_frames_for_output, video_vae_output_frames
+from h3_workbench.profiles import (
+    PROFILE_360P_17F,
+    video_latent_frames_for_output,
+    video_latent_index_for_output_frame,
+    video_vae_output_frames,
+)
 from h3_workbench.shard_cache import ShardPrefetchCache
 from h3_workbench.vendor.video_vae import MiniMaxH3VideoVAE
 from h3_workbench.torch_compat import apply_rope_split_half
@@ -121,6 +134,16 @@ def test_requested_frames_snap_to_native_h3_temporal_grid() -> None:
     assert video_vae_output_frames(107) == 362
 
 
+def test_requested_end_frame_maps_to_retained_h3_latent_token() -> None:
+    assert video_latent_index_for_output_frame(1, 7) == 0
+    assert video_latent_index_for_output_frame(5, 7) == 1
+    assert video_latent_index_for_output_frame(17, 7) == 4
+    assert video_latent_index_for_output_frame(18, 7) == 5
+    assert video_latent_index_for_output_frame(22, 7) == 6
+    with pytest.raises(ValueError, match="exceed"):
+        video_latent_index_for_output_frame(23, 7)
+
+
 def test_dynamic_resolution_profile_and_video_tiles() -> None:
     profile = PROFILE_360P_17F.resized(512, 300)
 
@@ -129,6 +152,97 @@ def test_dynamic_resolution_profile_and_video_tiles() -> None:
     assert profile.video_latent_height == 20
     assert _split_tiles(384) == ([0, 128], [256, 256], [128])
     assert _split_tiles(640) == ([0, 192, 384], [256, 256, 256], [64, 64])
+
+
+def test_low_vram_video_encoder_uses_six_spatial_tiles(monkeypatch) -> None:
+    monkeypatch.delenv("H3_VAE_ENCODER_OVERLAP", raising=False)
+    overlap = _video_vae_encoder_overlap(True, 4 * 1024**3)
+    with torch.device("meta"):
+        model = MiniMaxH3VideoVAE(
+            tiling=True,
+            tile_size=384,
+            tile_overlap_min=overlap,
+        )
+
+    y_tiles = model.split_tiles(736)[0]
+    x_tiles = model.split_tiles(960)[0]
+
+    assert overlap == 32
+    assert len(y_tiles) == 2
+    assert len(x_tiles) == 3
+
+
+def test_high_vram_video_encoder_keeps_reference_overlap(monkeypatch) -> None:
+    monkeypatch.delenv("H3_VAE_ENCODER_OVERLAP", raising=False)
+
+    assert _video_vae_encoder_overlap(True, 12 * 1024**3) == 64
+    assert _video_vae_encoder_overlap(False, 0) == 64
+
+
+def test_low_vram_auto_encoder_requires_staged_onnx_path() -> None:
+    backend, reason = select_video_vae_encoder_backend(
+        checkpoint_available=True,
+        onnx_available=True,
+        low_vram_cuda=True,
+        setting="auto",
+    )
+
+    assert backend == "onnxruntime"
+    assert "staged" in reason
+
+
+def test_auto_encoder_does_not_fall_back_to_pytorch() -> None:
+    with pytest.raises(RuntimeError, match="staged ONNX"):
+        select_video_vae_encoder_backend(
+            checkpoint_available=True,
+            onnx_available=False,
+            low_vram_cuda=True,
+            setting="auto",
+        )
+
+
+def test_encoder_backend_override_checks_availability() -> None:
+    assert select_video_vae_encoder_backend(
+        checkpoint_available=True,
+        onnx_available=True,
+        low_vram_cuda=True,
+        setting="onnx",
+    )[0] == "onnxruntime"
+    with pytest.raises(ValueError, match="disabled"):
+        select_video_vae_encoder_backend(
+            checkpoint_available=True,
+            onnx_available=True,
+            low_vram_cuda=True,
+            setting="pytorch",
+        )
+
+
+def test_staged_video_encoder_ready_requires_complete_graph_set(tmp_path: Path) -> None:
+    graphs = {
+        "prelude": "video_encoder_prelude.onnx",
+        "late": "video_encoder_late.onnx",
+        "tail": "video_encoder_tail.onnx",
+        "head": "video_encoder_head.onnx",
+    }
+    manifest = {
+        "temporal_encoder": {
+            "layout": "progressive_staged_cuda_v1",
+            "graphs": graphs,
+            "clip_frames": 17,
+            "token_drop": 3,
+            "spatial_ratio": 16,
+            "temporal_tokens": 5,
+            "channels": {"prelude": 128, "late": 256, "tail": 1024, "moments": 48},
+            "validation_passed": True,
+        }
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    for graph in graphs.values():
+        (tmp_path / graph).write_bytes(b"fixture")
+
+    assert video_vae_temporal_encoder_ready(tmp_path)
+    (tmp_path / graphs["late"]).unlink()
+    assert not video_vae_temporal_encoder_ready(tmp_path)
 
 
 def test_fl2va_chunk_sizes_follow_available_vram() -> None:
@@ -163,6 +277,28 @@ def test_host_prefetch_budget_reports_zero_below_reserve(monkeypatch) -> None:
     )
 
     assert host_prefetch_budget_bytes() == 0
+
+
+def test_cuda_preload_uses_the_torch_runtime_when_available(monkeypatch, tmp_path: Path) -> None:
+    import h3_workbench.inference_runtime as runtime
+
+    torch_root = tmp_path / "torch"
+    torch_lib = torch_root / "lib"
+    torch_lib.mkdir(parents=True)
+    (torch_lib / "cudnn64_9.dll").write_bytes(b"fixture")
+    monkeypatch.setattr(runtime.torch, "__file__", str(torch_root / "__init__.py"))
+    monkeypatch.setattr(runtime.torch.version, "cuda", "12.6")
+    monkeypatch.setattr(runtime.os, "name", "nt")
+    monkeypatch.setattr(runtime.os, "add_dll_directory", lambda path: path)
+    monkeypatch.setattr(runtime, "_DLL_DIRECTORY_HANDLES", [])
+    monkeypatch.setattr(runtime, "_CUDA_DLLS_PRELOADED", False)
+    preload_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(runtime.ort, "preload_dlls", lambda **kwargs: preload_calls.append(kwargs))
+
+    _preload_cuda_dlls()
+
+    assert runtime._DLL_DIRECTORY_HANDLES == [str(torch_lib)]
+    assert preload_calls == [{"directory": None}]
 
 
 def test_cuda_runner_defaults_to_non_spinning_single_cpu_thread(monkeypatch) -> None:
@@ -258,6 +394,41 @@ def test_modulation_rows_cover_packed_sequence() -> None:
     assert times.shape == (2,)
     assert ids.shape == (profile.sequence_tokens,)
     assert time_shift_sigma(0.5, 12.0, 3.0) < 0.5
+
+
+def test_modulation_rows_mark_conditioned_video_frames_clean() -> None:
+    profile = PROFILE_360P_17F
+    times, ids = modulation_ids(profile, 192, 0.5, (0, 6))
+    assert times.shape == (3,)
+    assert times[-1] == pytest.approx(1.0)
+
+    video_start = 192 + profile.audio_tokens
+    video_ids = ids[video_start:]
+    tokens_per_frame = profile.video_tokens // profile.video_latent_frames
+    clean_row = int(np.argmin(np.abs(times - 1.0))) * 3
+    current_row = int(np.argmin(np.abs(times - 0.5))) * 3
+    assert np.all(video_ids[:tokens_per_frame] == clean_row)
+    assert np.all(video_ids[-tokens_per_frame:] == clean_row)
+    assert np.all(video_ids[tokens_per_frame : 2 * tokens_per_frame] == current_row)
+
+
+def test_staged_image_encoder_uses_only_causal_token_zero() -> None:
+    encoder = ONNXVideoVAEEncoder.__new__(ONNXVideoVAEEncoder)
+    encoder.clip_length = 17
+    seen: list[np.ndarray] = []
+
+    def fake_encode(pixels, _callback=None):
+        seen.append(pixels.copy())
+        return np.arange(3, dtype=np.float32).reshape(1, 1, 3, 1, 1)
+
+    encoder.encode = fake_encode
+    image = np.ones((1, 3, 1, 4, 6), dtype=np.float16)
+    latent = encoder.encode_image(image)
+
+    assert seen[0].shape == (1, 3, 17, 4, 6)
+    np.testing.assert_array_equal(seen[0][:, :, 0], seen[0][:, :, -1])
+    assert latent.shape == (1, 1, 1, 1, 1)
+    assert latent.item() == 0.0
 
 
 def test_streamed_attention_matches_full_attention_on_cpu() -> None:
@@ -392,6 +563,108 @@ def test_sample_latents_emits_step_checkpoints() -> None:
 
     assert [(current, total) for current, total, _, _ in checkpoints] == [(1, 2), (2, 2)]
     assert not np.array_equal(checkpoints[0][2], checkpoints[1][2])
+
+
+def test_sample_latents_passes_conditioning_sigma_to_denoiser() -> None:
+    class Runtime:
+        audio_fallback_reason = None
+        sampling_step = 0
+        sampling_steps = 0
+        seen_sigmas = []
+
+        @staticmethod
+        def prepare_text(text_states):
+            return text_states
+
+        def denoise_step(self, video, audio, text_states, sigma, text_is_refined=False):
+            self.seen_sigmas.append(sigma)
+            return np.zeros_like(video), np.zeros_like(audio)
+
+    runtime = Runtime()
+    sample_latents(
+        runtime,
+        np.ones((1, 1), dtype=np.float32),
+        np.ones((1, 1), dtype=np.float32),
+        np.ones((1, 1), dtype=np.float32),
+        steps=1,
+        start_sigma=0.35,
+    )
+
+    assert runtime.seen_sigmas == [0.35]
+
+
+def test_sample_latents_keeps_sparse_anchor_clean_and_masks_its_update() -> None:
+    class Runtime:
+        audio_fallback_reason = None
+        sampling_step = 0
+        sampling_steps = 0
+        seen: list[tuple[float, np.ndarray, tuple[int, ...]]] = []
+
+        @staticmethod
+        def prepare_text(text_states):
+            return text_states
+
+        def denoise_step(
+            self,
+            video,
+            audio,
+            text_states,
+            sigma,
+            text_is_refined=False,
+            conditioned_video_indices=(),
+        ):
+            self.seen.append((sigma, video.copy(), conditioned_video_indices))
+            return np.ones_like(video), np.zeros_like(audio)
+
+    video = np.asarray([1.0, 2.0, 3.0], dtype=np.float32).reshape(1, 1, 3, 1, 1)
+    condition = VideoLatentCondition(
+        indices=(1,),
+        clean=np.asarray([10.0], dtype=np.float32).reshape(1, 1, 1, 1, 1),
+    )
+    runtime = Runtime()
+
+    sampled, _ = sample_latents(
+        runtime,
+        video,
+        np.zeros((1, 1), dtype=np.float32),
+        np.ones((1, 1), dtype=np.float32),
+        steps=2,
+        video_condition=condition,
+    )
+
+    for _sigma, seen, conditioned_indices in runtime.seen:
+        assert seen[0, 0, 1, 0, 0] == pytest.approx(10.0)
+        assert conditioned_indices == (1,)
+    assert sampled[0, 0, 1, 0, 0] == pytest.approx(10.0)
+    assert sampled[0, 0, 0, 0, 0] == pytest.approx(0.0)
+    assert sampled[0, 0, 2, 0, 0] == pytest.approx(2.0)
+
+
+def test_sample_latents_zero_sigma_is_a_pure_reconstruction() -> None:
+    class Runtime:
+        audio_fallback_reason = None
+
+        @staticmethod
+        def prepare_text(_text_states):
+            raise AssertionError("pure VAE reconstruction must not prepare FL2VA text")
+
+        @staticmethod
+        def denoise_step(*_args, **_kwargs):
+            raise AssertionError("pure VAE reconstruction must not sample FL2VA")
+
+    video = np.ones((1, 1), dtype=np.float32)
+    audio = np.ones((1, 1), dtype=np.float32)
+    sampled_video, sampled_audio = sample_latents(
+        Runtime(),
+        video,
+        audio,
+        np.ones((1, 1), dtype=np.float32),
+        steps=4,
+        start_sigma=0.0,
+    )
+
+    assert sampled_video is video
+    assert sampled_audio is audio
 
 
 def test_session_batch_does_not_retry_a_consumer_error(tmp_path) -> None:

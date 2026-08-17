@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import platform
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Literal
+from urllib.parse import unquote_to_bytes
 
 import onnxruntime as ort
 import psutil
@@ -21,6 +23,13 @@ from h3_workbench.config import Settings
 from h3_workbench.device_profile import probe_device_profiles, select_device_profile
 from h3_workbench.jobs import JobManager, resolve_main_model_directory
 from h3_workbench.memory_planner import main_model_shards, plan_shard_batches, probe_gpu_memory
+from h3_workbench.media_input import (
+    IMAGE_SUFFIXES,
+    VIDEO_SUFFIXES,
+    probe_image,
+    probe_video,
+    resolve_video_path,
+)
 from h3_workbench.model_registry import scan_models
 from h3_workbench.performance_monitor import LivePerformanceMonitor
 from h3_workbench.profiles import GENERATION_PROFILES
@@ -117,15 +126,60 @@ class InferenceRequest(BaseModel):
     height: int = Field(default=360, ge=128, le=1024)
     duration_seconds: float = Field(default=17 / 24, gt=0, le=15)
     temporal_mode: Literal["native", "segmented"] = "segmented"
+    conditioning_mode: Literal["text", "first", "last", "first_last"] = "text"
+    start_image_path: str | None = Field(default=None, max_length=2048)
+    end_image_path: str | None = Field(default=None, max_length=2048)
     attention_query_chunk: int = Field(default=512, ge=32, le=512)
     l1_prefetch_shards: int = Field(default=2, ge=0, le=4)
 
     @model_validator(mode="after")
     def require_prompt_or_tokens(self) -> "InferenceRequest":
+        self.start_image_path = self.start_image_path.strip() if self.start_image_path else None
+        self.end_image_path = self.end_image_path.strip() if self.end_image_path else None
         if not self.prompt and not self.token_ids:
             raise ValueError("Provide either prompt or token_ids")
         if self.token_ids is not None and len(self.token_ids) > 192:
             raise ValueError("token_ids must contain at most 192 items")
+        if self.prompt is not None and len(self.prompt) > 4000:
+            raise ValueError("prompt must contain at most 4000 characters")
+        if self.use_acceleration_lora and not 4 <= self.steps <= 8:
+            raise ValueError("Turbo v4 acceleration LoRA supports 4-8 sampling steps")
+        if self.attention_query_chunk not in {32, 64, 128, 256, 512}:
+            raise ValueError("attention_query_chunk must be one of 32, 64, 128, 256, or 512")
+        expected = {
+            "text": (False, False),
+            "first": (True, False),
+            "last": (False, True),
+            "first_last": (True, True),
+        }[self.conditioning_mode]
+        actual = (self.start_image_path is not None, self.end_image_path is not None)
+        if actual != expected:
+            raise ValueError(
+                f"conditioning_mode={self.conditioning_mode!r} requires "
+                f"start_image_path={expected[0]} and end_image_path={expected[1]}"
+            )
+        return self
+
+
+class VideoProbeRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=2048)
+
+
+class SuperResolutionRequest(BaseModel):
+    source_path: str = Field(min_length=1, max_length=2048)
+    prompt: str | None = Field(default=None, max_length=4000)
+    scale: float = Field(default=2.0, ge=1.0, le=4.0)
+    interpolation: Literal["nearest", "bilinear", "bicubic", "trilinear"] = "bicubic"
+    noise_strength: float = Field(default=0.35, ge=0.0, le=1.0)
+    processing_mode: Literal["segmented", "direct"] = "segmented"
+    steps: int = Field(default=4, ge=1, le=50)
+    use_acceleration_lora: bool = False
+    seed: int = 1
+    attention_query_chunk: int = Field(default=512, ge=32, le=512)
+    l1_prefetch_shards: int = Field(default=2, ge=0, le=4)
+
+    @model_validator(mode="after")
+    def validate_runtime_options(self) -> "SuperResolutionRequest":
         if self.prompt is not None and len(self.prompt) > 4000:
             raise ValueError("prompt must contain at most 4000 characters")
         if self.use_acceleration_lora and not 4 <= self.steps <= 8:
@@ -247,6 +301,95 @@ async def hardware_websocket(websocket: WebSocket) -> None:
 @app.get("/api/models")
 def models() -> list[dict[str, object]]:
     return [record.to_dict() for record in scan_models(settings.workspace)]
+
+
+@app.post("/api/media/probe")
+def probe_media(request: VideoProbeRequest) -> dict[str, object]:
+    try:
+        path = resolve_video_path(settings.workspace, request.path)
+        return probe_video(path).to_dict()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _decode_upload_filename(request: Request, allowed_suffixes: set[str], media_kind: str) -> str:
+    encoded = request.headers.get("x-filename", "")
+    try:
+        decoded = unquote_to_bytes(encoded).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="x-filename must be URI-encoded UTF-8") from exc
+    filename = Path(decoded).name
+    if not filename or Path(filename).suffix.lower() not in allowed_suffixes:
+        raise HTTPException(status_code=400, detail=f"x-filename must be a supported {media_kind} filename")
+    return filename
+
+
+@app.post("/api/media/upload", status_code=201)
+async def upload_media(request: Request) -> dict[str, object]:
+    filename = _decode_upload_filename(request, VIDEO_SUFFIXES, "video")
+    max_upload_bytes = 1024**3
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > max_upload_bytes:
+                raise HTTPException(status_code=413, detail="Uploaded video exceeds the 1 GiB limit")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length") from exc
+    input_root = (settings.workspace / ".h3-workbench" / "inputs").resolve()
+    input_root.mkdir(parents=True, exist_ok=True)
+    destination = (input_root / f"{uuid.uuid4().hex[:12]}-{filename}").resolve()
+    if input_root not in destination.parents:
+        raise HTTPException(status_code=400, detail="Invalid upload filename")
+    written = 0
+    try:
+        with destination.open("wb") as output:
+            async for chunk in request.stream():
+                written += len(chunk)
+                if written > max_upload_bytes:
+                    raise HTTPException(status_code=413, detail="Uploaded video exceeds the 1 GiB limit")
+                output.write(chunk)
+        info = probe_video(destination)
+        return {"path": str(destination), "size_bytes": written, "video": info.to_dict()}
+    except HTTPException:
+        destination.unlink(missing_ok=True)
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/images/upload", status_code=201)
+async def upload_image(request: Request) -> dict[str, object]:
+    filename = _decode_upload_filename(request, IMAGE_SUFFIXES, "image")
+    max_upload_bytes = 32 * 1024**2
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > max_upload_bytes:
+                raise HTTPException(status_code=413, detail="Uploaded image exceeds the 32 MiB limit")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length") from exc
+    input_root = (settings.workspace / ".h3-workbench" / "inputs").resolve()
+    input_root.mkdir(parents=True, exist_ok=True)
+    destination = (input_root / f"{uuid.uuid4().hex[:12]}-{filename}").resolve()
+    if input_root not in destination.parents:
+        raise HTTPException(status_code=400, detail="Invalid upload filename")
+    written = 0
+    try:
+        with destination.open("wb") as output:
+            async for chunk in request.stream():
+                written += len(chunk)
+                if written > max_upload_bytes:
+                    raise HTTPException(status_code=413, detail="Uploaded image exceeds the 32 MiB limit")
+                output.write(chunk)
+        info = probe_image(destination)
+        return {"path": str(destination), "size_bytes": written, "image": info.to_dict()}
+    except HTTPException:
+        destination.unlink(missing_ok=True)
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _source_asset_status(asset: SourceAsset) -> dict[str, object]:
@@ -440,6 +583,29 @@ def create_inference(request: InferenceRequest) -> dict[str, object]:
             request.height,
             request.duration_seconds,
             request.temporal_mode,
+            request.attention_query_chunk,
+            request.l1_prefetch_shards,
+            use_acceleration_lora=request.use_acceleration_lora,
+            conditioning_mode=request.conditioning_mode,
+            start_image_path=request.start_image_path,
+            end_image_path=request.end_image_path,
+        ).to_dict()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/jobs/super-resolution", status_code=202)
+def create_super_resolution(request: SuperResolutionRequest) -> dict[str, object]:
+    try:
+        return manager.create_super_resolution(
+            request.source_path,
+            request.prompt,
+            request.scale,
+            request.interpolation,
+            request.noise_strength,
+            request.processing_mode,
+            request.steps,
+            request.seed,
             request.attention_query_chunk,
             request.l1_prefetch_shards,
             use_acceleration_lora=request.use_acceleration_lora,

@@ -44,6 +44,24 @@ def video_latent_frames_for_output(output_frames: int) -> int:
     return chunks * 5 + 2
 
 
+def video_latent_index_for_output_frame(output_frames: int, latent_frames: int) -> int:
+    """Map the last requested output frame to its H3 temporal latent token."""
+    if output_frames < 1:
+        raise ValueError("output_frames must be positive")
+    if latent_frames < 1:
+        raise ValueError("latent_frames must be positive")
+    if output_frames > video_vae_output_frames(latent_frames):
+        raise ValueError("output_frames exceed the latent sequence capacity")
+
+    remaining = output_frames
+    for index in range(latent_frames):
+        span = 1 if index % 5 == 0 else 4
+        if remaining <= span:
+            return index
+        remaining -= span
+    raise RuntimeError("H3 temporal latent mapping is inconsistent")
+
+
 @dataclass(frozen=True)
 class GenerationProfile:
     id: str

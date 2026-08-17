@@ -6,6 +6,7 @@ import math
 import os
 import shutil
 import threading
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -20,17 +21,47 @@ import torch
 from h3_workbench.exporter import export_checkpoint
 from h3_workbench.acceleration import shifted_flow_sigmas
 from h3_workbench.direct_download import download_file
-from h3_workbench.inference_runtime import H3MainRuntime, ORTGraphRunner, QwenTextRuntime, initial_latents, sample_latents
+from h3_workbench.inference_runtime import (
+    H3MainRuntime,
+    ORTGraphRunner,
+    QwenTextRuntime,
+    VideoLatentCondition,
+    initial_latents,
+    sample_latents,
+)
 from h3_workbench.qwen_persistent import resolve_qwen_directory
 from h3_workbench.media_output import (
     decode_audio_latents,
     decode_audio_latents_onnx,
     decode_video_latents,
     decode_video_latents_onnx,
+    encode_image_frame,
+    encode_video_frames,
+    load_video_vae_onnx_encoder,
+    select_video_vae_encoder_backend,
+    video_vae_temporal_encoder_ready,
     write_mp4,
+    write_mp4_with_audio_source,
+)
+from h3_workbench.media_input import (
+    InterpolationMode,
+    prepare_frame_condition,
+    prepare_super_resolution_segment,
+    probe_image,
+    probe_video,
+    read_image,
+    read_video_frames,
+    resolve_image_path,
+    resolve_video_path,
 )
 from h3_workbench.performance_monitor import PerformanceMonitor
-from h3_workbench.profiles import PROFILE_360P_17F, GenerationProfile
+from h3_workbench.profiles import (
+    PROFILE_360P_17F,
+    GenerationProfile,
+    video_latent_index_for_output_frame,
+    video_latent_frames_for_output,
+    video_vae_output_frames,
+)
 from h3_workbench.tokenizer import encode_prompt
 from h3_workbench.tokenizer import tokenizer_files_ready
 from h3_workbench.model_registry import inspect_checkpoint
@@ -118,6 +149,53 @@ def _close_qwen_runtime_weights(runtime: QwenTextRuntime | None) -> None:
     for weights in (runtime.int8_virtual, runtime.persistent):
         if weights is not None:
             weights.close()
+
+
+def _release_video_encoder(encoder: Any | None) -> None:
+    if encoder is None:
+        return
+    close = getattr(encoder, "close", None)
+    if callable(close):
+        close()
+        return
+    try:
+        if next(encoder.parameters()).device.type == "cuda":
+            encoder.to("cpu", memory_format=torch.contiguous_format)
+            torch.cuda.empty_cache()
+    except (AttributeError, StopIteration):
+        pass
+
+
+def _segment_video_condition(
+    profile: GenerationProfile,
+    target_frames: int,
+    segment: int,
+    segment_count: int,
+    temporal_mode: str,
+    frame_anchors: dict[str, np.ndarray],
+) -> VideoLatentCondition | None:
+    anchors: dict[int, np.ndarray] = {}
+    if "start" in frame_anchors and segment == 0:
+        anchors[0] = frame_anchors["start"]
+
+    if "end" in frame_anchors and segment == segment_count - 1:
+        retained_frames = target_frames
+        if temporal_mode == "segmented":
+            retained_frames = target_frames - segment * profile.frames
+        retained_frames = max(1, min(profile.frames, retained_frames))
+        latent_index = video_latent_index_for_output_frame(
+            retained_frames,
+            profile.video_latent_frames,
+        )
+        if latent_index in anchors:
+            raise ValueError("First and last frame conditions map to the same latent token")
+        anchors[latent_index] = frame_anchors["end"]
+
+    if not anchors:
+        return None
+    indices = tuple(sorted(anchors))
+    clean = np.ascontiguousarray(np.concatenate([anchors[index] for index in indices], axis=2), dtype=np.float32)
+    return VideoLatentCondition(indices=indices, clean=clean)
 
 
 def _now() -> str:
@@ -361,6 +439,9 @@ class JobManager:
         attention_query_chunk: int = 512,
         l1_prefetch_shards: int = 2,
         use_acceleration_lora: bool = False,
+        conditioning_mode: str = "text",
+        start_image_path: str | None = None,
+        end_image_path: str | None = None,
     ) -> Job:
         if not 1 <= steps <= 50:
             raise ValueError("Inference steps must be from 1 to 50")
@@ -378,12 +459,38 @@ class JobManager:
             raise ValueError("Attention query chunk must be one of 32, 64, 128, 256, or 512")
         if not 0 <= l1_prefetch_shards <= 4:
             raise ValueError("L1 prefetch shards must be from 0 to 4")
+        if conditioning_mode not in {"text", "first", "last", "first_last"}:
+            raise ValueError("Unknown frame conditioning mode")
+        expected = {
+            "text": (False, False),
+            "first": (True, False),
+            "last": (False, True),
+            "first_last": (True, True),
+        }[conditioning_mode]
+        supplied = (bool(start_image_path), bool(end_image_path))
+        if supplied != expected:
+            raise ValueError(f"Frame conditioning inputs do not match mode {conditioning_mode!r}")
         # Keep the model's validated temporal/FPS geometry as an internal template;
         # output dimensions and duration are always supplied explicitly by the caller.
         base_profile = PROFILE_360P_17F.resized(width, height)
         target_frames = max(1, round(duration_seconds * base_profile.fps))
+        if conditioning_mode == "first_last" and target_frames < 2:
+            raise ValueError("First/last conditioning requires an output of at least two frames")
         segment_count = math.ceil(target_frames / base_profile.frames) if temporal_mode == "segmented" else 1
         profile = base_profile if temporal_mode == "segmented" else base_profile.with_frame_count(target_frames)
+        frame_conditioning: dict[str, str] | None = None
+        if conditioning_mode != "text":
+            video_product = (self.workspace / export_preset("video_vae").output_dir).resolve()
+            if not video_vae_temporal_encoder_ready(video_product):
+                raise ValueError(
+                    "Frame conditioning requires the staged Video VAE encoder; "
+                    "re-export the Video VAE encoder product"
+                )
+            frame_conditioning = {"mode": conditioning_mode}
+            if start_image_path:
+                frame_conditioning["start"] = str(resolve_image_path(self.workspace, start_image_path))
+            if end_image_path:
+                frame_conditioning["end"] = str(resolve_image_path(self.workspace, end_image_path))
         job = Job(id=uuid.uuid4().hex[:12], model_id="manual", kind="inference")
         destination = self.workspace / ".h3-workbench" / "outputs" / f"h3-{job.id}.mp4"
         performance_log = self.workspace / ".h3-workbench" / "performance" / f"h3-{job.id}.jsonl"
@@ -406,6 +513,109 @@ class JobManager:
             l1_prefetch_shards,
             destination,
             use_acceleration_lora,
+            frame_conditioning=frame_conditioning,
+        )
+        return job
+
+    def create_super_resolution(
+        self,
+        source_path: str,
+        prompt: str | None,
+        scale: float,
+        interpolation: InterpolationMode,
+        noise_strength: float,
+        processing_mode: str,
+        steps: int,
+        seed: int,
+        attention_query_chunk: int = 512,
+        l1_prefetch_shards: int = 2,
+        use_acceleration_lora: bool = False,
+    ) -> Job:
+        source = resolve_video_path(self.workspace, source_path)
+        info = probe_video(source)
+        if not 1.0 <= scale <= 4.0:
+            raise ValueError("Super-resolution scale must be from 1.0 to 4.0")
+        if interpolation not in {"nearest", "bilinear", "bicubic", "trilinear"}:
+            raise ValueError("Unsupported interpolation mode")
+        if processing_mode not in {"segmented", "direct"}:
+            raise ValueError("Super-resolution processing mode must be 'segmented' or 'direct'")
+        if not 0.0 <= noise_strength <= 1.0:
+            raise ValueError("Noise strength must be from 0.0 to 1.0")
+        if not 1 <= steps <= 50:
+            raise ValueError("Inference steps must be from 1 to 50")
+        if use_acceleration_lora and not 4 <= steps <= 8:
+            raise ValueError("Turbo v4 acceleration LoRA supports 4-8 sampling steps")
+        if attention_query_chunk not in {32, 64, 128, 256, 512}:
+            raise ValueError("Attention query chunk must be one of 32, 64, 128, 256, or 512")
+        if not 0 <= l1_prefetch_shards <= 4:
+            raise ValueError("L1 prefetch shards must be from 0 to 4")
+        output_width = max(32, round(info.width * scale))
+        output_height = max(32, round(info.height * scale))
+        if output_width > 2048 or output_height > 2048 or output_width * output_height > 4_194_304:
+            raise ValueError("Super-resolution output is limited to 2048 px per side and 4 MP")
+        manual_prompt = prompt.strip() if prompt and prompt.strip() else None
+        final_prompt = manual_prompt or info.prompt
+        if not final_prompt:
+            raise ValueError("No prompt found in video metadata; provide a manual prompt")
+        video_preset = export_preset("video_vae")
+        video_product = (self.workspace / video_preset.output_dir).resolve()
+        if not video_vae_temporal_encoder_ready(video_product):
+            raise ValueError(
+                "Super-resolution requires the staged Video VAE encoder; "
+                "re-export the Video VAE encoder product"
+            )
+
+        profile = PROFILE_360P_17F.resized(output_width, output_height)
+        if processing_mode == "direct":
+            if info.frames > 360:
+                raise ValueError("Direct super-resolution is limited to 360 input frames; use video segmentation")
+            profile = profile.with_frame_count(info.frames)
+            segment_frames = info.frames
+            segment_stride = info.frames
+            temporal_overlap = 0
+            segment_count = 1
+            temporal_mode = "native"
+        else:
+            temporal_overlap = 5
+            segment_stride = PROFILE_360P_17F.frames - temporal_overlap
+            segment_frames = PROFILE_360P_17F.frames
+            segment_count = max(1, math.ceil(max(1, info.frames - temporal_overlap) / segment_stride))
+            temporal_mode = "segmented"
+        job = Job(id=uuid.uuid4().hex[:12], model_id=source.name, kind="super_resolution")
+        destination = self.workspace / ".h3-workbench" / "outputs" / f"h3-sr-{job.id}.mp4"
+        performance_log = self.workspace / ".h3-workbench" / "performance" / f"h3-{job.id}.jsonl"
+        job.output_dir = str(destination.parent)
+        job.performance_log = str(performance_log)
+        with self._lock:
+            self._jobs[job.id] = job
+        self._executor.submit(
+            self._run_inference,
+            job.id,
+            None,
+            final_prompt,
+            profile,
+            steps,
+            seed,
+            info.frames,
+            segment_count,
+            temporal_mode,
+            attention_query_chunk,
+            l1_prefetch_shards,
+            destination,
+            use_acceleration_lora,
+            output_fps=max(1.0, info.fps),
+            super_resolution={
+                "source": str(source),
+                "source_info": info.to_dict(),
+                "scale": scale,
+                "interpolation": interpolation,
+                "noise_strength": noise_strength,
+                "segment_frames": segment_frames,
+                "segment_stride": segment_stride,
+                "temporal_overlap": temporal_overlap,
+                "processing_mode": processing_mode,
+                "prompt_source": "manual" if manual_prompt is not None else info.prompt_source,
+            },
         )
         return job
 
@@ -492,6 +702,9 @@ class JobManager:
         l1_prefetch_shards: int,
         destination: Path,
         use_acceleration_lora: bool,
+        output_fps: float | None = None,
+        super_resolution: dict[str, Any] | None = None,
+        frame_conditioning: dict[str, str] | None = None,
     ) -> None:
         self._update(
             job_id,
@@ -509,6 +722,13 @@ class JobManager:
         warm_runtime: H3MainRuntime | None = None
         task_runtime: H3MainRuntime | None = None
         active_runtime: H3MainRuntime | None = None
+        super_source: Path | None = None
+        super_frames: np.ndarray | None = None
+        super_encoder: Any | None = None
+        super_encoder_backend: str | None = None
+        frame_encoder_backend: str | None = None
+        frame_encode_seconds = 0.0
+        frame_anchors: dict[str, np.ndarray] = {}
         reservation_token = f"{os.getpid()}-{job_id}"
         heartbeat_stop = threading.Event()
         reservation_active = False
@@ -683,12 +903,292 @@ class JobManager:
                     warmup_future = None
             _close_qwen_runtime_weights(qwen)
             qwen = None
+            if (super_resolution is not None or frame_conditioning is not None) and warm_runtime is not None:
+                # Video VAE encoding is compute-heavy on low-VRAM GPUs. Do not
+                # keep the FL2VA warmup sessions resident while it runs; the
+                # task runtime is recreated after conditioning is prepared.
+                warm_runtime.close()
+                warm_runtime = None
             video_onnx = self.output_root / "video_vae"
             video_manifest = video_onnx / "manifest.json"
             pixel_segments: list[np.ndarray] = []
             audio_segments: list[np.ndarray] = []
             audio_warnings: list[str] = []
             main_runtime_metrics: list[dict[str, object]] = []
+            super_noise_strength = 0.0
+            sampling_start_sigma = 1.0
+            super_interpolation: str | None = None
+            super_segment_frames = profile.frames
+            super_segment_stride = profile.frames
+            super_temporal_overlap = 0
+            super_encode_seconds = 0.0
+            # Conditioning is deliberately prepared in one contiguous phase.
+            # The staged ONNX sessions stay resident across segments, then are
+            # released before FL2VA sampling claims the device.
+            super_conditioning: list[np.ndarray] = []
+            if frame_conditioning is not None:
+                onnx_encoder_ready = video_vae_temporal_encoder_ready(video_onnx)
+                frame_encoder_backend, encoder_selection_reason = select_video_vae_encoder_backend(
+                    checkpoint_available=False,
+                    onnx_available=onnx_encoder_ready,
+                    low_vram_cuda=False,
+                )
+                self._update(
+                    job_id,
+                    progress=0.16,
+                    message="Encoding first/last frame conditions",
+                    activity={
+                        "phase": "frame_conditioning_encode",
+                        "module": "Video VAE",
+                        "operation": "Loading persistent staged ONNX temporal encoder",
+                        "mode": frame_conditioning["mode"],
+                        "backend": frame_encoder_backend,
+                        "selection_reason": encoder_selection_reason,
+                    },
+                )
+                super_encoder = load_video_vae_onnx_encoder(video_onnx)
+                encode_started = time.perf_counter()
+                encoded_paths: dict[str, np.ndarray] = {}
+                roles = [role for role in ("start", "end") if role in frame_conditioning]
+                for index, role in enumerate(roles, 1):
+                    source = resolve_image_path(self.workspace, frame_conditioning[role])
+                    cache_key = str(source)
+                    anchor = encoded_paths.get(cache_key)
+                    source_size: list[int] | None = None
+                    if anchor is None:
+                        info = probe_image(source)
+                        source_size = [info.width, info.height]
+                        image = read_image(source, info)
+                        prepared = prepare_frame_condition(
+                            image,
+                            profile.output_height,
+                            profile.output_width,
+                            profile.padded_height,
+                            profile.padded_width,
+                        )
+                        anchor = encode_image_frame(
+                            super_encoder,
+                            np.ascontiguousarray(prepared, dtype=np.float16),
+                            callback=lambda activity, role=role: report_activity(
+                                activity,
+                                phase="frame_conditioning_encode",
+                                role=role,
+                            ),
+                            offload_after=False,
+                        )
+                        encoded_paths[cache_key] = anchor
+                        del image, prepared
+                    frame_anchors[role] = anchor.copy()
+                    self._update(
+                        job_id,
+                        progress=0.16 + 0.02 * index / len(roles),
+                        activity={
+                            "phase": "frame_conditioning_encode",
+                            "module": "Video VAE",
+                            "operation": "Frame anchor latent prepared",
+                            "role": role,
+                            "source": str(source),
+                            "source_size": source_size,
+                            "latent_shape": list(frame_anchors[role].shape),
+                            "encoder_protocol": "single_image_causal_token_zero",
+                        },
+                    )
+                frame_encode_seconds = time.perf_counter() - encode_started
+                _release_video_encoder(super_encoder)
+                super_encoder = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            if super_resolution is not None:
+                super_source = resolve_video_path(self.workspace, str(super_resolution["source"]))
+                source_info = probe_video(super_source)
+                self._update(
+                    job_id,
+                    progress=0.16,
+                    message="Reading source video into host RAM",
+                    activity={
+                        "phase": "super_resolution_input",
+                        "module": "Input Video",
+                        "operation": "Reading RGB frames and metadata",
+                        "frames": source_info.frames,
+                        "width": source_info.width,
+                        "height": source_info.height,
+                    },
+                )
+                super_frames = read_video_frames(super_source, source_info)
+                onnx_encoder_ready = video_vae_temporal_encoder_ready(video_onnx)
+                super_encoder_backend, encoder_selection_reason = select_video_vae_encoder_backend(
+                    checkpoint_available=False,
+                    onnx_available=onnx_encoder_ready,
+                    low_vram_cuda=False,
+                )
+                self._update(
+                    job_id,
+                    progress=0.17,
+                    message="Loading Video VAE encoder weights",
+                    activity={
+                        "phase": "super_resolution_input",
+                        "module": "Video VAE",
+                        "operation": "Loading persistent staged ONNX temporal encoder",
+                        "graphs": [
+                            str(video_onnx / "video_encoder_prelude.onnx"),
+                            str(video_onnx / "video_encoder_late.onnx"),
+                            str(video_onnx / "video_encoder_tail.onnx"),
+                            str(video_onnx / "video_encoder_head.onnx"),
+                        ],
+                        "backend": super_encoder_backend,
+                        "selection_reason": encoder_selection_reason,
+                    },
+                )
+                super_encoder = load_video_vae_onnx_encoder(video_onnx)
+                super_noise_strength = float(super_resolution["noise_strength"])
+                sampling_start_sigma = super_noise_strength
+                super_interpolation = str(super_resolution["interpolation"])
+                super_segment_frames = int(super_resolution["segment_frames"])
+                super_segment_stride = int(super_resolution.get("segment_stride", super_segment_frames))
+                super_temporal_overlap = int(super_resolution.get("temporal_overlap", 0))
+                assert super_frames is not None
+                assert super_encoder is not None
+                assert super_interpolation is not None
+                encode_started = time.perf_counter()
+                combined_vae_frames = video_vae_output_frames(
+                    video_latent_frames_for_output(target_frames)
+                )
+                combined_prepared_bytes = (
+                    3
+                    * combined_vae_frames
+                    * profile.padded_height
+                    * profile.padded_width
+                    * np.dtype(np.float16).itemsize
+                )
+                combine_segment_encoding = bool(
+                    segment_count > 1
+                    and super_resolution.get("processing_mode") == "segmented"
+                    and combined_prepared_bytes <= 1536 * 1024**2
+                )
+                if combine_segment_encoding:
+                    prepared, _ = prepare_super_resolution_segment(
+                        super_frames,
+                        0,
+                        int(super_frames.shape[2]),
+                        combined_vae_frames,
+                        combined_vae_frames,
+                        profile.output_height,
+                        profile.output_width,
+                        profile.padded_height,
+                        profile.padded_width,
+                        super_interpolation,  # type: ignore[arg-type]
+                    )
+                    combined_conditioning = encode_video_frames(
+                        super_encoder,
+                        np.ascontiguousarray(prepared, dtype=np.float16),
+                        callback=lambda activity: report_activity(
+                            activity,
+                            phase="super_resolution_encode",
+                            segment=1,
+                            segments=segment_count,
+                        ),
+                        offload_after=False,
+                    )
+                    del prepared
+                    for segment in range(segment_count):
+                        latent_start = segment * 5
+                        latent_stop = latent_start + profile.video_latent_frames
+                        if latent_stop > combined_conditioning.shape[2]:
+                            raise RuntimeError(
+                                "Combined Video VAE conditioning is shorter than the segment plan"
+                            )
+                        conditioning = combined_conditioning[:, :, latent_start:latent_stop].copy()
+                        super_conditioning.append(conditioning)
+                        segment_start = segment * super_segment_stride
+                        actual_source_frames = max(
+                            0,
+                            min(super_segment_frames, target_frames - segment_start),
+                        )
+                        self._update(
+                            job_id,
+                            progress=0.17 + 0.01 * (segment + 1) / segment_count,
+                            activity={
+                                "phase": "super_resolution_encode",
+                                "module": "Video VAE",
+                                "operation": "Conditioning latent window prepared",
+                                "segment": segment + 1,
+                                "segments": segment_count,
+                                "source_frames": actual_source_frames,
+                                "latent_shape": list(conditioning.shape),
+                                "noise_strength": super_noise_strength,
+                                "interpolation": super_interpolation,
+                                "combined_encode": True,
+                            },
+                        )
+                    del combined_conditioning
+                else:
+                    for segment in range(segment_count):
+                        segment_start = segment * super_segment_stride
+                        segment_stop = segment_start + super_segment_frames
+                        prepared, actual_source_frames = prepare_super_resolution_segment(
+                            super_frames,
+                            segment_start,
+                            segment_stop,
+                            super_segment_frames,
+                            profile.frames,
+                            profile.output_height,
+                            profile.output_width,
+                            profile.padded_height,
+                            profile.padded_width,
+                            super_interpolation,  # type: ignore[arg-type]
+                        )
+                        conditioning = encode_video_frames(
+                            super_encoder,
+                            prepared,
+                            callback=lambda activity, segment=segment: report_activity(
+                                activity,
+                                phase="super_resolution_encode",
+                                segment=segment + 1,
+                                segments=segment_count,
+                            ),
+                            offload_after=False,
+                        )
+                        super_conditioning.append(conditioning)
+                        self._update(
+                            job_id,
+                            progress=0.17 + 0.01 * (segment + 1) / segment_count,
+                            activity={
+                                "phase": "super_resolution_encode",
+                                "module": "Video VAE",
+                                "operation": "Conditioning latent prepared",
+                                "segment": segment + 1,
+                                "segments": segment_count,
+                                "source_frames": actual_source_frames,
+                                "latent_shape": list(conditioning.shape),
+                                "noise_strength": super_noise_strength,
+                                "interpolation": super_interpolation,
+                                "combined_encode": False,
+                            },
+                        )
+                        del prepared
+                super_encode_seconds = time.perf_counter() - encode_started
+                self._update(
+                    job_id,
+                    activity={
+                        "phase": "super_resolution_encode",
+                        "module": "Video VAE",
+                        "operation": "Conditioning encode pass completed",
+                        "elapsed_seconds": round(super_encode_seconds, 3),
+                        "segments": segment_count,
+                        "backend": super_encoder_backend,
+                    },
+                )
+
+                # Sampling and decoding need essentially all available VRAM.
+                # Release the encoder session/weights before creating the
+                # first FL2VA runtime, while retaining only tiny host latents.
+                _release_video_encoder(super_encoder)
+                del super_encoder
+                super_encoder = None
+                del super_frames
+                super_frames = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             for segment in range(segment_count):
                 self._update(
                     job_id,
@@ -704,6 +1204,50 @@ class JobManager:
                     },
                 )
                 video, audio = initial_latents(profile, seed + segment)
+                video_condition = (
+                    _segment_video_condition(
+                        profile,
+                        target_frames,
+                        segment,
+                        segment_count,
+                        temporal_mode,
+                        frame_anchors,
+                    )
+                    if frame_anchors
+                    else None
+                )
+                if video_condition is not None:
+                    self._update(
+                        job_id,
+                        activity={
+                            "phase": "sampling",
+                            "module": "Video VAE",
+                            "operation": "Applying clean frame anchor mask",
+                            "segment": segment + 1,
+                            "segments": segment_count,
+                            "latent_indices": list(video_condition.indices),
+                        },
+                    )
+                if super_resolution is not None:
+                    conditioning = super_conditioning[segment]
+                    noise = np.random.default_rng(seed + segment).standard_normal(
+                        conditioning.shape,
+                        dtype=np.float32,
+                    )
+                    video = conditioning * (1.0 - super_noise_strength) + noise * super_noise_strength
+                    self._update(
+                        job_id,
+                        activity={
+                            "phase": "sampling",
+                            "module": "FL2VA",
+                            "operation": "Applying conditioning latent",
+                            "segment": segment + 1,
+                            "segments": segment_count,
+                            "latent_shape": list(conditioning.shape),
+                            "noise_strength": super_noise_strength,
+                        },
+                    )
+                    del conditioning, noise
 
                 def report_main(activity: dict[str, object], segment: int = segment) -> None:
                     details = {
@@ -768,6 +1312,8 @@ class JobManager:
                                 "segments": segment_count,
                             },
                         ),
+                        start_sigma=sampling_start_sigma,
+                        video_condition=video_condition,
                     )
                     if active_runtime.audio_fallback_reason is not None:
                         audio_warnings.append(active_runtime.audio_fallback_reason)
@@ -814,9 +1360,25 @@ class JobManager:
                         profile.output_width,
                         callback=video_callback,
                     )
+                if super_resolution is not None and super_temporal_overlap > 0 and segment > 0:
+                    overlap = min(super_temporal_overlap, segment_pixels.shape[2])
+                    previous = pixel_segments[-1]
+                    positions = np.arange(overlap, dtype=np.float32) / overlap
+                    left_weight = (1.0 - positions).reshape(1, 1, overlap, 1, 1)
+                    right_weight = positions.reshape(1, 1, overlap, 1, 1)
+                    blended = (
+                        previous[:, :, -overlap:] * left_weight
+                        + segment_pixels[:, :, :overlap] * right_weight
+                    )
+                    pixel_segments[-1] = np.concatenate(
+                        (previous[:, :, :-overlap], blended),
+                        axis=2,
+                    )
+                    segment_pixels = segment_pixels[:, :, overlap:]
                 pixel_segments.append(segment_pixels)
-                audio_segments.append(audio)
-                del video, audio, segment_pixels
+                if super_resolution is None:
+                    audio_segments.append(audio)
+                del video, audio, segment_pixels, video_condition
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -826,52 +1388,46 @@ class JobManager:
             del text_states
             gc.collect()
             pixels = np.concatenate(pixel_segments, axis=2)[:, :, :target_frames]
-            target_audio_frames = math.ceil(target_frames * profile.audio_latents_per_second / profile.fps)
-            audio = np.concatenate(audio_segments, axis=3)[:, :, :, :target_audio_frames]
-            del pixel_segments, audio_segments
-            self._update(
-                job_id,
-                progress=0.92,
-                message="Decoding audio",
-                activity={"phase": "audio_decode", "module": "Audio VAE", "operation": "Preparing decoder"},
-            )
+            del pixel_segments
             audio_onnx = self.output_root / "audio_vae"
-            def audio_callback(activity: dict[str, object]) -> None:
-                report_activity(activity, phase="audio_decode")
-
-            audio_status = "generated"
+            output_fps_value = output_fps or profile.fps
             audio_warning = "; ".join(dict.fromkeys(audio_warnings)) if audio_warnings else None
-            if audio_warning is not None or not np.isfinite(audio).all():
-                audio_status = "silent_fallback"
-                audio_warning = audio_warning or "Non-finite FL2VA audio latent"
-                waveform = np.zeros((1, 2, target_audio_frames * 800), dtype=np.float32)
+            if super_resolution is not None:
+                waveform = None
+                audio_status = "source_preserved" if super_source is not None and probe_video(super_source).has_audio else "no_audio"
                 self._update(
                     job_id,
-                    message="Audio unstable; using a silent track",
+                    progress=0.92,
+                    message="Preparing source audio",
                     activity={
-                        "phase": "audio_decode",
-                        "module": "Audio VAE",
-                        "operation": "Using silent fallback",
-                        "reason": audio_warning,
+                        "phase": "audio_mux",
+                        "module": "Input Audio",
+                        "operation": "Keeping original audio stream",
+                        "audio_status": audio_status,
                     },
                 )
             else:
-                try:
-                    if (audio_onnx / "manifest.json").is_file():
-                        waveform = decode_audio_latents_onnx(audio_onnx, audio, callback=audio_callback)
-                    else:
-                        waveform = decode_audio_latents(
-                            self.workspace / "minimax_h3_audio_vae_fp32.safetensors",
-                            audio,
-                            audio_callback,
-                        )
-                except FloatingPointError as exc:
+                target_audio_frames = math.ceil(target_frames * profile.audio_latents_per_second / profile.fps)
+                audio = np.concatenate(audio_segments, axis=3)[:, :, :, :target_audio_frames]
+                del audio_segments
+                self._update(
+                    job_id,
+                    progress=0.92,
+                    message="Decoding audio",
+                    activity={"phase": "audio_decode", "module": "Audio VAE", "operation": "Preparing decoder"},
+                )
+
+                def audio_callback(activity: dict[str, object]) -> None:
+                    report_activity(activity, phase="audio_decode")
+
+                audio_status = "generated"
+                if audio_warning is not None or not np.isfinite(audio).all():
                     audio_status = "silent_fallback"
-                    audio_warning = str(exc)
+                    audio_warning = audio_warning or "Non-finite FL2VA audio latent"
                     waveform = np.zeros((1, 2, target_audio_frames * 800), dtype=np.float32)
                     self._update(
                         job_id,
-                        message="Audio decoder unstable; using a silent track",
+                        message="Audio unstable; using a silent track",
                         activity={
                             "phase": "audio_decode",
                             "module": "Audio VAE",
@@ -879,6 +1435,30 @@ class JobManager:
                             "reason": audio_warning,
                         },
                     )
+                else:
+                    try:
+                        if (audio_onnx / "manifest.json").is_file():
+                            waveform = decode_audio_latents_onnx(audio_onnx, audio, callback=audio_callback)
+                        else:
+                            waveform = decode_audio_latents(
+                                self.workspace / "minimax_h3_audio_vae_fp32.safetensors",
+                                audio,
+                                audio_callback,
+                            )
+                    except FloatingPointError as exc:
+                        audio_status = "silent_fallback"
+                        audio_warning = str(exc)
+                        waveform = np.zeros((1, 2, target_audio_frames * 800), dtype=np.float32)
+                        self._update(
+                            job_id,
+                            message="Audio decoder unstable; using a silent track",
+                            activity={
+                                "phase": "audio_decode",
+                                "module": "Audio VAE",
+                                "operation": "Using silent fallback",
+                                "reason": audio_warning,
+                            },
+                        )
             self._update(
                 job_id,
                 progress=0.97,
@@ -898,6 +1478,23 @@ class JobManager:
                 "input": {
                     "prompt": prompt,
                     "token_ids": token_ids,
+                    **(
+                        {
+                            "video": super_resolution["source_info"],
+                            "source_path": str(super_source) if super_source is not None else None,
+                            "prompt_source": super_resolution["prompt_source"],
+                        }
+                        if super_resolution is not None
+                        else {}
+                    ),
+                    **(
+                        {
+                            "start_image_path": frame_conditioning.get("start"),
+                            "end_image_path": frame_conditioning.get("end"),
+                        }
+                        if frame_conditioning is not None
+                        else {}
+                    ),
                 },
                 "sampling": {
                     "seed": seed,
@@ -905,7 +1502,8 @@ class JobManager:
                     "scheduler": "simple_shifted_flow",
                     "video_shift": 12.0,
                     "audio_shift": 3.0,
-                    "video_sigmas": shifted_flow_sigmas(steps, 12.0),
+                    "start_sigma": sampling_start_sigma,
+                    "video_sigmas": shifted_flow_sigmas(steps, 12.0, sampling_start_sigma),
                     "audio_schedule": "dual_clock_time_shift_from_video_12_to_audio_3",
                 },
                 "output": {
@@ -913,12 +1511,50 @@ class JobManager:
                     "width": profile.output_width,
                     "height": profile.output_height,
                     "frames": target_frames,
-                    "fps": profile.fps,
-                    "duration_seconds": target_frames / profile.fps,
+                    "fps": output_fps_value,
+                    "duration_seconds": target_frames / output_fps_value,
                     "audio_sample_rate": 32000,
                     "audio_status": audio_status,
                     "audio_warning": audio_warning,
                 },
+                **(
+                    {
+                        "super_resolution": {
+                            "scale": super_resolution["scale"],
+                            "interpolation": super_resolution["interpolation"],
+                            "noise_strength": super_resolution["noise_strength"],
+                            "start_sigma": sampling_start_sigma,
+                            "processing_mode": super_resolution["processing_mode"],
+                            "segment_frames": super_resolution["segment_frames"],
+                            "segment_stride": super_resolution["segment_stride"],
+                            "temporal_overlap": super_resolution["temporal_overlap"],
+                            "noise_formula": "conditioning * (1 - strength) + standard_normal * strength",
+                            "latent_conditioning": "Video VAE temporal/spatial encode",
+                            "encoder_backend": super_encoder_backend,
+                            "encoder_seconds": round(super_encode_seconds, 3),
+                            "audio_policy": "reuse_input_audio",
+                        }
+                    }
+                    if super_resolution is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "frame_conditioning": {
+                            "mode": frame_conditioning["mode"],
+                            "policy": "clean_masked_latent_slots",
+                            "anchor_tokens_per_boundary": 1,
+                            "encoder_protocol": "single_image_causal_token_zero",
+                            "condition_timestep": 1.0,
+                            "condition_update": "excluded_from_euler_update",
+                            "end_alignment": "last_retained_output_frame",
+                            "encoder_backend": frame_encoder_backend,
+                            "encoder_seconds": round(frame_encode_seconds, 3),
+                        }
+                    }
+                    if frame_conditioning is not None
+                    else {}
+                ),
                 "temporal": {
                     "mode": temporal_mode,
                     "segments": segment_count,
@@ -956,7 +1592,18 @@ class JobManager:
                     "audio_vae": _manifest_identity(audio_onnx),
                 },
             }
-            metadata_path = write_mp4(destination, pixels, waveform, profile.fps, metadata)
+            if super_resolution is not None:
+                assert super_source is not None
+                metadata_path = write_mp4_with_audio_source(
+                    destination,
+                    pixels,
+                    super_source,
+                    output_fps_value,
+                    metadata,
+                )
+            else:
+                assert waveform is not None
+                metadata_path = write_mp4(destination, pixels, waveform, output_fps_value, metadata)
             self._update(
                 job_id,
                 status="completed",
@@ -985,13 +1632,27 @@ class JobManager:
                     "steps": steps,
                     "seed": seed,
                     "frames": target_frames,
-                    "duration_seconds": target_frames / profile.fps,
+                    "duration_seconds": target_frames / output_fps_value,
                     "segments": segment_count,
                     "temporal_mode": temporal_mode,
                     "attention_query_chunk": attention_query_chunk,
                     "l1_prefetch_shards": l1_prefetch_shards,
                     "audio_status": audio_status,
                     "audio_warning": audio_warning,
+                    "conditioning_mode": frame_conditioning["mode"] if frame_conditioning is not None else "text",
+                    "start_image_path": frame_conditioning.get("start") if frame_conditioning is not None else None,
+                    "end_image_path": frame_conditioning.get("end") if frame_conditioning is not None else None,
+                    **(
+                        {
+                            "source": str(super_source) if super_source is not None else None,
+                            "scale": super_resolution["scale"],
+                            "interpolation": super_resolution["interpolation"],
+                            "noise_strength": super_resolution["noise_strength"],
+                            "processing_mode": super_resolution["processing_mode"],
+                        }
+                        if super_resolution is not None
+                        else {}
+                    ),
                 },
             )
         except Exception as exc:
@@ -1018,6 +1679,12 @@ class JobManager:
             if warm_runtime is not None:
                 warm_runtime.close()
             _close_qwen_runtime_weights(qwen)
+            if super_encoder is not None:
+                _release_video_encoder(super_encoder)
+                del super_encoder
+            if super_frames is not None:
+                del super_frames
+            gc.collect()
             if reservation_active:
                 release_reservation(reservation_token)
             if runner is not None:

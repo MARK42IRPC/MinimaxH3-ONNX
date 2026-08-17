@@ -1077,6 +1077,201 @@ input:disabled {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.columns-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.file-field {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  color: var(--ink-soft);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.file-field input {
+  height: 36px;
+  padding: 8px;
+  font-size: 10px;
+}
+
+.super-source-actions {
+  align-items: end;
+}
+
+.super-source-actions .text-button {
+  min-height: 36px;
+}
+
+.frame-mode-field {
+  margin-top: 14px;
+}
+
+.conditioning-mode-control {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.conditioning-mode-control label > span {
+  min-height: 58px;
+  padding: 10px 11px;
+}
+
+.frame-condition-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 13px;
+  margin-top: 14px;
+}
+
+.frame-condition-grid.hidden,
+.frame-input.hidden {
+  display: none;
+}
+
+.frame-input {
+  min-width: 0;
+  border: 1px solid var(--line-strong);
+  background: var(--surface-subtle);
+}
+
+.frame-input-heading,
+.frame-input-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+  gap: 10px;
+  padding: 9px 10px;
+}
+
+.frame-input-heading > div {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+  gap: 7px;
+}
+
+.frame-input-heading strong {
+  font-size: 11px;
+}
+
+.frame-input-heading span {
+  color: var(--muted);
+  font: 9px Consolas, monospace;
+}
+
+.frame-clear-button {
+  display: grid;
+  place-items: center;
+  width: 27px;
+  height: 27px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 17px;
+  line-height: 1;
+}
+
+.frame-clear-button:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.frame-preview {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: #e9eeeb;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.frame-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #151a18;
+}
+
+.frame-file-button {
+  flex: 0 0 auto;
+}
+
+.frame-file-button input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.frame-file-button > span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 31px;
+  padding: 0 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.frame-file-button input:focus-visible + span {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+.frame-file-button input:disabled + span {
+  background: var(--surface-strong);
+  color: var(--muted);
+  cursor: wait;
+}
+
+.frame-file-status {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font: 9px Consolas, "Microsoft YaHei", monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.range-field {
+  display: grid;
+  gap: 8px;
+  margin-top: 17px;
+  color: var(--ink-soft);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.range-field > span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.range-field output {
+  color: var(--accent);
+  font: 12px Consolas, monospace;
+}
+
+.range-field input[type="range"] {
+  height: 20px;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
 .mode-field {
   min-width: 0;
   margin: 17px 0 0;
@@ -1980,6 +2175,19 @@ input:disabled {
     --sidebar-width: 194px;
   }
 
+  .conditioning-mode-control {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .conditioning-mode-control label:nth-child(3) {
+    border-left: 0;
+    border-top: 1px solid var(--line-strong);
+  }
+
+  .conditioning-mode-control label:nth-child(4) {
+    border-top: 1px solid var(--line-strong);
+  }
+
   main {
     padding-right: 22px;
     padding-left: 22px;
@@ -2272,6 +2480,23 @@ input:disabled {
 
   .columns-3 {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .columns-2 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .frame-condition-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .conditioning-mode-control {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .conditioning-mode-control label:nth-child(2),
+  .conditioning-mode-control label:nth-child(4) {
+    border-left: 0;
   }
 
   .segmented-control {

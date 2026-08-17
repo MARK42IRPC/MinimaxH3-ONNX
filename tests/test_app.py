@@ -1,10 +1,12 @@
 import json
+from urllib.parse import quote
+
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 import pytest
 from dataclasses import replace
 
-from h3_workbench.app import InferenceRequest, app
+from h3_workbench.app import InferenceRequest, SuperResolutionRequest, app
 
 
 def test_health() -> None:
@@ -113,6 +115,46 @@ def test_webui_contains_live_job_elapsed_timer() -> None:
     assert "手动开启" in response.text
     assert "use_acceleration_lora" in response.text
     assert "Turbo v4 尚未就绪，将使用流式基座模型" not in response.text
+
+
+def test_webui_uri_encodes_upload_filenames() -> None:
+    response = TestClient(app).get("/assets/app.js")
+
+    assert response.status_code == 200
+    assert '"x-filename": encodeURIComponent(file.name)' in response.text
+
+
+def test_image_upload_decodes_utf8_filename(monkeypatch, tmp_path) -> None:
+    from h3_workbench import app as app_module
+    from h3_workbench.media_input import ImageInfo
+
+    monkeypatch.setattr(
+        app_module,
+        "settings",
+        replace(
+            app_module.settings,
+            workspace=tmp_path,
+            output_dir=tmp_path / "onnx_models",
+            state_dir=tmp_path / ".h3-workbench",
+        ),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "probe_image",
+        lambda path: ImageInfo(path=str(path), width=320, height=180),
+    )
+
+    response = TestClient(app_module.app).post(
+        "/api/images/upload",
+        headers={"x-filename": quote("首帧测试.png", safe=""), "content-type": "image/png"},
+        content=b"image-data",
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["path"].endswith("-首帧测试.png")
+    assert payload["image"]["width"] == 320
+    assert payload["image"]["height"] == 180
 
 
 def test_performance_log_endpoint(monkeypatch, tmp_path) -> None:
@@ -368,9 +410,53 @@ def test_inference_request_accepts_explicit_acceleration_lora() -> None:
     assert request.use_acceleration_lora is True
 
 
+@pytest.mark.parametrize(
+    ("mode", "start", "end"),
+    (
+        ("text", None, None),
+        ("first", "start.png", None),
+        ("last", None, "end.png"),
+        ("first_last", "start.png", "end.png"),
+    ),
+)
+def test_inference_request_accepts_four_conditioning_modes(
+    mode: str,
+    start: str | None,
+    end: str | None,
+) -> None:
+    request = InferenceRequest(
+        prompt="snowfall",
+        conditioning_mode=mode,
+        start_image_path=start,
+        end_image_path=end,
+    )
+
+    assert request.conditioning_mode == mode
+    assert request.start_image_path == start
+    assert request.end_image_path == end
+
+
+def test_inference_request_rejects_missing_frame_condition_input() -> None:
+    with pytest.raises(ValidationError, match="requires"):
+        InferenceRequest(prompt="snowfall", conditioning_mode="first_last", start_image_path="start.png")
+
+
 def test_inference_request_rejects_acceleration_lora_outside_supported_steps() -> None:
     with pytest.raises(ValidationError, match="supports 4-8"):
         InferenceRequest(prompt="snowfall", steps=3, use_acceleration_lora=True)
+
+
+def test_super_resolution_request_exposes_manual_processing_mode() -> None:
+    assert SuperResolutionRequest(source_path="clip.mp4", prompt="snowfall").processing_mode == "segmented"
+    assert (
+        SuperResolutionRequest(source_path="clip.mp4", prompt="snowfall", processing_mode="direct").processing_mode
+        == "direct"
+    )
+
+
+def test_super_resolution_request_rejects_unknown_processing_mode() -> None:
+    with pytest.raises(ValidationError):
+        SuperResolutionRequest(source_path="clip.mp4", prompt="snowfall", processing_mode="auto")
 
 
 @pytest.mark.parametrize(

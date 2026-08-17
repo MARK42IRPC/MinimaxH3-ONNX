@@ -28,11 +28,30 @@ class AccelerationConfig:
         return asdict(self)
 
 
-def shifted_flow_sigmas(steps: int, shift: float = 12.0) -> list[float]:
+def shifted_flow_sigmas(
+    steps: int,
+    shift: float = 12.0,
+    start_sigma: float = 1.0,
+) -> list[float]:
+    """Build a shifted-flow schedule beginning at ``start_sigma``.
+
+    ``start_sigma`` is expressed in the shifted schedule's sigma space. The
+    inverse shift maps it back to the linear-flow coordinate before sampling so
+    the first denoise call receives exactly the sigma represented by the input
+    latent. This is important for image/video-to-video conditioning: a latent
+    mixed with 35% noise must not be treated as the sigma=1 pure-noise state.
+    """
     if steps < 1:
         raise ValueError("steps must be positive")
-    base = np.linspace(1.0, 0.0, steps + 1, dtype=np.float64)
+    if not np.isfinite(shift) or shift <= 0.0:
+        raise ValueError("shift must be a positive finite number")
+    if not np.isfinite(start_sigma) or not 0.0 <= start_sigma <= 1.0:
+        raise ValueError("start_sigma must be between 0.0 and 1.0")
+    base_start = start_sigma / (shift - (shift - 1.0) * start_sigma)
+    base = np.linspace(base_start, 0.0, steps + 1, dtype=np.float64)
     shifted = shift * base / (1.0 + (shift - 1.0) * base)
+    shifted[0] = start_sigma
+    shifted[-1] = 0.0
     return shifted.tolist()
 
 

@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import wave
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -12,10 +13,17 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file
 
 from h3_workbench.vendor.audio_vae import MiniMaxH3AudioVAE
-from h3_workbench.vendor.video_vae import IMAGENET_MEAN, IMAGENET_STD, MiniMaxH3VideoVAE
+from h3_workbench.vendor.video_vae import (
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+    LATENTS_MEAN,
+    LATENTS_STD,
+    MiniMaxH3VideoVAE,
+)
 from h3_workbench.profiles import video_vae_output_frames
 
 
@@ -442,6 +450,7 @@ def _assemble_video_vae_tiles(
     x_overlaps: list[int],
     padded_height: int,
     padded_width: int,
+    canvas_dtype: np.dtype | type[np.floating] | None = np.float32,
 ) -> np.ndarray:
     canvas: np.ndarray | None = None
     row_tails: list[np.ndarray | None] = []
@@ -465,7 +474,8 @@ def _assemble_video_vae_tiles(
             if column < len(x_starts) - 1:
                 tile = tile[..., :, :-x_overlaps[column]]
             if canvas is None:
-                canvas = np.empty((*tile.shape[:-2], padded_height, padded_width), dtype=np.float32)
+                dtype = tile.dtype if canvas_dtype is None else canvas_dtype
+                canvas = np.empty((*tile.shape[:-2], padded_height, padded_width), dtype=dtype)
             canvas[..., out_y : out_y + tile.shape[-2], out_x : out_x + tile.shape[-1]] = tile
             out_x += tile.shape[-1]
         row_tails = new_tails
@@ -528,6 +538,1465 @@ def decode_video_latents(
     top = max(0, (height - output_height) // 2)
     left = max(0, (width - output_width) // 2)
     return pixels[:, :, :, top : top + output_height, left : left + output_width]
+
+
+def _video_vae_encoder_overlap(use_cuda: bool, total_vram_bytes: int) -> int:
+    setting = os.environ.get("H3_VAE_ENCODER_OVERLAP", "auto").strip().lower()
+    if setting == "auto":
+        return 32 if use_cuda and total_vram_bytes <= 6 * 1024**3 else 64
+    try:
+        overlap = int(setting)
+    except ValueError as exc:
+        raise ValueError(
+            "H3_VAE_ENCODER_OVERLAP must be auto or a positive integer"
+        ) from exc
+    if overlap < 16 or overlap % 16 != 0:
+        raise ValueError(
+            "Video VAE encoder tile_overlap_min must be a multiple of 16 and at least 16"
+        )
+    return overlap
+
+
+def video_vae_temporal_encoder_ready(directory: Path) -> bool:
+    try:
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        encoder = manifest["temporal_encoder"]
+        graphs = encoder["graphs"]
+        return (
+            encoder.get("layout") == "progressive_staged_cuda_v1"
+            and encoder.get("validation_passed") is True
+            and int(encoder.get("clip_frames", 0)) == 17
+            and int(encoder.get("token_drop", -1)) == 3
+            and int(encoder.get("spatial_ratio", 0)) == 16
+            and int(encoder.get("temporal_tokens", 0)) == 5
+            and encoder.get("channels")
+            == {"prelude": 128, "late": 256, "tail": 1024, "moments": 48}
+            and set(graphs) == {"prelude", "late", "tail", "head"}
+            and all(
+                (directory / str(graphs[name])).is_file()
+                for name in ("prelude", "late", "tail", "head")
+            )
+        )
+    except (OSError, KeyError, TypeError, ValueError):
+        return False
+
+
+def select_video_vae_encoder_backend(
+    *,
+    checkpoint_available: bool,
+    onnx_available: bool,
+    low_vram_cuda: bool,
+    setting: str | None = None,
+) -> tuple[str, str]:
+    """Require the staged ONNX encoder so auto mode cannot select a known slow path."""
+    del checkpoint_available, low_vram_cuda
+    requested = (
+        setting if setting is not None else os.environ.get("H3_VAE_ENCODER_BACKEND", "auto")
+    ).strip().lower()
+    requested = {"onnx": "onnxruntime", "torch": "pytorch"}.get(requested, requested)
+    if requested == "pytorch":
+        raise ValueError(
+            "The PyTorch Video VAE encoder backend is disabled; export the staged ONNX encoder"
+        )
+    if requested not in {"auto", "onnxruntime"}:
+        raise ValueError("H3_VAE_ENCODER_BACKEND must be auto or onnxruntime")
+    if onnx_available:
+        reason = (
+            "forced staged ONNX encoder by H3_VAE_ENCODER_BACKEND"
+            if requested == "onnxruntime"
+            else "validated staged ONNX encoder is available"
+        )
+        return "onnxruntime", reason
+    raise RuntimeError(
+        "Super-resolution requires a validated staged ONNX Video VAE encoder; "
+        "run export-video-encoder for the Video VAE product"
+    )
+
+
+class _MonolithicONNXVideoVAEEncoder:
+    """Persistent ORT session for the production temporal Video VAE encoder."""
+
+    _h3_onnx_runtime = True
+
+    def __init__(self, directory: Path, prefer_cuda: bool = True):
+        if not video_vae_temporal_encoder_ready(directory):
+            raise ValueError(f"Production temporal Video VAE encoder is not ready: {directory}")
+        from h3_workbench.inference_runtime import ORTGraphRunner
+
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        encoder = manifest["temporal_encoder"]
+        self.directory = directory.resolve()
+        self.clip_length = int(encoder["clip_frames"])
+        self.token_drop = int(encoder["token_drop"])
+        self.vae_ratio = int(encoder["spatial_ratio"])
+        self._runner = ORTGraphRunner(prefer_cuda=prefer_cuda, prefetch_depth=0)
+        self._session = self._runner.session(self.directory / str(encoder["graph"]))
+        use_cuda = self._runner.provider == "CUDAExecutionProvider"
+        free_bytes = 0
+        total_bytes = 0
+        if use_cuda and torch.cuda.is_available():
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+            except RuntimeError:
+                pass
+        if total_bytes >= 10 * 1024**3:
+            self.tile_size = 512
+        elif total_bytes >= 3 * 1024**3:
+            self.tile_size = 384
+        elif free_bytes >= 1536 * 1024**2:
+            self.tile_size = 320
+        else:
+            self.tile_size = 256
+        self.tile_overlap_min = _video_vae_encoder_overlap(use_cuda, total_bytes)
+        self.provider = self._runner.provider
+
+    def close(self) -> None:
+        self._session = None
+        self._runner.close()
+
+    def _encode_with_tile_size(
+        self,
+        pixels: np.ndarray,
+        tile_size: int,
+        callback: Callable[[dict[str, object]], None] | None,
+    ) -> np.ndarray:
+        y_starts, y_lengths, y_overlaps = _split_tiles(
+            int(pixels.shape[3]),
+            tile_size,
+            self.tile_overlap_min,
+            self.vae_ratio,
+        )
+        x_starts, x_lengths, x_overlaps = _split_tiles(
+            int(pixels.shape[4]),
+            tile_size,
+            self.tile_overlap_min,
+            self.vae_ratio,
+        )
+        tiles_per_clip = len(y_starts) * len(x_starts)
+        temporal_clips = int(np.ceil(pixels.shape[2] / self.clip_length))
+        clip_moments: list[np.ndarray] = []
+        for temporal_index in range(temporal_clips):
+            if callback is not None:
+                callback(
+                    {
+                        "module": "Video VAE",
+                        "operation": "ORT encoder temporal clip",
+                        "event": "temporal_clip_start",
+                        "temporal_clip": temporal_index + 1,
+                        "temporal_clips": temporal_clips,
+                        "provider": self.provider,
+                    }
+                )
+            clip = pixels[
+                :,
+                :,
+                temporal_index * self.clip_length : (temporal_index + 1) * self.clip_length,
+                :,
+                :,
+            ]
+            if clip.shape[2] < self.clip_length:
+                clip = np.concatenate(
+                    (clip, np.repeat(clip[:, :, -1:], self.clip_length - clip.shape[2], axis=2)),
+                    axis=2,
+                )
+            encoded_tiles: dict[tuple[int, int], np.ndarray] = {}
+            tile_number = 0
+            for row, (y_start, y_length) in enumerate(zip(y_starts, y_lengths, strict=True)):
+                for column, (x_start, x_length) in enumerate(zip(x_starts, x_lengths, strict=True)):
+                    tile_number += 1
+                    details = {
+                        "temporal_clip": temporal_index + 1,
+                        "temporal_clips": temporal_clips,
+                        "tile": tile_number,
+                        "tiles": tiles_per_clip,
+                        "row": row + 1,
+                        "rows": len(y_starts),
+                        "column": column + 1,
+                        "columns": len(x_starts),
+                        "provider": self.provider,
+                    }
+                    if callback is not None:
+                        callback(
+                            {
+                                "module": "Video VAE",
+                                "operation": "ORT encoder tile",
+                                "event": "tile_start",
+                                **details,
+                            }
+                        )
+                    started = time.perf_counter()
+                    tile = np.ascontiguousarray(
+                        clip[
+                            :,
+                            :,
+                            :,
+                            y_start : y_start + y_length,
+                            x_start : x_start + x_length,
+                        ],
+                        dtype=np.float16,
+                    )
+                    encoded_tiles[(row, column)] = self._session.run(None, {"pixels": tile})[0]
+                    if callback is not None:
+                        callback(
+                            {
+                                "module": "Video VAE",
+                                "operation": "ORT encoder tile complete",
+                                "event": "tile_complete",
+                                "elapsed_seconds": time.perf_counter() - started,
+                                **details,
+                            }
+                        )
+            clip_moments.append(
+                _assemble_video_vae_tiles(
+                    encoded_tiles,
+                    y_starts,
+                    [value // self.vae_ratio for value in y_overlaps],
+                    x_starts,
+                    [value // self.vae_ratio for value in x_overlaps],
+                    int(pixels.shape[3]) // self.vae_ratio,
+                    int(pixels.shape[4]) // self.vae_ratio,
+                )
+            )
+        moments = np.concatenate(clip_moments, axis=2)
+        if self.token_drop > 0:
+            moments = moments[:, :, :-self.token_drop]
+        mean = np.split(moments.astype(np.float32, copy=False), 2, axis=1)[0]
+        latent_mean = np.asarray(LATENTS_MEAN, dtype=np.float32).reshape(1, -1, 1, 1, 1)
+        latent_std = np.asarray(LATENTS_STD, dtype=np.float32).reshape(1, -1, 1, 1, 1)
+        return (mean - latent_mean) / latent_std
+
+    def encode(
+        self,
+        pixels: np.ndarray,
+        callback: Callable[[dict[str, object]], None] | None = None,
+    ) -> np.ndarray:
+        candidates = [value for value in (512, 448, 384, 320, 256) if value <= self.tile_size]
+        last_error: Exception | None = None
+        for tile_size in candidates:
+            try:
+                result = self._encode_with_tile_size(pixels, tile_size, callback)
+                self.tile_size = tile_size
+                return result
+            except RuntimeError as exc:
+                if not any(marker in str(exc).lower() for marker in ("out of memory", "cuda error 2")):
+                    raise
+                last_error = exc
+                if callback is not None and tile_size != candidates[-1]:
+                    callback(
+                        {
+                            "module": "Video VAE",
+                            "operation": "Reducing ORT encoder tile after CUDA OOM",
+                            "from_tile_size": tile_size,
+                            "to_tile_size": candidates[candidates.index(tile_size) + 1],
+                        }
+                    )
+        assert last_error is not None
+        raise last_error
+
+
+class _BatchedStagedONNXVideoVAEEncoder:
+    """Three persistent ORT stages with CUDA-resident intermediate activations."""
+
+    _h3_onnx_runtime = True
+
+    def __init__(self, directory: Path, prefer_cuda: bool = True):
+        if not video_vae_temporal_encoder_ready(directory):
+            raise ValueError(f"Staged temporal Video VAE encoder is not ready: {directory}")
+        from h3_workbench.inference_runtime import ORTGraphRunner
+
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        encoder = manifest["temporal_encoder"]
+        self.directory = directory.resolve()
+        self.clip_length = int(encoder["clip_frames"])
+        self.token_drop = int(encoder["token_drop"])
+        self.vae_ratio = int(encoder["spatial_ratio"])
+        self.temporal_tokens = int(encoder["temporal_tokens"])
+        self.channels = {name: int(value) for name, value in encoder["channels"].items()}
+        self._graphs = {name: self.directory / str(value) for name, value in encoder["graphs"].items()}
+        self._runner = ORTGraphRunner(prefer_cuda=prefer_cuda, prefetch_depth=0)
+        self.provider = self._runner.provider
+        self._sessions: dict[str, object] = {}
+        self._load_sessions()
+
+        use_cuda = self.provider == "CUDAExecutionProvider"
+        free_bytes = 0
+        total_bytes = 0
+        if use_cuda and torch.cuda.is_available():
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+            except RuntimeError:
+                pass
+        if total_bytes >= 10 * 1024**3:
+            self.tile_size = 512
+        elif total_bytes >= 3 * 1024**3:
+            self.tile_size = 384
+        elif free_bytes >= 1536 * 1024**2:
+            self.tile_size = 320
+        else:
+            self.tile_size = 256
+        self.tile_overlap_min = _video_vae_encoder_overlap(use_cuda, total_bytes)
+
+    def _load_sessions(self) -> None:
+        try:
+            self._sessions = {
+                name: self._runner.session(self._graphs[name])
+                for name in ("prelude", "late", "head")
+            }
+        except Exception:
+            self._sessions.clear()
+            gc.collect()
+            raise
+
+    def _reload_sessions(self) -> None:
+        self._sessions.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self._load_sessions()
+
+    def close(self) -> None:
+        self._sessions.clear()
+        gc.collect()
+        self._runner.close()
+
+    @staticmethod
+    def _emit(
+        callback: Callable[[dict[str, object]], None] | None,
+        operation: str,
+        **details: object,
+    ) -> None:
+        if callback is not None:
+            callback({"module": "Video VAE", "operation": operation, **details})
+
+    def _run_cuda_stage(
+        self,
+        session: object,
+        input_name: str,
+        input_value: object,
+        output_name: str,
+        output_shape: tuple[int, ...],
+    ) -> object:
+        import onnxruntime as ort
+
+        output = ort.OrtValue.ortvalue_from_shape_and_type(
+            output_shape,
+            np.float16,
+            "cuda",
+            self._runner.device_index,
+        )
+        binding = None
+        try:
+            binding = session.io_binding()  # type: ignore[attr-defined]
+            binding.bind_ortvalue_input(input_name, input_value)
+            binding.bind_ortvalue_output(output_name, output)
+            binding.synchronize_inputs()
+            session.run_with_iobinding(binding)  # type: ignore[attr-defined]
+            binding.synchronize_outputs()
+            return output
+        finally:
+            _release_io_binding(binding)
+
+    def _encode_clip_cuda(
+        self,
+        clip: np.ndarray,
+        tile_size: int,
+        callback: Callable[[dict[str, object]], None] | None,
+        temporal_index: int,
+        temporal_clips: int,
+    ) -> np.ndarray:
+        import onnxruntime as ort
+
+        y_starts, y_lengths, y_overlaps = _split_tiles(
+            int(clip.shape[3]), tile_size, self.tile_overlap_min, self.vae_ratio
+        )
+        x_starts, x_lengths, x_overlaps = _split_tiles(
+            int(clip.shape[4]), tile_size, self.tile_overlap_min, self.vae_ratio
+        )
+        if len(set(y_lengths)) != 1 or len(set(x_lengths)) != 1:
+            raise ValueError("Staged Video VAE encoder requires uniform spatial tile shapes")
+        tile_entries = [
+            (row, column, y_start, y_length, x_start, x_length)
+            for row, (y_start, y_length) in enumerate(zip(y_starts, y_lengths, strict=True))
+            for column, (x_start, x_length) in enumerate(zip(x_starts, x_lengths, strict=True))
+        ]
+        latent_height = y_lengths[0] // self.vae_ratio
+        latent_width = x_lengths[0] // self.vae_ratio
+        single_shape = (
+            1,
+            self.channels["prelude"],
+            self.temporal_tokens,
+            latent_height,
+            latent_width,
+        )
+        prelude_shape = (len(tile_entries), *single_shape[1:])
+        prelude_batch = ort.OrtValue.ortvalue_from_shape_and_type(
+            prelude_shape,
+            np.float16,
+            "cuda",
+            self._runner.device_index,
+        )
+        tile_bytes = int(np.prod(single_shape, dtype=np.int64)) * np.dtype(np.float16).itemsize
+        prelude_session = self._sessions["prelude"]
+        for tile_index, (row, column, y_start, y_length, x_start, x_length) in enumerate(tile_entries):
+            details = {
+                "event": "tile_start",
+                "temporal_clip": temporal_index + 1,
+                "temporal_clips": temporal_clips,
+                "tile": tile_index + 1,
+                "tiles": len(tile_entries),
+                "row": row + 1,
+                "rows": len(y_starts),
+                "column": column + 1,
+                "columns": len(x_starts),
+                "provider": self.provider,
+                "stage": "prelude",
+            }
+            self._emit(callback, "Staged encoder prelude tile", **details)
+            started = time.perf_counter()
+            tile = np.ascontiguousarray(
+                clip[:, :, :, y_start : y_start + y_length, x_start : x_start + x_length],
+                dtype=np.float16,
+            )
+            input_value = ort.OrtValue.ortvalue_from_numpy(
+                tile,
+                "cuda",
+                self._runner.device_index,
+            )
+            binding = None
+            try:
+                binding = prelude_session.io_binding()  # type: ignore[attr-defined]
+                binding.bind_ortvalue_input("pixels", input_value)
+                binding.bind_output(
+                    "prelude_activation",
+                    "cuda",
+                    self._runner.device_index,
+                    np.float16,
+                    single_shape,
+                    prelude_batch.data_ptr() + tile_index * tile_bytes,
+                )
+                binding.synchronize_inputs()
+                prelude_session.run_with_iobinding(binding)  # type: ignore[attr-defined]
+                binding.synchronize_outputs()
+            finally:
+                _release_io_binding(binding)
+            self._emit(
+                callback,
+                "Staged encoder prelude tile complete",
+                **{**details, "event": "tile_complete", "elapsed_seconds": time.perf_counter() - started},
+            )
+
+        self._emit(
+            callback,
+            "Staged encoder late tile batch",
+            temporal_clip=temporal_index + 1,
+            temporal_clips=temporal_clips,
+            tiles=len(tile_entries),
+            stage="late",
+            provider=self.provider,
+        )
+        late_shape = (
+            len(tile_entries),
+            self.channels["late"],
+            self.temporal_tokens,
+            latent_height,
+            latent_width,
+        )
+        late_batch = self._run_cuda_stage(
+            self._sessions["late"],
+            "prelude_activation",
+            prelude_batch,
+            "late_activation",
+            late_shape,
+        )
+        del prelude_batch
+
+        self._emit(
+            callback,
+            "Staged encoder head tile batch",
+            temporal_clip=temporal_index + 1,
+            temporal_clips=temporal_clips,
+            tiles=len(tile_entries),
+            stage="head",
+            provider=self.provider,
+        )
+        moments_shape = (
+            len(tile_entries),
+            self.channels["moments"],
+            self.temporal_tokens,
+            latent_height,
+            latent_width,
+        )
+        moments_device = self._run_cuda_stage(
+            self._sessions["head"],
+            "late_activation",
+            late_batch,
+            "moments",
+            moments_shape,
+        )
+        del late_batch
+        moments_batch = moments_device.numpy()
+        del moments_device
+        encoded_tiles = {
+            (row, column): moments_batch[index : index + 1]
+            for index, (row, column, *_rest) in enumerate(tile_entries)
+        }
+        return _assemble_video_vae_tiles(
+            encoded_tiles,
+            y_starts,
+            [value // self.vae_ratio for value in y_overlaps],
+            x_starts,
+            [value // self.vae_ratio for value in x_overlaps],
+            int(clip.shape[3]) // self.vae_ratio,
+            int(clip.shape[4]) // self.vae_ratio,
+        )
+
+    def _encode_clip_cpu(
+        self,
+        clip: np.ndarray,
+        tile_size: int,
+        callback: Callable[[dict[str, object]], None] | None,
+        temporal_index: int,
+        temporal_clips: int,
+    ) -> np.ndarray:
+        y_starts, y_lengths, y_overlaps = _split_tiles(
+            int(clip.shape[3]), tile_size, self.tile_overlap_min, self.vae_ratio
+        )
+        x_starts, x_lengths, x_overlaps = _split_tiles(
+            int(clip.shape[4]), tile_size, self.tile_overlap_min, self.vae_ratio
+        )
+        entries = [
+            (row, column, y_start, y_length, x_start, x_length)
+            for row, (y_start, y_length) in enumerate(zip(y_starts, y_lengths, strict=True))
+            for column, (x_start, x_length) in enumerate(zip(x_starts, x_lengths, strict=True))
+        ]
+        preludes: list[np.ndarray] = []
+        for tile_index, (row, column, y_start, y_length, x_start, x_length) in enumerate(entries):
+            self._emit(
+                callback,
+                "Staged encoder CPU prelude tile",
+                temporal_clip=temporal_index + 1,
+                temporal_clips=temporal_clips,
+                tile=tile_index + 1,
+                tiles=len(entries),
+                row=row + 1,
+                column=column + 1,
+                provider=self.provider,
+                stage="prelude",
+            )
+            tile = np.ascontiguousarray(
+                clip[:, :, :, y_start : y_start + y_length, x_start : x_start + x_length],
+                dtype=np.float16,
+            )
+            preludes.append(
+                self._sessions["prelude"].run(None, {"pixels": tile})[0]  # type: ignore[attr-defined]
+            )
+        prelude_batch = np.concatenate(preludes, axis=0)
+        late_batch = self._sessions["late"].run(  # type: ignore[attr-defined]
+            None, {"prelude_activation": prelude_batch}
+        )[0]
+        moments_batch = self._sessions["head"].run(  # type: ignore[attr-defined]
+            None, {"late_activation": late_batch}
+        )[0]
+        encoded_tiles = {
+            (row, column): moments_batch[index : index + 1]
+            for index, (row, column, *_rest) in enumerate(entries)
+        }
+        return _assemble_video_vae_tiles(
+            encoded_tiles,
+            y_starts,
+            [value // self.vae_ratio for value in y_overlaps],
+            x_starts,
+            [value // self.vae_ratio for value in x_overlaps],
+            int(clip.shape[3]) // self.vae_ratio,
+            int(clip.shape[4]) // self.vae_ratio,
+        )
+
+    def _encode_with_tile_size(
+        self,
+        pixels: np.ndarray,
+        tile_size: int,
+        callback: Callable[[dict[str, object]], None] | None,
+    ) -> np.ndarray:
+        temporal_clips = int(np.ceil(pixels.shape[2] / self.clip_length))
+        clip_moments: list[np.ndarray] = []
+        for temporal_index in range(temporal_clips):
+            self._emit(
+                callback,
+                "Staged encoder temporal clip",
+                event="temporal_clip_start",
+                temporal_clip=temporal_index + 1,
+                temporal_clips=temporal_clips,
+                provider=self.provider,
+                tile_size=tile_size,
+            )
+            clip = pixels[
+                :,
+                :,
+                temporal_index * self.clip_length : (temporal_index + 1) * self.clip_length,
+                :,
+                :,
+            ]
+            if clip.shape[2] < self.clip_length:
+                clip = np.concatenate(
+                    (clip, np.repeat(clip[:, :, -1:], self.clip_length - clip.shape[2], axis=2)),
+                    axis=2,
+                )
+            if self.provider == "CUDAExecutionProvider":
+                clip_moments.append(
+                    self._encode_clip_cuda(clip, tile_size, callback, temporal_index, temporal_clips)
+                )
+            else:
+                clip_moments.append(
+                    self._encode_clip_cpu(clip, tile_size, callback, temporal_index, temporal_clips)
+                )
+        moments = np.concatenate(clip_moments, axis=2)
+        if self.token_drop > 0:
+            moments = moments[:, :, :-self.token_drop]
+        mean = np.split(moments.astype(np.float32, copy=False), 2, axis=1)[0]
+        latent_mean = np.asarray(LATENTS_MEAN, dtype=np.float32).reshape(1, -1, 1, 1, 1)
+        latent_std = np.asarray(LATENTS_STD, dtype=np.float32).reshape(1, -1, 1, 1, 1)
+        return (mean - latent_mean) / latent_std
+
+    def encode(
+        self,
+        pixels: np.ndarray,
+        callback: Callable[[dict[str, object]], None] | None = None,
+    ) -> np.ndarray:
+        candidates = [value for value in (512, 448, 384, 320, 256) if value <= self.tile_size]
+        last_error: Exception | None = None
+        for tile_size in candidates:
+            try:
+                result = self._encode_with_tile_size(pixels, tile_size, callback)
+                self.tile_size = tile_size
+                return result
+            except RuntimeError as exc:
+                if not any(marker in str(exc).lower() for marker in ("out of memory", "cuda error 2")):
+                    raise
+                last_error = exc
+                if tile_size != candidates[-1]:
+                    next_tile = candidates[candidates.index(tile_size) + 1]
+                    self._emit(
+                        callback,
+                        "Rebuilding staged encoder after CUDA OOM",
+                        from_tile_size=tile_size,
+                        to_tile_size=next_tile,
+                    )
+                    self._reload_sessions()
+        assert last_error is not None
+        raise last_error
+
+
+class ONNXVideoVAEEncoder:
+    """Progressively tile early levels and stream compact encoder stages."""
+
+    _h3_onnx_runtime = True
+
+    def __init__(self, directory: Path, prefer_cuda: bool = True):
+        if not video_vae_temporal_encoder_ready(directory):
+            raise ValueError(f"Progressive temporal Video VAE encoder is not ready: {directory}")
+        from h3_workbench.inference_runtime import ORTGraphRunner, _preload_tensorrt_dlls
+
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        encoder = manifest["temporal_encoder"]
+        self.directory = directory.resolve()
+        self.clip_length = int(encoder["clip_frames"])
+        self.token_drop = int(encoder["token_drop"])
+        self.vae_ratio = int(encoder["spatial_ratio"])
+        self.temporal_tokens = int(encoder["temporal_tokens"])
+        self.channels = {name: int(value) for name, value in encoder["channels"].items()}
+        self._graphs = {name: self.directory / str(value) for name, value in encoder["graphs"].items()}
+        self._runner = ORTGraphRunner(prefer_cuda=prefer_cuda, prefetch_depth=0)
+        self.provider = self._runner.provider
+        if self.provider == "CUDAExecutionProvider":
+            import onnxruntime as ort
+
+            self._runner.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            self._runner.enable_mem_pattern = True
+            self._runner.cudnn_conv_use_max_workspace = True
+        self.tensorrt_enabled = False
+        self.tensorrt_fallback_reason: str | None = None
+        self._tensorrt_cache_root = Path(
+            os.environ.get(
+                "H3_VAE_TENSORRT_CACHE",
+                str(Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "h3-workbench" / "tensorrt-cache" / "video-encoder"),
+            )
+        )
+        if (
+            self.provider == "CUDAExecutionProvider"
+            and os.environ.get("H3_VAE_TENSORRT", "1") != "0"
+        ):
+            try:
+                _preload_tensorrt_dlls()
+                import onnxruntime as ort
+
+                self.tensorrt_enabled = "TensorrtExecutionProvider" in ort.get_available_providers()
+                if self.tensorrt_enabled:
+                    self._tensorrt_cache_root.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:  # noqa: BLE001 - CUDA remains the validated fallback
+                self.tensorrt_fallback_reason = str(exc)
+        self.tile_overlap_min = 32 if self.provider == "CUDAExecutionProvider" else 64
+        self.stage1_overlap = 16 if self.provider == "CUDAExecutionProvider" else 32
+        total_bytes = 0
+        if self.provider == "CUDAExecutionProvider" and torch.cuda.is_available():
+            try:
+                _, total_bytes = torch.cuda.mem_get_info()
+            except RuntimeError:
+                pass
+        if total_bytes >= 10 * 1024**3:
+            self.tile_height, self.tile_width = 768, 1024
+            self.stage1_tile_height, self.stage1_tile_width = 384, 512
+        elif total_bytes >= 3 * 1024**3:
+            self.tile_height, self.tile_width = 208, 264
+            self.stage1_tile_height, self.stage1_tile_width = 136, 144
+        else:
+            self.tile_height, self.tile_width = 256, 320
+            self.stage1_tile_height, self.stage1_tile_width = 128, 128
+        self.tile_size = self.tile_height
+
+    def _session(self, stage: str) -> object:
+        if not self.tensorrt_enabled or stage not in {"prelude", "late"}:
+            return self._runner.session(self._graphs[stage])
+        import onnxruntime as ort
+
+        cache = self._tensorrt_cache_root / stage
+        cache.mkdir(parents=True, exist_ok=True)
+        options = ort.SessionOptions()
+        options.log_severity_level = 3
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        providers = ["TensorrtExecutionProvider", "CUDAExecutionProvider"]
+        provider_options = [
+            {
+                "trt_engine_cache_enable": "True",
+                "trt_engine_cache_path": str(cache),
+                "trt_fp16_enable": "True",
+                "trt_builder_optimization_level": "3",
+                "trt_max_workspace_size": str(1024**3),
+            },
+            {
+                "device_id": str(self._runner.device_index),
+                "arena_extend_strategy": "kSameAsRequested",
+                "cudnn_conv_use_max_workspace": "1",
+            },
+        ]
+        try:
+            session = ort.InferenceSession(
+                str(self._graphs[stage]),
+                sess_options=options,
+                providers=providers,
+                provider_options=provider_options,
+            )
+            if "TensorrtExecutionProvider" not in session.get_providers():
+                raise RuntimeError("ONNX Runtime did not activate TensorRTExecutionProvider")
+            return session
+        except Exception as exc:  # noqa: BLE001 - keep the CUDA path operational
+            self.tensorrt_enabled = False
+            self.tensorrt_fallback_reason = str(exc)
+            return self._runner.session(self._graphs[stage])
+
+    def close(self) -> None:
+        self._runner.close()
+        gc.collect()
+
+    @staticmethod
+    def _emit(
+        callback: Callable[[dict[str, object]], None] | None,
+        operation: str,
+        **details: object,
+    ) -> None:
+        if callback is not None:
+            callback({"module": "Video VAE", "operation": operation, **details})
+
+    def _run_cuda_to_device(
+        self,
+        session: object,
+        input_name: str,
+        values: np.ndarray | object,
+        output_name: str,
+        output_shape: tuple[int, ...],
+    ) -> object:
+        import onnxruntime as ort
+
+        input_value = (
+            values
+            if isinstance(values, ort.OrtValue)
+            else ort.OrtValue.ortvalue_from_numpy(
+                np.ascontiguousarray(values, dtype=np.float16),
+                "cuda",
+                self._runner.device_index,
+            )
+        )
+        output = ort.OrtValue.ortvalue_from_shape_and_type(
+            output_shape,
+            np.float16,
+            "cuda",
+            self._runner.device_index,
+        )
+        binding = None
+        try:
+            binding = session.io_binding()  # type: ignore[attr-defined]
+            binding.bind_ortvalue_input(input_name, input_value)
+            binding.bind_ortvalue_output(output_name, output)
+            binding.synchronize_inputs()
+            session.run_with_iobinding(binding)  # type: ignore[attr-defined]
+            binding.synchronize_outputs()
+            return output
+        finally:
+            _release_io_binding(binding)
+
+    def _run_to_host(
+        self,
+        session: object,
+        input_name: str,
+        values: np.ndarray,
+        output_name: str,
+        output_shape: tuple[int, ...],
+    ) -> np.ndarray:
+        if self.provider != "CUDAExecutionProvider":
+            return session.run(  # type: ignore[attr-defined]
+                [output_name],
+                {input_name: np.ascontiguousarray(values, dtype=np.float16)},
+            )[0]
+        output = self._run_cuda_to_device(
+            session,
+            input_name,
+            values,
+            output_name,
+            output_shape,
+        )
+        return output.numpy()  # type: ignore[no-any-return,union-attr]
+
+    def _run_tiled_stage(
+        self,
+        session: object,
+        values: np.ndarray,
+        *,
+        input_name: str,
+        output_name: str,
+        output_channels: int,
+        output_frames: int,
+        tile_height: int,
+        tile_width: int,
+        overlap: int,
+        stage: str,
+        temporal_index: int,
+        temporal_clips: int,
+        callback: Callable[[dict[str, object]], None] | None,
+    ) -> np.ndarray:
+        y_starts, y_lengths, y_overlaps = _split_tiles(
+            int(values.shape[3]), tile_height, overlap, 2
+        )
+        x_starts, x_lengths, x_overlaps = _split_tiles(
+            int(values.shape[4]), tile_width, overlap, 2
+        )
+        entries = [
+            (row, column, y_start, y_length, x_start, x_length)
+            for row, (y_start, y_length) in enumerate(zip(y_starts, y_lengths, strict=True))
+            for column, (x_start, x_length) in enumerate(zip(x_starts, x_lengths, strict=True))
+        ]
+        outputs: dict[tuple[int, int], np.ndarray] = {}
+        for tile_index, (row, column, y_start, y_length, x_start, x_length) in enumerate(entries):
+            details = {
+                "event": "tile_start",
+                "temporal_clip": temporal_index + 1,
+                "temporal_clips": temporal_clips,
+                "tile": tile_index + 1,
+                "tiles": len(entries),
+                "row": row + 1,
+                "rows": len(y_starts),
+                "column": column + 1,
+                "columns": len(x_starts),
+                "stage": stage,
+                "provider": self.provider,
+            }
+            self._emit(callback, f"Progressive encoder {stage} tile", **details)
+            started = time.perf_counter()
+            tile = values[
+                :,
+                :,
+                :,
+                y_start : y_start + y_length,
+                x_start : x_start + x_length,
+            ]
+            output_shape = (
+                1,
+                output_channels,
+                output_frames,
+                y_length // 2,
+                x_length // 2,
+            )
+            outputs[(row, column)] = self._run_to_host(
+                session,
+                input_name,
+                tile,
+                output_name,
+                output_shape,
+            )
+            self._emit(
+                callback,
+                f"Progressive encoder {stage} tile complete",
+                **{**details, "event": "tile_complete", "elapsed_seconds": time.perf_counter() - started},
+            )
+        return _assemble_video_vae_tiles(
+            outputs,
+            y_starts,
+            [value // 2 for value in y_overlaps],
+            x_starts,
+            [value // 2 for value in x_overlaps],
+            int(values.shape[3]) // 2,
+            int(values.shape[4]) // 2,
+            canvas_dtype=None,
+        )
+
+    def _encode_clip(
+        self,
+        clip: np.ndarray,
+        tile_height: int,
+        tile_width: int,
+        temporal_index: int,
+        temporal_clips: int,
+        callback: Callable[[dict[str, object]], None] | None,
+    ) -> np.ndarray:
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-encoder-stage")
+        session = self._session("prelude")
+        next_session = executor.submit(self._session, "late")
+        try:
+            try:
+                stage0 = self._run_tiled_stage(
+                    session,
+                    clip,
+                    input_name="pixels",
+                    output_name="stage0_activation",
+                    output_channels=self.channels["prelude"],
+                    output_frames=self.clip_length,
+                    tile_height=tile_height,
+                    tile_width=tile_width,
+                    overlap=self.tile_overlap_min,
+                    stage="stage 0",
+                    temporal_index=temporal_index,
+                    temporal_clips=temporal_clips,
+                    callback=callback,
+                )
+            finally:
+                del session
+                gc.collect()
+
+            session = next_session.result()
+            next_session = executor.submit(self._session, "tail")
+            try:
+                stage1 = self._run_tiled_stage(
+                    session,
+                    stage0,
+                    input_name="stage0_activation",
+                    output_name="stage1_activation",
+                    output_channels=self.channels["late"],
+                    output_frames=9,
+                    tile_height=(
+                        self.stage1_tile_height
+                        if tile_height == self.tile_height
+                        else max(96, tile_height // 2)
+                    ),
+                    tile_width=(
+                        self.stage1_tile_width
+                        if tile_width == self.tile_width
+                        else max(96, tile_width // 2)
+                    ),
+                    overlap=self.stage1_overlap,
+                    stage="stage 1",
+                    temporal_index=temporal_index,
+                    temporal_clips=temporal_clips,
+                    callback=callback,
+                )
+            finally:
+                del stage0
+                del session
+                gc.collect()
+
+            tail_shape = (
+                1,
+                self.channels["tail"],
+                self.temporal_tokens,
+                int(stage1.shape[3]) // 4,
+                int(stage1.shape[4]) // 4,
+            )
+            self._emit(
+                callback,
+                "Progressive encoder compact tail",
+                temporal_clip=temporal_index + 1,
+                temporal_clips=temporal_clips,
+                stage="tail",
+                provider=self.provider,
+            )
+            session = next_session.result()
+            next_session = executor.submit(self._session, "head")
+            try:
+                if self.provider == "CUDAExecutionProvider":
+                    tail = self._run_cuda_to_device(
+                        session,
+                        "stage1_activation",
+                        stage1,
+                        "tail_activation",
+                        tail_shape,
+                    )
+                else:
+                    tail = session.run(  # type: ignore[attr-defined]
+                        ["tail_activation"], {"stage1_activation": stage1}
+                    )[0]
+            finally:
+                del stage1
+                del session
+                gc.collect()
+
+            moments_shape = (
+                1,
+                self.channels["moments"],
+                self.temporal_tokens,
+                tail_shape[3],
+                tail_shape[4],
+            )
+            self._emit(
+                callback,
+                "Progressive encoder head",
+                temporal_clip=temporal_index + 1,
+                temporal_clips=temporal_clips,
+                stage="head",
+                provider=self.provider,
+            )
+            session = next_session.result()
+            try:
+                if self.provider == "CUDAExecutionProvider":
+                    moments_device = self._run_cuda_to_device(
+                        session,
+                        "tail_activation",
+                        tail,
+                        "moments",
+                        moments_shape,
+                    )
+                    moments = moments_device.numpy()  # type: ignore[union-attr]
+                    del moments_device
+                else:
+                    moments = session.run(  # type: ignore[attr-defined]
+                        ["moments"], {"tail_activation": tail}
+                    )[0]
+            finally:
+                del tail
+                del session
+                gc.collect()
+            return moments
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def _encode_with_tiles(
+        self,
+        pixels: np.ndarray,
+        tile_height: int,
+        tile_width: int,
+        callback: Callable[[dict[str, object]], None] | None,
+    ) -> np.ndarray:
+        temporal_clips = int(np.ceil(pixels.shape[2] / self.clip_length))
+        clip_moments: list[np.ndarray] = []
+        for temporal_index in range(temporal_clips):
+            self._emit(
+                callback,
+                "Progressive encoder temporal clip",
+                event="temporal_clip_start",
+                temporal_clip=temporal_index + 1,
+                temporal_clips=temporal_clips,
+                provider=self.provider,
+                tile_height=tile_height,
+                tile_width=tile_width,
+            )
+            clip = pixels[
+                :,
+                :,
+                temporal_index * self.clip_length : (temporal_index + 1) * self.clip_length,
+                :,
+                :,
+            ]
+            if clip.shape[2] < self.clip_length:
+                clip = np.concatenate(
+                    (clip, np.repeat(clip[:, :, -1:], self.clip_length - clip.shape[2], axis=2)),
+                    axis=2,
+                )
+            clip_moments.append(
+                self._encode_clip(
+                    clip,
+                    tile_height,
+                    tile_width,
+                    temporal_index,
+                    temporal_clips,
+                    callback,
+                )
+            )
+        moments = np.concatenate(clip_moments, axis=2)
+        if self.token_drop > 0:
+            moments = moments[:, :, :-self.token_drop]
+        mean = np.split(moments.astype(np.float32, copy=False), 2, axis=1)[0]
+        latent_mean = np.asarray(LATENTS_MEAN, dtype=np.float32).reshape(1, -1, 1, 1, 1)
+        latent_std = np.asarray(LATENTS_STD, dtype=np.float32).reshape(1, -1, 1, 1, 1)
+        return (mean - latent_mean) / latent_std
+
+    def encode(
+        self,
+        pixels: np.ndarray,
+        callback: Callable[[dict[str, object]], None] | None = None,
+    ) -> np.ndarray:
+        candidates = [
+            (self.tile_height, self.tile_width),
+            (192, 256),
+            (160, 224),
+            (128, 192),
+        ]
+        candidates = list(dict.fromkeys(candidates))
+        last_error: Exception | None = None
+        for index, (tile_height, tile_width) in enumerate(candidates):
+            try:
+                result = self._encode_with_tiles(pixels, tile_height, tile_width, callback)
+                self.tile_height, self.tile_width = tile_height, tile_width
+                self.tile_size = tile_height
+                return result
+            except RuntimeError as exc:
+                if not any(marker in str(exc).lower() for marker in ("out of memory", "cuda error 2")):
+                    raise
+                last_error = exc
+                if index + 1 < len(candidates):
+                    self._emit(
+                        callback,
+                        "Reducing progressive encoder tiles after CUDA OOM",
+                        from_tile=[tile_height, tile_width],
+                        to_tile=list(candidates[index + 1]),
+                    )
+        assert last_error is not None
+        raise last_error
+
+    def encode_image(
+        self,
+        pixels: np.ndarray,
+        callback: Callable[[dict[str, object]], None] | None = None,
+    ) -> np.ndarray:
+        """Encode one image using the causal token equivalent to encode_images()."""
+        if pixels.ndim != 5 or pixels.shape[:3] != (1, 3, 1):
+            raise ValueError("Image encoder expects pixels with shape [1, 3, 1, H, W]")
+        # The validated staged graphs have a fixed 17-frame temporal axis. For
+        # a repeated image, causal token zero is numerically equivalent to the
+        # official process_image=True path; later tokens contain video history.
+        repeated = np.repeat(pixels, self.clip_length, axis=2)
+        latent = self.encode(np.ascontiguousarray(repeated, dtype=np.float16), callback)
+        if latent.shape[2] < 1:
+            raise RuntimeError("Video VAE image encode returned no latent token")
+        return np.ascontiguousarray(latent[:, :, :1], dtype=np.float32)
+
+
+def load_video_vae_onnx_encoder(directory: Path, prefer_cuda: bool = True) -> ONNXVideoVAEEncoder:
+    return ONNXVideoVAEEncoder(directory, prefer_cuda=prefer_cuda)
+
+
+def load_video_vae_for_encoding(
+    checkpoint: Path,
+    prefer_cuda: bool = True,
+    tile_size: int | None = None,
+    tile_overlap_min: int | None = None,
+) -> MiniMaxH3VideoVAE:
+    """Load only the Video VAE encoder subgraph, leaving the decoder unmapped."""
+    from h3_workbench.device_profile import selected_device_index, torch_cuda_architecture_supported
+
+    device_index = selected_device_index() if torch.cuda.is_available() else 0
+    cuda_device = f"cuda:{device_index}"
+    use_cuda = (
+        prefer_cuda
+        and torch.cuda.is_available()
+        and torch_cuda_architecture_supported(device_index)
+    )
+    cuda_fallback_reason = None
+    total_vram_bytes = 0
+    if prefer_cuda and torch.cuda.is_available() and not use_cuda:
+        cuda_fallback_reason = (
+            "PyTorch build does not contain kernels for the selected CUDA architecture; "
+            "using CPU Video VAE encoding"
+        )
+    free_bytes = 0
+    if use_cuda:
+        free_bytes, total_vram_bytes = torch.cuda.mem_get_info(device_index)
+    if tile_size is None:
+        tile_size = 256
+        if use_cuda:
+            if free_bytes >= 10 * 1024**3:
+                tile_size = 512
+            elif free_bytes >= 3 * 1024**3:
+                tile_size = 384
+            elif free_bytes >= 1536 * 1024**2:
+                tile_size = 320
+    if tile_overlap_min is None:
+        # On low-VRAM devices this removes one complete spatial row for 736p
+        # input (3x3 encoder tiles become 2x3). Larger devices retain 64px.
+        tile_overlap_min = _video_vae_encoder_overlap(use_cuda, total_vram_bytes)
+    if tile_overlap_min < 16 or tile_overlap_min % 16 != 0:
+        raise ValueError(
+            "Video VAE encoder tile_overlap_min must be a multiple of 16 and at least 16"
+        )
+    if tile_size < 256 or tile_size % 16 != 0:
+        raise ValueError("Video VAE encoder tile_size must be a multiple of 16 and at least 256")
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float16)
+    try:
+        with torch.device("meta"):
+            model = MiniMaxH3VideoVAE(
+                tiling=True,
+                tile_size=tile_size,
+                tile_overlap_min=tile_overlap_min,
+            )
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+    encoder_keys = {
+        name
+        for name in model.state_dict()
+        if name.startswith("encoder.") or name.startswith("quant_conv.") or name in {"latents_mean", "latents_std"}
+    }
+    state: dict[str, torch.Tensor] = {}
+    with safe_open(str(checkpoint), framework="pt", device="cpu") as handle:
+        available = set(handle.keys())
+        for name in sorted(encoder_keys & available):
+            state[name] = handle.get_tensor(name)
+    incompatible = model.load_state_dict(state, strict=False, assign=True)
+    unexpected = set(incompatible.unexpected_keys)
+    if unexpected:
+        raise RuntimeError(f"Unexpected Video VAE encoder weights: {sorted(unexpected)}")
+    del state
+
+    model.pixel_mean = torch.tensor(IMAGENET_MEAN, dtype=torch.float16).view(1, 3, 1, 1, 1)
+    model.pixel_std = torch.tensor(IMAGENET_STD, dtype=torch.float16).view(1, 3, 1, 1, 1)
+    del model.decoder
+    del model.post_quant_conv
+    model._h3_prefer_cuda = use_cuda  # type: ignore[attr-defined]
+    model._h3_cuda_device = cuda_device  # type: ignore[attr-defined]
+    model._h3_cuda_fallback_reason = cuda_fallback_reason  # type: ignore[attr-defined]
+    model._h3_tile_size = tile_size  # type: ignore[attr-defined]
+    model._h3_tile_overlap = tile_overlap_min  # type: ignore[attr-defined]
+    model._h3_channels_last_3d = bool(use_cuda)  # type: ignore[attr-defined]
+    model._h3_cuda_oom = False  # type: ignore[attr-defined]
+    if use_cuda:
+        try:
+            # CUDA Conv3d has a fast channels-last-3d path. CPU fallback stays
+            # contiguous because this format is not consistently faster there.
+            model.to(device=cuda_device, memory_format=torch.channels_last_3d)
+            torch.backends.cudnn.benchmark = True
+        except RuntimeError as exc:
+            if not any(marker in str(exc).lower() for marker in ("out of memory", "cuda error 2")):
+                raise
+            model._h3_cuda_oom = True  # type: ignore[attr-defined]
+            model.to(device="cpu", memory_format=torch.contiguous_format)
+            torch.cuda.empty_cache()
+    else:
+        model.to("cpu")
+    model.eval().requires_grad_(False)
+    return model
+
+
+def encode_image_frame(
+    model: MiniMaxH3VideoVAE | ONNXVideoVAEEncoder,
+    pixels: np.ndarray,
+    callback: Callable[[dict[str, object]], None] | None = None,
+    offload_after: bool = True,
+) -> np.ndarray:
+    """Encode one reference image into one normalized Video VAE token."""
+    if pixels.ndim != 5 or pixels.shape[:3] != (1, 3, 1):
+        raise ValueError("Image encoder expects pixels with shape [1, 3, 1, H, W]")
+    if isinstance(model, ONNXVideoVAEEncoder):
+        if callback is not None:
+            callback(
+                {
+                    "module": "Video VAE",
+                    "operation": "Encoding single-image conditioning",
+                    "frames": 1,
+                    "height": int(pixels.shape[3]),
+                    "width": int(pixels.shape[4]),
+                    "provider": model.provider,
+                    "backend": "onnxruntime",
+                    "protocol": "causal_token_zero",
+                }
+            )
+        result = model.encode_image(np.ascontiguousarray(pixels, dtype=np.float16), callback)
+    else:
+        result = encode_video_frames(
+            model,
+            pixels,
+            callback=callback,
+            offload_after=offload_after,
+        )
+    if result.shape[2] != 1:
+        raise RuntimeError(f"Video VAE image encode returned {result.shape[2]} latent tokens")
+    if not np.isfinite(result).all():
+        invalid = int((~np.isfinite(result)).sum())
+        raise FloatingPointError(f"Non-finite Video VAE image encoder output: {invalid} invalid values")
+    return np.ascontiguousarray(result, dtype=np.float32)
+
+
+def encode_video_frames(
+    model: MiniMaxH3VideoVAE | ONNXVideoVAEEncoder,
+    pixels: np.ndarray,
+    callback: Callable[[dict[str, object]], None] | None = None,
+    offload_after: bool = True,
+) -> np.ndarray:
+    """Encode ``[1, 3, T, H, W]`` pixels into normalized VAE latents.
+
+    ``offload_after`` is intentionally configurable for segmented super
+    resolution.  Encoding all segments as one GPU phase avoids moving the
+    (large) PyTorch encoder weights to CPU and back for every segment.  The
+    default remains ``True`` so callers that interleave encoding with another
+    GPU workload retain the previous low-VRAM behaviour.
+    """
+    if pixels.ndim != 5 or pixels.shape[0] != 1 or pixels.shape[1] != 3:
+        raise ValueError("Video encoder expects pixels with shape [1, 3, T, H, W]")
+    if isinstance(model, ONNXVideoVAEEncoder):
+        if callback is not None:
+            callback(
+                {
+                    "module": "Video VAE",
+                    "operation": "Encoding temporal/spatial conditioning",
+                    "frames": int(pixels.shape[2]),
+                    "height": int(pixels.shape[3]),
+                    "width": int(pixels.shape[4]),
+                    "provider": model.provider,
+                    "tile_size": model.tile_size,
+                    "tile_overlap": model.tile_overlap_min,
+                    "backend": "onnxruntime",
+                }
+            )
+        result = model.encode(np.ascontiguousarray(pixels, dtype=np.float16), callback)
+        if not np.isfinite(result).all():
+            invalid = int((~np.isfinite(result)).sum())
+            raise FloatingPointError(f"Non-finite Video VAE encoder output: {invalid} invalid values")
+        return result
+
+    def is_cuda_failure(error: RuntimeError) -> bool:
+        message = str(error).lower()
+        return any(
+            marker in message
+            for marker in (
+                "out of memory",
+                "cuda error 2",
+                "no kernel image",
+                "not implemented for",
+                "not supported on this gpu",
+            )
+        )
+
+    current_device = next(model.parameters()).device
+    if (
+        current_device.type == "cpu"
+        and getattr(model, "_h3_prefer_cuda", False)
+        and not getattr(model, "_h3_cuda_oom", False)
+    ):
+        try:
+            model.to(
+                device=getattr(model, "_h3_cuda_device", "cuda"),
+                memory_format=torch.channels_last_3d,
+            )
+        except RuntimeError as exc:
+            if not is_cuda_failure(exc):
+                raise
+            model._h3_cuda_oom = True  # type: ignore[attr-defined]
+            model.to("cpu")
+            torch.cuda.empty_cache()
+    if callback is not None:
+        tile_size = int(getattr(model, "_h3_tile_size", getattr(model, "tile_size", 256)))
+        tile_overlap = int(
+            getattr(model, "_h3_tile_overlap", getattr(model, "tile_overlap_min", 64))
+        )
+        y_tiles = len(model.split_tiles(int(pixels.shape[3]))[0])
+        x_tiles = len(model.split_tiles(int(pixels.shape[4]))[0])
+        callback(
+            {
+                "module": "Video VAE",
+                "operation": "Encoding temporal/spatial conditioning",
+                "frames": int(pixels.shape[2]),
+                "height": int(pixels.shape[3]),
+                "width": int(pixels.shape[4]),
+                "provider": str(next(model.parameters()).device),
+                "tile_size": tile_size,
+                "tile_overlap": tile_overlap,
+                "tiles_per_temporal_clip": y_tiles * x_tiles,
+                "fallback_reason": getattr(model, "_h3_cuda_fallback_reason", None),
+            }
+        )
+    device = next(model.parameters()).device
+    input_tensor = torch.from_numpy(np.ascontiguousarray(pixels, dtype=np.float16))
+    if device.type == "cuda":
+        try:
+            # Temporal chunks are copied one at a time. A pinned source makes
+            # those copies asynchronous and avoids a pageable-memory stall at
+            # every 17-frame boundary.
+            input_tensor = input_tensor.pin_memory()
+        except RuntimeError:
+            pass
+
+    def encode_progress(details: dict[str, object]) -> None:
+        if callback is None:
+            return
+        event = str(details.get("event", ""))
+        if event == "tile_complete":
+            operation = "Video VAE encoder tile complete"
+        elif event == "tile_start":
+            operation = "Video VAE encoder tile"
+        else:
+            operation = "Video VAE encoder temporal clip"
+        callback({"module": "Video VAE", "operation": operation, **details})
+
+    def next_tile_size(size: int) -> int | None:
+        candidates = (512, 448, 384, 320, 256)
+        smaller = [candidate for candidate in candidates if candidate < size]
+        return max(smaller) if smaller else None
+
+    latent = None
+    while latent is None:
+        try:
+            with torch.inference_mode():
+                latent = model.encode(input_tensor, device=device, callback=encode_progress)
+        except RuntimeError as exc:
+            if device.type != "cuda" or not is_cuda_failure(exc):
+                raise
+            current_tile = int(getattr(model, "tile_size", getattr(model, "_h3_tile_size", 256)))
+            smaller_tile = next_tile_size(current_tile)
+            if smaller_tile is not None:
+                model.tile_size = smaller_tile
+                model._h3_tile_size = smaller_tile  # type: ignore[attr-defined]
+                model.tile_overlap_min = min(
+                    int(getattr(model, "tile_overlap_min", 64)),
+                    32,
+                )
+                model._h3_tile_overlap = model.tile_overlap_min  # type: ignore[attr-defined]
+                model._h3_cuda_fallback_reason = (
+                    f"encoder tile {current_tile} exceeded available VRAM; retrying at {smaller_tile}"
+                )  # type: ignore[attr-defined]
+                if callback is not None:
+                    callback(
+                        {
+                            "module": "Video VAE",
+                            "operation": "Reducing encoder tile after CUDA OOM",
+                            "from_tile_size": current_tile,
+                            "to_tile_size": smaller_tile,
+                        }
+                    )
+                torch.cuda.empty_cache()
+                continue
+            # Only give up on CUDA after every safe tile size has failed. The
+            # previous implementation fell back after the first OOM and could
+            # silently turn a GPU job into a very slow CPU encode.
+            model._h3_cuda_oom = True  # type: ignore[attr-defined]
+            model._h3_cuda_fallback_reason = str(exc)  # type: ignore[attr-defined]
+            model.to(device="cpu", memory_format=torch.contiguous_format)
+            torch.cuda.empty_cache()
+            device = torch.device("cpu")
+            with torch.inference_mode():
+                latent = model.encode(input_tensor, device=device, callback=encode_progress)
+    result = latent.detach().cpu().numpy().astype(np.float32, copy=False)
+    if offload_after and next(model.parameters()).device.type == "cuda":
+        model.to("cpu")
+        torch.cuda.empty_cache()
+    if not np.isfinite(result).all():
+        invalid = int((~np.isfinite(result)).sum())
+        raise FloatingPointError(f"Non-finite Video VAE encoder output: {invalid} invalid values")
+    return result
 
 
 def decode_audio_latents(
@@ -603,7 +2072,7 @@ def write_mp4(
     path: Path,
     pixels: np.ndarray,
     waveform: np.ndarray,
-    fps: int = 24,
+    fps: float = 24,
     metadata: dict[str, object] | None = None,
 ) -> Path | None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -651,6 +2120,69 @@ def write_mp4(
         result = subprocess.run(command, input=frames.tobytes(), capture_output=True, timeout=600)
         if result.returncode != 0:
             raise RuntimeError(result.stderr.decode("utf-8", errors="replace"))
+    if metadata is None:
+        return None
+    metadata_path = output_metadata_path(path)
+    temporary = metadata_path.with_suffix(metadata_path.suffix + ".tmp")
+    temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(metadata_path)
+    return metadata_path
+
+
+def write_mp4_with_audio_source(
+    path: Path,
+    pixels: np.ndarray,
+    audio_source: Path,
+    fps: float = 24,
+    metadata: dict[str, object] | None = None,
+) -> Path | None:
+    """Encode generated frames and reuse the input video's audio stream."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frames = np.clip(pixels[0].transpose(1, 2, 3, 0) * 255.0, 0.0, 255.0).astype(np.uint8)
+    height, width = frames.shape[1:3]
+    command = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(fps),
+        "-i",
+        "pipe:0",
+        "-i",
+        str(audio_source),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-shortest",
+    ]
+    if metadata is not None:
+        embedded = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+        command.extend(
+            (
+                "-metadata",
+                "title=MiniMax H3 Edge Workbench output",
+                "-metadata",
+                f"comment={embedded}",
+            )
+        )
+    command.append(str(path))
+    result = subprocess.run(command, input=frames.tobytes(), capture_output=True, timeout=600)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode("utf-8", errors="replace"))
     if metadata is None:
         return None
     metadata_path = output_metadata_path(path)
