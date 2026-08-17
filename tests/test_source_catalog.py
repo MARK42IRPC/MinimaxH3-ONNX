@@ -1,4 +1,5 @@
 from h3_workbench.source_catalog import EXPORT_PRESETS, OFFICIAL_REPO, SUPPORT_REPO
+from urllib.parse import parse_qs, urlparse
 
 
 def test_large_checkpoint_sources_use_official_modelscope() -> None:
@@ -10,10 +11,10 @@ def test_large_checkpoint_sources_use_official_modelscope() -> None:
 
     assert large_assets
     assert all(asset.repo_id == OFFICIAL_REPO for asset in large_assets)
-    assert all(
-        asset.url.startswith("https://www.modelscope.cn/models/Comfy-Org/MiniMax-H3/resolve/master/")
-        for asset in large_assets
-    )
+    for asset in large_assets:
+        parsed = urlparse(asset.url)
+        assert parsed.path == "/api/v1/models/Comfy-Org/MiniMax-H3/repo"
+        assert parse_qs(parsed.query) == {"Revision": ["master"], "FilePath": [asset.path]}
 
 
 def test_small_support_assets_use_private_modelscope_collection() -> None:
@@ -28,7 +29,10 @@ def test_small_support_assets_use_private_modelscope_collection() -> None:
         "qwen_tokenizer/tokenizer_config.json",
         "qwen_tokenizer/vocab.json",
     }
-    assert all(asset.url.startswith("https://www.modelscope.cn/models/") for asset in assets)
+    for asset in assets:
+        parsed = urlparse(asset.url)
+        assert parsed.path == "/api/v1/models/Mark42IRPC/Minimax-H3-int8-fl2va-onnx-50CLIPS/repo"
+        assert parse_qs(parsed.query) == {"Revision": ["master"], "FilePath": [asset.path]}
 
     turbo = next(preset for preset in EXPORT_PRESETS if preset.id == "fl2va_turbo_v4")
     assert turbo.support is not None

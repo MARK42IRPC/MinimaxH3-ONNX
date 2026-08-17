@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 
 OFFICIAL_REPO = "Comfy-Org/MiniMax-H3"
@@ -15,7 +15,8 @@ def _hugging_face_url(repo_id: str, path: str) -> str:
 
 
 def _modelscope_url(repo_id: str, path: str) -> str:
-    return f"https://www.modelscope.cn/models/{repo_id}/resolve/master/{quote(path, safe='/')}"
+    query = urlencode({"Revision": "master", "FilePath": path})
+    return f"https://www.modelscope.cn/api/v1/models/{repo_id}/repo?{query}"
 
 
 @dataclass(frozen=True)
