@@ -36,6 +36,17 @@ def test_checkpoint_reader_streams_fp8_and_bfloat16(tmp_path: Path) -> None:
     )
 
 
+def test_checkpoint_reader_dequant_falls_back_to_full_precision_bfloat16(tmp_path: Path) -> None:
+    path = tmp_path / "main_bfloat16.safetensors"
+    source = torch.tensor([[1.0, -2.0], [0.5, 3.0]], dtype=torch.bfloat16)
+    save_file({"test.weight": source}, path)
+
+    actual = CheckpointReader(path).dequant_weight("test")
+
+    assert actual.dtype == torch.float16
+    np.testing.assert_array_equal(actual.numpy(), source.to(torch.float16).numpy())
+
+
 def test_scaled_fp16_linear_preserves_large_finite_output() -> None:
     linear = FrozenLinear(torch.full((1, 2), 100.0), compute_fp32=True)
     inputs = torch.full((1, 2), 1000.0)

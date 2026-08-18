@@ -149,6 +149,13 @@ class CheckpointReader:
 
     def dequant_weight(self, prefix: str) -> torch.Tensor:
         weight = self._file.get_tensor(f"{prefix}.weight")
+        # Ref2VA ships the same block layout in BF16 rather than FP8 plus a
+        # scalar scale. Keep the FP8 path unchanged and let the virtual slicer
+        # use the exported FP16/FP32 topology dtype for these full-precision
+        # weights.
+        if not self._file.has_tensor(f"{prefix}.weight_scale"):
+            del weight
+            return self.full_precision_weight(prefix)
         scale = float(self._file.get_tensor(f"{prefix}.weight_scale"))
         # Multiplication in FP32 matches the quantized layout's dequantization;
         # stream rows so the FP8, a full FP32 copy, and FP16 output never coexist.

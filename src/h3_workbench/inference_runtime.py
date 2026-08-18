@@ -19,7 +19,7 @@ import onnxruntime as ort
 import torch
 import torch.nn.functional as torch_functional
 
-from h3_workbench.acceleration import shifted_flow_sigmas
+from h3_workbench.acceleration import minimax_h3_euler_step, shifted_flow_sigmas
 from h3_workbench.device_profile import selected_device_index, torch_cuda_architecture_supported
 from h3_workbench.fl2va_runtime_graphs import (
     fp16_attention_output_ready,
@@ -42,6 +42,10 @@ from h3_workbench.qwen_persistent import (
     build_persistent_qwen_graphs,
     int8_virtual_qwen_ready,
     persistent_qwen_ready,
+)
+from h3_workbench.qwen_transformer import (
+    qwen_mrope_cos_sin,
+    streamed_qwen_causal_attention,
 )
 from h3_workbench.vram_reservation import other_reserved_bytes
 
@@ -1165,22 +1169,157 @@ class QwenTextRuntime:
                 pass
         self.persistent = QwenWeightInputs(directory) if persistent_qwen_ready(directory) else None
 
+    @staticmethod
+    def _visual_value(condition: Any | None, name: str, default: Any = None) -> Any:
+        if condition is None:
+            return default
+        if isinstance(condition, dict):
+            return condition.get(name, default)
+        return getattr(condition, name, default)
+
+    def _encode_int8_virtual_split(
+        self,
+        token_ids: np.ndarray,
+        callback: Callable[[str, int, int], None] | None,
+        position_ids: np.ndarray | None = None,
+        visual_condition: Any | None = None,
+    ) -> np.ndarray:
+        """Run the Qwen text tower with split attention and visual injection."""
+        assert self.int8_virtual is not None
+        attention = self.runner.session(self.int8_virtual.graph("attention_qkv"))
+        attention_output = self.runner.session(self.int8_virtual.graph("attention_output"))
+        mlp = self.runner.session(self.int8_virtual.graph("mlp"))
+        sequence = int(token_ids.shape[0])
+        if position_ids is None:
+            position_ids = np.arange(sequence, dtype=np.int64)[None, :].repeat(3, axis=0)
+        cosine, sine = qwen_mrope_cos_sin(position_ids)
+        try:
+            hidden = self.int8_virtual.embedding(token_ids)
+            image_mask = np.asarray(self._visual_value(visual_condition, "image_mask", np.zeros(sequence, bool)), dtype=bool)
+            video_mask = np.asarray(self._visual_value(visual_condition, "video_mask", np.zeros(sequence, bool)), dtype=bool)
+            image_features = self._visual_value(visual_condition, "image_features")
+            video_features = self._visual_value(visual_condition, "video_features")
+            if image_mask.any():
+                if image_features is None or np.asarray(image_features).shape[0] != int(image_mask.sum()):
+                    raise ValueError("Qwen image feature count does not match image pad tokens")
+                hidden[image_mask] = np.asarray(image_features, dtype=np.float32)
+            if video_mask.any():
+                if video_features is None or np.asarray(video_features).shape[0] != int(video_mask.sum()):
+                    raise ValueError("Qwen video feature count does not match video pad tokens")
+                hidden[video_mask] = np.asarray(video_features, dtype=np.float32)
+            visual_mask = image_mask | video_mask
+            image_deepstack = self._visual_value(visual_condition, "image_deepstack", ()) or ()
+            video_deepstack = self._visual_value(visual_condition, "video_deepstack", ()) or ()
+            qkv_chunk = max(128, int(os.environ.get("H3_QWEN_QKV_CHUNK", "2048")))
+            output_chunk = max(32, int(os.environ.get("H3_QWEN_OUTPUT_CHUNK", "1024")))
+            mlp_chunk = max(32, int(os.environ.get("H3_QWEN_MLP_CHUNK", "512")))
+            for layer in range(50):
+                if callback is not None:
+                    callback("Attention", layer + 1, 50)
+                queries: list[np.ndarray] = []
+                keys: list[np.ndarray] = []
+                values: list[np.ndarray] = []
+                feeds = self.int8_virtual.inputs("attention_qkv", layer)
+                for start in range(0, sequence, qkv_chunk):
+                    stop = min(start + qkv_chunk, sequence)
+                    q, k, v = attention.run(
+                        None,
+                        {
+                            "hidden_states": hidden[start:stop],
+                            "cosine": cosine[start:stop],
+                            "sine": sine[start:stop],
+                            **feeds,
+                        },
+                    )
+                    queries.append(np.asarray(q, dtype=np.float16))
+                    keys.append(np.asarray(k, dtype=np.float16))
+                    values.append(np.asarray(v, dtype=np.float16))
+                query = np.concatenate(queries, axis=0)
+                key = np.concatenate(keys, axis=0)
+                value = np.concatenate(values, axis=0)
+                del queries, keys, values, feeds
+                snapshot = probe_gpu_memory()
+                query_chunk = select_attention_query_chunk(
+                    min(1024, max(32, int(os.environ.get("H3_QWEN_ATTENTION_CHUNK", "512")))),
+                    sequence,
+                    snapshot.free_bytes,
+                )
+                attended = streamed_qwen_causal_attention(
+                    query,
+                    key,
+                    value,
+                    query_chunk_tokens=query_chunk,
+                    use_cuda=self.runner.provider == "CUDAExecutionProvider",
+                    device_index=int(getattr(self.runner, "device_index", 0)),
+                    output_dtype=np.dtype(np.float16),
+                )
+                del query, key, value
+                output_parts: list[np.ndarray] = []
+                output_feeds = self.int8_virtual.inputs("attention_output", layer)
+                for start in range(0, sequence, output_chunk):
+                    stop = min(start + output_chunk, sequence)
+                    output_parts.append(
+                        np.asarray(
+                            attention_output.run(
+                                None,
+                                {
+                                    "hidden_states": hidden[start:stop],
+                                    "sine": sine[start:stop],
+                                    "attended": attended[start:stop].reshape(-1, 32, 256).astype(np.float32),
+                                    **output_feeds,
+                                },
+                            )[0],
+                            dtype=np.float32,
+                        )
+                    )
+                hidden = np.concatenate(output_parts, axis=0)
+                del output_parts, output_feeds, attended
+                if callback is not None:
+                    callback("MLP", layer + 1, 50)
+                mlp_feeds = self.int8_virtual.inputs("mlp", layer)
+                mlp_parts: list[np.ndarray] = []
+                for start in range(0, sequence, mlp_chunk):
+                    stop = min(start + mlp_chunk, sequence)
+                    mlp_parts.append(
+                        np.asarray(
+                            mlp.run(None, {"hidden_states": hidden[start:stop], **mlp_feeds})[0],
+                            dtype=np.float32,
+                        )
+                    )
+                hidden = np.concatenate(mlp_parts, axis=0)
+                del mlp_parts, mlp_feeds
+                if layer < 3 and visual_mask.any():
+                    image_deep = image_deepstack[layer] if layer < len(image_deepstack) else None
+                    video_deep = video_deepstack[layer] if layer < len(video_deepstack) else None
+                    if image_mask.any() and image_deep is not None:
+                        hidden[image_mask] += np.asarray(image_deep, dtype=np.float32)
+                    if video_mask.any() and video_deep is not None:
+                        hidden[video_mask] += np.asarray(video_deep, dtype=np.float32)
+            return hidden
+        finally:
+            del attention, attention_output, mlp
+            gc.collect()
+
     def _encode_int8_virtual(
         self,
         token_ids: np.ndarray,
         callback: Callable[[str, int, int], None] | None,
+        position_ids: np.ndarray | None = None,
+        visual_condition: Any | None = None,
     ) -> np.ndarray:
         assert self.int8_virtual is not None
+        split = self.int8_virtual.attention_split
+        if isinstance(split, dict) and "qkv" in split and "output" in split:
+            return self._encode_int8_virtual_split(token_ids, callback, position_ids, visual_condition)
+        if visual_condition is not None:
+            raise RuntimeError("Multimodal Qwen conditioning requires split attention graphs")
         attention = self.runner.session(self.int8_virtual.graph("attention"))
         mlp = self.runner.session(self.int8_virtual.graph("mlp"))
         try:
             hidden = self.int8_virtual.embedding(token_ids)
             sequence = token_ids.shape[0]
-            positions = np.arange(sequence, dtype=np.float32)
-            inv_freq = 1.0 / (500_000.0 ** (np.arange(0, 128, 2, dtype=np.float32) / 128.0))
-            angles = np.outer(positions, inv_freq)
-            angles = np.concatenate((angles, angles), axis=-1)
-            cosine, sine = np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
+            position_table = np.arange(sequence, dtype=np.int64)[None, :].repeat(3, axis=0)
+            cosine, sine = qwen_mrope_cos_sin(position_table)
             mask = np.triu(np.full((1, 1, sequence, sequence), -10_000.0, dtype=np.float32), k=1)
             for layer in range(50):
                 if callback is not None:
@@ -1219,11 +1358,8 @@ class QwenTextRuntime:
                 None, {"token_ids": token_ids.astype(np.int64), **self.persistent.inputs("embedding")}
             )[0]
             sequence = token_ids.shape[0]
-            positions = np.arange(sequence, dtype=np.float32)
-            inv_freq = 1.0 / (500_000.0 ** (np.arange(0, 128, 2, dtype=np.float32) / 128.0))
-            angles = np.outer(positions, inv_freq)
-            angles = np.concatenate((angles, angles), axis=-1)
-            cosine, sine = np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
+            position_table = np.arange(sequence, dtype=np.int64)[None, :].repeat(3, axis=0)
+            cosine, sine = qwen_mrope_cos_sin(position_table)
             mask = np.triu(np.full((1, 1, sequence, sequence), -10_000.0, dtype=np.float32), k=1)
             normalized: np.ndarray | None = None
             gate: np.ndarray | None = None
@@ -1272,20 +1408,23 @@ class QwenTextRuntime:
         token_ids: np.ndarray,
         callback: Callable[[str, int, int], None] | None = None,
         activity_callback: Callable[[dict[str, object]], None] | None = None,
+        position_ids: np.ndarray | None = None,
+        visual_condition: Any | None = None,
     ) -> np.ndarray:
         if self.int8_virtual is not None and self.runner.provider == "CUDAExecutionProvider":
-            return self._encode_int8_virtual(token_ids, callback)
+            return self._encode_int8_virtual(token_ids, callback, position_ids, visual_condition)
         if self.persistent is not None and self.runner.provider == "CUDAExecutionProvider":
+            if visual_condition is not None:
+                raise RuntimeError("Multimodal Qwen conditioning requires the INT8 virtual split runtime")
             return self._encode_persistent(token_ids, callback)
+        if visual_condition is not None:
+            raise RuntimeError("Multimodal Qwen conditioning requires a CUDA virtual Qwen runtime")
         if callback is not None:
             callback("Embedding", 0, 50)
         hidden = self.runner.run(self.directory / "qwen_embedding.onnx", {"token_ids": token_ids.astype(np.int64)})[0]
         sequence = token_ids.shape[0]
-        positions = np.arange(sequence, dtype=np.float32)
-        inv_freq = 1.0 / (500_000.0 ** (np.arange(0, 128, 2, dtype=np.float32) / 128.0))
-        angles = np.outer(positions, inv_freq)
-        angles = np.concatenate((angles, angles), axis=-1)
-        cosine, sine = np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
+        position_table = np.arange(sequence, dtype=np.int64)[None, :].repeat(3, axis=0)
+        cosine, sine = qwen_mrope_cos_sin(position_table)
         mask = np.triu(np.full((1, 1, sequence, sequence), -10_000.0, dtype=np.float32), k=1)
         graph_paths = [
             self.directory / f"qwen_layer_{index:02d}_{kind}.onnx"
@@ -1932,13 +2071,13 @@ class _FineGraphRuntime:
         )
         _finite_guard("main head video patches", video_out)
         _finite_guard("main head audio patches", audio_out)
-        video_velocity = -unpatchify_video(
+        video_velocity = unpatchify_video(
             video_out,
             self.profile.video_latent_frames,
             self.profile.video_latent_height,
             self.profile.video_latent_width,
         )
-        audio_velocity = -unpack_audio(audio_out)
+        audio_velocity = unpack_audio(audio_out)
         return video_velocity, audio_velocity
 
     def _streaming_qkv_dtype(self) -> np.dtype:
@@ -2102,6 +2241,41 @@ def initial_latents(profile: GenerationProfile, seed: int) -> tuple[np.ndarray, 
     return video, audio
 
 
+def initial_ref2va_latents(
+    profile: GenerationProfile,
+    seed: int,
+    reference_video_latents: Sequence[np.ndarray],
+    condition_timestep: float = 0.999,
+) -> tuple[tuple[np.ndarray, ...], np.ndarray, np.ndarray]:
+    """Draw Ref2VA condition noise before the generated video/audio noise.
+
+    The official pipeline consumes one random draw per visual reference first,
+    then draws the target video and audio rows.  Keeping that order here makes
+    request seeds reproducible across the virtual-slice runtime.
+    """
+    if not 0.0 <= condition_timestep <= 1.0:
+        raise ValueError("Ref2VA condition timestep must be between 0 and 1")
+    random = np.random.default_rng(seed)
+    noised: list[np.ndarray] = []
+    for latent in reference_video_latents:
+        values = np.asarray(latent, dtype=np.float32)
+        if values.ndim != 5:
+            raise ValueError(f"Ref2VA visual condition must be 5D, got {values.shape}")
+        noise = random.standard_normal(values.shape, dtype=np.float32)
+        noised.append(
+            np.ascontiguousarray(
+                values * float(condition_timestep) + noise * (1.0 - float(condition_timestep)),
+                dtype=np.float32,
+            )
+        )
+    video = random.standard_normal(
+        (1, 24, profile.video_latent_frames, profile.video_latent_height, profile.video_latent_width),
+        dtype=np.float32,
+    )
+    audio = random.standard_normal((1, 32, 2, profile.audio_latent_frames), dtype=np.float32)
+    return tuple(noised), video, audio
+
+
 @dataclass(frozen=True)
 class VideoLatentCondition:
     """Clean image latents pinned to sparse video slots during denoising."""
@@ -2187,14 +2361,13 @@ def sample_latents(
             runtime.audio_fallback_reason = (
                 f"Non-finite FL2VA audio velocity at step {index + 1}: {invalid} invalid values"
             )
-        video_delta = sigma_next - sigma
-        video = video + video_delta * video_velocity
+        video = minimax_h3_euler_step(video, video_velocity, sigma, sigma_next)
         if video_condition is not None:
             video_condition.apply_clean(video)
         if audio_velocity_finite:
             audio_sigma = time_shift_sigma(sigma, 12.0, 3.0)
             audio_sigma_next = time_shift_sigma(sigma_next, 12.0, 3.0)
-            next_audio = audio + (audio_sigma_next - audio_sigma) * audio_velocity
+            next_audio = minimax_h3_euler_step(audio, audio_velocity, audio_sigma, audio_sigma_next)
             if np.isfinite(next_audio).all():
                 audio = next_audio
             elif runtime.audio_fallback_reason is None:
@@ -2205,6 +2378,67 @@ def sample_latents(
         if not np.isfinite(video).all():
             invalid = int((~np.isfinite(video)).sum())
             raise FloatingPointError(f"Non-finite FL2VA video latent at step {index + 1}: {invalid} invalid values")
+        if callback is not None:
+            callback(index + 1, steps)
+        if checkpoint_callback is not None:
+            checkpoint_callback(index + 1, steps, video, audio)
+    return video, audio
+
+
+def sample_ref2va_latents(
+    runtime: H3MainRuntime,
+    video: np.ndarray,
+    audio: np.ndarray,
+    text_states: np.ndarray,
+    reference_video_latents: Sequence[np.ndarray],
+    reference_audio_latents: Sequence[np.ndarray],
+    layout: Any,
+    steps: int = 4,
+    callback: Callable[[int, int], None] | None = None,
+    checkpoint_callback: Callable[[int, int, np.ndarray, np.ndarray], None] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sample target audio/video while keeping all Ref2VA rows immutable."""
+    sigmas = shifted_flow_sigmas(steps)
+    refined_text = runtime.prepare_text(text_states)
+    reference_video = tuple(np.asarray(value, dtype=np.float32) for value in reference_video_latents)
+    reference_audio = tuple(np.asarray(value, dtype=np.float32) for value in reference_audio_latents)
+    for index, (sigma, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:], strict=True)):
+        runtime.sampling_step = index + 1
+        runtime.sampling_steps = steps
+        video_velocity, audio_velocity = runtime.denoise_ref2va_step(
+            video,
+            audio,
+            refined_text,
+            sigma,
+            reference_video,
+            reference_audio,
+            layout,
+            text_is_refined=True,
+        )
+        if not np.isfinite(video_velocity).all():
+            invalid = int((~np.isfinite(video_velocity)).sum())
+            raise FloatingPointError(f"Non-finite Ref2VA video velocity at step {index + 1}: {invalid} invalid values")
+        audio_velocity_finite = np.isfinite(audio_velocity).all()
+        if not audio_velocity_finite and runtime.audio_fallback_reason is None:
+            invalid = int((~np.isfinite(audio_velocity)).sum())
+            runtime.audio_fallback_reason = (
+                f"Non-finite Ref2VA audio velocity at step {index + 1}: {invalid} invalid values"
+            )
+        video = minimax_h3_euler_step(video, video_velocity, sigma, sigma_next)
+        if audio_velocity_finite:
+            audio_sigma = time_shift_sigma(sigma, 12.0, 3.0)
+            audio_sigma_next = time_shift_sigma(sigma_next, 12.0, 3.0)
+            next_audio = minimax_h3_euler_step(audio, audio_velocity, audio_sigma, audio_sigma_next)
+            if np.isfinite(next_audio).all():
+                audio = next_audio
+            elif runtime.audio_fallback_reason is None:
+                invalid = int((~np.isfinite(next_audio)).sum())
+                runtime.audio_fallback_reason = (
+                    f"Non-finite Ref2VA audio latent at step {index + 1}: {invalid} invalid values"
+                )
+        if not np.isfinite(video).all():
+            invalid = int((~np.isfinite(video)).sum())
+            raise FloatingPointError(f"Non-finite Ref2VA video latent at step {index + 1}: {invalid} invalid values")
         if callback is not None:
             callback(index + 1, steps)
         if checkpoint_callback is not None:

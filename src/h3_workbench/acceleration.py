@@ -33,13 +33,14 @@ def shifted_flow_sigmas(
     shift: float = 12.0,
     start_sigma: float = 1.0,
 ) -> list[float]:
-    """Build a shifted-flow schedule beginning at ``start_sigma``.
+    """Build the MiniMax-H3 sigma grid for ``steps`` model evaluations.
 
-    ``start_sigma`` is expressed in the shifted schedule's sigma space. The
-    inverse shift maps it back to the linear-flow coordinate before sampling so
-    the first denoise call receives exactly the sigma represented by the input
-    latent. This is important for image/video-to-video conditioning: a latent
-    mixed with 35% noise must not be treated as the sigma=1 pure-noise state.
+    The official scheduler receives the number of grid points and exposes one
+    fewer model timestep because the terminal zero is not evaluated. The
+    workbench API exposes the number of model evaluations, so it constructs one
+    extra point internally. ``start_sigma`` is expressed in shifted sigma
+    space; for a partial-noise request the inverse shift is used to preserve
+    the requested starting sigma exactly.
     """
     if steps < 1:
         raise ValueError("steps must be positive")
@@ -48,11 +49,54 @@ def shifted_flow_sigmas(
     if not np.isfinite(start_sigma) or not 0.0 <= start_sigma <= 1.0:
         raise ValueError("start_sigma must be between 0.0 and 1.0")
     base_start = start_sigma / (shift - (shift - 1.0) * start_sigma)
-    base = np.linspace(base_start, 0.0, steps + 1, dtype=np.float64)
+    base = np.linspace(base_start, 0.0, steps + 1, dtype=np.float32)
     shifted = shift * base / (1.0 + (shift - 1.0) * base)
-    shifted[0] = start_sigma
-    shifted[-1] = 0.0
-    return shifted.tolist()
+    shifted = np.asarray(shifted, dtype=np.float32)
+    shifted[0] = np.float32(start_sigma)
+    shifted[-1] = np.float32(0.0)
+    # Match MiniMaxH3Scheduler's unique_consecutive behavior if float32
+    # rounding collapses adjacent points at an unusually large step count.
+    keep = np.concatenate(([True], shifted[1:] != shifted[:-1]))
+    values = shifted[keep].tolist()
+    # Preserve an explicitly supplied Python start value at the public API
+    # boundary; the official torch scheduler rounds it when it materializes
+    # the device tensor, but callers use this value to label the first pass.
+    values[0] = float(start_sigma)
+    values[-1] = 0.0
+    return values
+
+
+def minimax_h3_euler_step(
+    sample: np.ndarray,
+    velocity: np.ndarray,
+    sigma: float,
+    sigma_next: float,
+) -> np.ndarray:
+    """Apply MiniMax-H3's data-ward rectified-flow Euler step.
+
+    MiniMax-H3's transformer predicts a data-ward velocity. Its official
+    scheduler therefore uses ``x_next = x + (sigma - sigma_next) * velocity``
+    (equivalently, it blends ``x`` with ``x0 = x + sigma * velocity``).
+    Compute the update in float32, as the reference scheduler does for half
+    precision samples.
+    """
+    if not np.isfinite(sigma) or not np.isfinite(sigma_next):
+        raise ValueError("Scheduler sigmas must be finite")
+    if sigma <= 0.0 or sigma_next < 0.0 or sigma_next > sigma:
+        raise ValueError(
+            f"MiniMax-H3 Euler step requires 0 <= sigma_next <= sigma with sigma > 0, "
+            f"got sigma={sigma}, sigma_next={sigma_next}"
+        )
+    sample_values = np.asarray(sample)
+    velocity_values = np.asarray(velocity)
+    if sample_values.shape != velocity_values.shape:
+        raise ValueError(
+            f"Sample and velocity shapes must match, got {sample_values.shape} and {velocity_values.shape}"
+        )
+    result = sample_values.astype(np.float32, copy=False) + (
+        np.float32(sigma - sigma_next) * velocity_values.astype(np.float32, copy=False)
+    )
+    return np.asarray(result, dtype=sample_values.dtype)
 
 
 def load_silu_temb_grid(lora_path: Path) -> np.ndarray:

@@ -19,11 +19,206 @@ QUERY_HEADS = 64
 KV_HEADS = 8
 KV_REPEAT = QUERY_HEADS // KV_HEADS
 NORM_EPS = 1e-6
+TEXT_ROPE_THETA = 5_000_000.0
+MROPE_SECTION = (24, 20, 20)
+IMAGE_TOKEN_ID = 151655
+VIDEO_TOKEN_ID = 151656
 CONVROT_FORMAT = "int8_tensorwise"
 E2M1_LUT = np.asarray(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
     dtype=np.float32,
 )
+
+
+def qwen_mrope_position_ids(
+    token_ids: np.ndarray,
+    image_grid_thw: np.ndarray | None = None,
+    video_grid_thw: np.ndarray | None = None,
+    image_token_id: int = IMAGE_TOKEN_ID,
+    video_token_id: int = VIDEO_TOKEN_ID,
+    *,
+    mm_token_type_ids: np.ndarray | None = None,
+    token_tags: np.ndarray | None = None,
+) -> np.ndarray:
+    """Build Qwen3-VL's three-axis text positions for one multimodal sequence.
+
+    ``mm_token_type_ids`` follows Qwen3-VL's processor contract: ``0`` is
+    text, ``1`` is image and ``2`` is video.  It is deliberately separate from
+    H3's packed-row ``token_tags``.  The processor marks only pad tokens;
+    vision delimiters remain text.  When omitted, pad-token inference is
+    retained for callers that only have token ids.
+
+    Video grids are split into one temporal grid per vision block, matching
+    the official ``torch.repeat_interleave(video_grid_thw, grid_t, dim=0)``
+    logic.  Positions inside a visual block use the same block-major
+    ``(T,H,W)`` merge order as ``get_vision_position_ids``.
+    """
+    ids = np.asarray(token_ids, dtype=np.int64).reshape(-1)
+    image_grids = [] if image_grid_thw is None else [tuple(int(v) for v in row) for row in np.asarray(image_grid_thw)]
+    video_grids: list[tuple[int, int, int]] = []
+    if video_grid_thw is not None:
+        for row in np.asarray(video_grid_thw):
+            _, height, width = (int(v) for v in row)
+            video_grids.extend((1, height, width) for _ in range(int(row[0])))
+    grids = {1: iter(image_grids), 2: iter(video_grids)}
+    if mm_token_type_ids is not None:
+        modality = np.asarray(mm_token_type_ids, dtype=np.int8).reshape(-1)
+        if modality.shape != ids.shape:
+            raise ValueError(
+                "Qwen modality tags must have the same length as token_ids: "
+                f"{modality.shape} != {ids.shape}"
+            )
+        if np.any(~np.isin(modality, (0, 1, 2))):
+            raise ValueError("Qwen modality tags must contain only 0 (text), 1 (image), or 2 (video)")
+    elif token_tags is not None:
+        # H3 tags distinguish text/video rows but do not identify image vs
+        # video.  Pad ids still provide the unambiguous modality for the
+        # legacy path; vision delimiters inherit the adjacent pad modality.
+        h3_tags = np.asarray(token_tags, dtype=np.int8).reshape(-1)
+        if h3_tags.shape != ids.shape:
+            raise ValueError("H3 token_tags must have the same length as token_ids")
+        modality = np.zeros(ids.shape[0], dtype=np.int8)
+        modality[ids == image_token_id] = 1
+        modality[ids == video_token_id] = 2
+    else:
+        modality = np.zeros(ids.shape[0], dtype=np.int8)
+        modality[ids == image_token_id] = 1
+        modality[ids == video_token_id] = 2
+
+    positions = np.zeros((3, ids.shape[0]), dtype=np.int64)
+    cursor = 0
+    current_pos = 0
+    while cursor < ids.size:
+        end = cursor + 1
+        while end < ids.size and modality[end] == modality[cursor]:
+            end += 1
+        kind = int(modality[cursor])
+        length = end - cursor
+        if kind == 0:
+            # ``current_pos`` in the official implementation advances by the
+            # number of rows in a text group.
+            values = np.arange(length, dtype=np.int64) + current_pos
+            positions[:, cursor:end] = values[None, :]
+            current_pos += length
+        else:
+            try:
+                temporal, height, width = next(grids[kind])
+            except StopIteration as exc:
+                raise ValueError("Qwen visual grid count does not match presentation pad runs") from exc
+            merged_height = height // 2
+            merged_width = width // 2
+            expected = temporal * merged_height * merged_width
+            if expected != length:
+                raise ValueError(
+                    f"Qwen visual pad run has {length} tokens, expected {expected} from grid "
+                    f"({temporal}, {height}, {width})"
+                )
+            time = np.arange(temporal, dtype=np.int64)[:, None, None] + current_pos
+            row = np.arange(merged_height, dtype=np.int64)[None, :, None] + current_pos
+            column = np.arange(merged_width, dtype=np.int64)[None, None, :] + current_pos
+            positions[:, cursor:end] = np.stack(
+                np.broadcast_arrays(time, np.broadcast_to(row, (temporal, merged_height, merged_width)),
+                                    np.broadcast_to(column, (temporal, merged_height, merged_width))),
+                axis=0,
+            ).reshape(3, -1)
+            current_pos += max(height, width) // 2
+        cursor = end
+    for kind, iterator in grids.items():
+        try:
+            next(iterator)
+        except StopIteration:
+            continue
+        raise ValueError(f"Qwen presentation did not consume all modality-{kind} visual grids")
+    return positions
+
+
+def qwen_mrope_cos_sin(
+    position_ids: np.ndarray,
+    theta: float = TEXT_ROPE_THETA,
+    sections: tuple[int, int, int] = MROPE_SECTION,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the interleaved MRoPE table expected by the H3 text tower."""
+    positions = np.asarray(position_ids, dtype=np.float32)
+    if positions.ndim != 2 or positions.shape[0] != 3:
+        raise ValueError(f"Qwen position ids must have shape (3, sequence), got {positions.shape}")
+    inv_freq = 1.0 / (float(theta) ** (np.arange(0, HEAD_DIM, 2, dtype=np.float32) / HEAD_DIM))
+    freqs = positions[:, :, None] * inv_freq[None, None, :]
+    selected = freqs[0].copy()
+    for axis, section in enumerate(sections[1:], start=1):
+        length = int(section) * 3
+        selected[:, axis:length:3] = freqs[axis, :, axis:length:3]
+    embedding = np.concatenate((selected, selected), axis=-1)
+    return np.cos(embedding).astype(np.float32), np.sin(embedding).astype(np.float32)
+
+
+def streamed_qwen_causal_attention(
+    query: np.ndarray,
+    key: np.ndarray,
+    value: np.ndarray,
+    query_chunk_tokens: int = 512,
+    use_cuda: bool = False,
+    device_index: int = 0,
+    output_dtype: np.dtype = np.dtype(np.float32),
+) -> np.ndarray:
+    """Evaluate GQA causal attention without materializing a sequence square.
+
+    ``query`` has 64 heads while ``key`` and ``value`` have 8.  Only the key
+    and value are kept on the selected device; query chunks and the boolean
+    causal mask are released after each output chunk.
+    """
+    q = np.asarray(query)
+    k = np.asarray(key)
+    v = np.asarray(value)
+    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3 or q.shape[0] != k.shape[0] or k.shape != v.shape:
+        raise ValueError(f"Invalid Qwen attention shapes: query={q.shape}, key={k.shape}, value={v.shape}")
+    if q.shape[1] != 64 or k.shape[1] != 8 or q.shape[2] != 128:
+        raise ValueError(f"Unexpected Qwen GQA shapes: query={q.shape}, key={k.shape}")
+    if query_chunk_tokens < 1:
+        raise ValueError("query_chunk_tokens must be positive")
+    cuda = bool(use_cuda and torch.cuda.is_available())
+    device = torch.device(f"cuda:{device_index}" if cuda else "cpu")
+    # Qwen's exported projections produce FP32 activations, but the streamed
+    # attention workspace is deliberately kept at 16 bits.  FP16 preserves
+    # substantially more mantissa precision than BF16 for the normalized Q/K
+    # values and uses the same amount of VRAM on CUDA; this matters for the
+    # deeper Qwen blocks on consumer GPUs.
+    work_dtype = torch.float16 if cuda else torch.float32
+    key_t = torch.from_numpy(np.ascontiguousarray(k)).to(device=device, dtype=work_dtype).transpose(0, 1).unsqueeze(0)
+    value_t = torch.from_numpy(np.ascontiguousarray(v)).to(device=device, dtype=work_dtype).transpose(0, 1).unsqueeze(0)
+    output = np.empty((q.shape[0], q.shape[1], q.shape[2]), dtype=output_dtype)
+    key_positions = torch.arange(q.shape[0], device=device)
+    try:
+        for start in range(0, q.shape[0], query_chunk_tokens):
+            stop = min(start + query_chunk_tokens, q.shape[0])
+            query_t = torch.from_numpy(np.ascontiguousarray(q[start:stop])).to(device=device, dtype=work_dtype)
+            query_t = query_t.transpose(0, 1).unsqueeze(0)
+            allowed = key_positions[None, :] <= torch.arange(start, stop, device=device)[:, None]
+            try:
+                attended = F.scaled_dot_product_attention(
+                    query_t,
+                    key_t,
+                    value_t,
+                    attn_mask=allowed[None, None],
+                    dropout_p=0.0,
+                    enable_gqa=True,
+                )
+            except (TypeError, RuntimeError):
+                expanded_key = key_t.repeat_interleave(8, dim=1)
+                expanded_value = value_t.repeat_interleave(8, dim=1)
+                attended = F.scaled_dot_product_attention(
+                    query_t,
+                    expanded_key,
+                    expanded_value,
+                    attn_mask=allowed[None, None],
+                    dropout_p=0.0,
+                )
+            output[start:stop] = attended[0].transpose(0, 1).float().cpu().numpy().astype(output_dtype, copy=False)
+            del query_t, allowed, attended
+    finally:
+        del key_t, value_t, key_positions
+        if cuda:
+            torch.cuda.synchronize(device)
+    return output
 
 
 def _from_blocked(blocked: np.ndarray, rows: int, columns: int) -> np.ndarray:

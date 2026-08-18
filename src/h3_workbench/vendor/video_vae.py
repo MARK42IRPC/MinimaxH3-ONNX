@@ -757,7 +757,14 @@ class MiniMaxH3VideoVAE(nn.Module):
         return dec
 
 
-    def encode(self, x, device=None, callback=None):
+    def encode(
+        self,
+        x,
+        device=None,
+        callback=None,
+        sample_posterior=False,
+        posterior_seed=42,
+    ):
         # x: [B, 3, T, H, W] in [-1, 1] -> normalized latents [B, 24, T_lat, H/16, W/16]
         if x.ndim == 4:
             x = x.unsqueeze(2)
@@ -770,7 +777,12 @@ class MiniMaxH3VideoVAE(nn.Module):
         else:
             moments = self.encode_temporal(x, device, callback=callback)
 
-        mean = torch.chunk(moments.float(), 2, dim=1)[0]
+        mean, logvar = torch.chunk(moments.float(), 2, dim=1)
+        if sample_posterior:
+            generator = torch.Generator(device="cpu").manual_seed(int(posterior_seed))
+            noise = torch.randn(mean.shape, generator=generator, dtype=torch.float32).to(mean.device)
+            mean = mean + torch.exp(0.5 * logvar.clamp(-30.0, 20.0)) * noise
+            mean = mean.to(torch.float16).float()
 
         latents_mean = self.latents_mean.view(1, -1, 1, 1, 1).to(mean)
         latents_std = self.latents_std.view(1, -1, 1, 1, 1).to(mean)

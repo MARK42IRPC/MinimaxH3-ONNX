@@ -23,6 +23,7 @@ from h3_workbench.media_output import (
 from h3_workbench.memory_planner import main_model_shards, plan_shard_batches, probe_gpu_memory
 from h3_workbench.profiles import PROFILE_360P_17F
 from h3_workbench.qwen_persistent import resolve_qwen_directory
+from h3_workbench.jobs import resolve_main_model_directory
 
 
 def _token_ids(value: str) -> np.ndarray:
@@ -49,7 +50,13 @@ def main() -> None:
 
     if args.command == "plan":
         snapshot = probe_gpu_memory()
-        directory = Path.cwd() / "onnx_models" / "minimax_h3_fl2va_pruned_fp8_scaled_streaming"
+        directory = resolve_main_model_directory(
+            Path.cwd(),
+            Path.cwd() / "onnx_models",
+            accelerated=False,
+        )
+        if directory is None:
+            raise RuntimeError("No validated Ref2VA or FL2VA main model is installed")
         shards = main_model_shards(directory)
         batches = plan_shard_batches(shards, profile, snapshot.free_bytes) if snapshot.free_bytes else []
         print(
@@ -74,8 +81,15 @@ def main() -> None:
     )
     text_states = qwen.encode_token_ids(args.token_ids)
     video, audio = initial_latents(profile, args.seed)
+    main_directory = resolve_main_model_directory(
+        workspace,
+        workspace / "onnx_models",
+        accelerated=False,
+    )
+    if main_directory is None:
+        raise RuntimeError("No validated Ref2VA or FL2VA main model is installed")
     main_runtime = H3MainRuntime(
-        workspace / "onnx_models" / "minimax_h3_fl2va_pruned_fp8_scaled_streaming",
+        main_directory,
         runner,
         profile,
         l1_prefetch_shards=args.l1_prefetch_shards,

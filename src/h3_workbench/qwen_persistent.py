@@ -19,6 +19,7 @@ RUNTIME_INT8_MANIFEST = "runtime_int8_manifest.json"
 RUNTIME_KINDS = ("embedding", "attention", "gate", "up", "down")
 INT8_VIRTUAL_FORMAT = "h3-qwen-int8-virtual-v1"
 INT8_VIRTUAL_KINDS = ("attention", "mlp")
+INT8_SPLIT_KINDS = ("qkv", "output")
 
 
 def _sha256(path: Path) -> str:
@@ -238,7 +239,9 @@ class QwenInt8SourceWeights:
         if not int8_virtual_qwen_ready(self.directory):
             raise ValueError(f"Qwen INT8 virtual product is stale or incomplete: {self.directory}")
         self.reader = _StreamingSafeTensorFile(self.source)
+        self.raw = raw
         self.kinds = raw["kinds"]
+        self.attention_split = raw.get("attention_split")
         self.embedding_key = str(raw["embedding_key"])
         self._embedding: np.ndarray | None = self.reader.memmap_tensor(self.embedding_key)
         self._input_cache: dict[tuple[str, int], dict[str, np.ndarray]] = {}
@@ -250,6 +253,11 @@ class QwenInt8SourceWeights:
         _close_memmaps(arrays)
 
     def graph(self, kind: str) -> Path:
+        if kind in {"attention_qkv", "attention_output"}:
+            split_kind = "qkv" if kind == "attention_qkv" else "output"
+            if not isinstance(self.attention_split, dict) or split_kind not in self.attention_split:
+                raise KeyError(f"Qwen split attention graph is not installed: {kind}")
+            return self.directory / str(self.attention_split[split_kind]["graph"])
         return self.directory / str(self.kinds[kind]["graph"])
 
     def embedding(self, token_ids: np.ndarray) -> np.ndarray:
@@ -263,7 +271,14 @@ class QwenInt8SourceWeights:
         if cached is not None:
             return cached
         result: dict[str, np.ndarray] = {}
-        for spec in self.kinds[kind]["inputs"]:
+        if kind in {"attention_qkv", "attention_output"}:
+            split_kind = "qkv" if kind == "attention_qkv" else "output"
+            if not isinstance(self.attention_split, dict) or split_kind not in self.attention_split:
+                raise KeyError(f"Qwen split attention graph is not installed: {kind}")
+            specs = self.attention_split[split_kind]["inputs"]
+        else:
+            specs = self.kinds[kind]["inputs"]
+        for spec in specs:
             source_key = str(spec["source_key"]).format(layer=layer)
             source = self.reader.memmap_tensor(source_key)
             target_dtype = np.dtype(str(spec["target_dtype"]))
@@ -305,6 +320,17 @@ def int8_virtual_qwen_ready(directory: Path) -> bool:
             graph = directory / str(raw["kinds"][kind]["graph"])
             if not graph.is_file() or runtime_file_identity(graph) != raw["kinds"][kind]["graph_identity"]:
                 return False
+        split = raw.get("attention_split")
+        if split is not None:
+            if not isinstance(split, dict):
+                return False
+            for kind in INT8_SPLIT_KINDS:
+                entry = split.get(kind)
+                if not isinstance(entry, dict):
+                    return False
+                graph = directory / str(entry["graph"])
+                if not graph.is_file() or runtime_file_identity(graph) != entry["graph_identity"]:
+                    return False
         return True
     except (OSError, KeyError, TypeError, ValueError):
         return False

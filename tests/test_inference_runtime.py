@@ -25,6 +25,7 @@ from h3_workbench.inference_runtime import (
     select_fl2va_chunk_sizes,
     select_attention_query_chunk,
     sample_latents,
+    sample_ref2va_latents,
     unpack_audio,
     unpatchify_video,
 )
@@ -40,7 +41,7 @@ from h3_workbench.media_output import (
     select_video_vae_encoder_backend,
     video_vae_temporal_encoder_ready,
 )
-from h3_workbench.media_output import decode_audio_latents_onnx
+from h3_workbench.media_output import audio_vae_encoder_ready, decode_audio_latents_onnx
 from h3_workbench.profiles import (
     PROFILE_360P_17F,
     video_latent_frames_for_output,
@@ -170,6 +171,40 @@ def test_low_vram_video_encoder_uses_six_spatial_tiles(monkeypatch) -> None:
     assert overlap == 32
     assert len(y_tiles) == 2
     assert len(x_tiles) == 3
+
+
+def test_staged_encoder_tail_tiles_use_four_to_one_spatial_downsample() -> None:
+    encoder = ONNXVideoVAEEncoder.__new__(ONNXVideoVAEEncoder)
+    encoder.provider = "CPUExecutionProvider"
+    seen_shapes: list[tuple[int, ...]] = []
+    events: list[dict[str, object]] = []
+
+    def run_to_host(_session, _input_name, _values, _output_name, output_shape):
+        seen_shapes.append(tuple(output_shape))
+        return np.zeros(output_shape, dtype=np.float16)
+
+    encoder._run_to_host = run_to_host
+    values = np.zeros((1, 2, 5, 20, 28), dtype=np.float16)
+    result = encoder._run_tiled_stage(
+        object(),
+        values,
+        input_name="stage1_activation",
+        output_name="tail_activation",
+        output_channels=3,
+        output_frames=5,
+        tile_height=12,
+        tile_width=16,
+        overlap=4,
+        stage="tail",
+        temporal_index=0,
+        temporal_clips=1,
+        callback=lambda details: events.append(details),
+        spatial_downsample=4,
+    )
+
+    assert result.shape == (1, 3, 5, 5, 7)
+    assert seen_shapes == [(1, 3, 5, 3, 4)] * 4
+    assert {event["stage"] for event in events} == {"tail"}
 
 
 def test_high_vram_video_encoder_keeps_reference_overlap(monkeypatch) -> None:
@@ -417,7 +452,7 @@ def test_staged_image_encoder_uses_only_causal_token_zero() -> None:
     encoder.clip_length = 17
     seen: list[np.ndarray] = []
 
-    def fake_encode(pixels, _callback=None):
+    def fake_encode(pixels, _callback=None, **_kwargs):
         seen.append(pixels.copy())
         return np.arange(3, dtype=np.float32).reshape(1, 1, 3, 1, 1)
 
@@ -560,10 +595,58 @@ def test_sample_latents_emits_step_checkpoints() -> None:
             (current, total, video.copy(), audio.copy())
         ),
     )
-
     assert [(current, total) for current, total, _, _ in checkpoints] == [(1, 2), (2, 2)]
     assert not np.array_equal(checkpoints[0][2], checkpoints[1][2])
 
+
+def test_sample_ref2va_latents_only_updates_target_latents() -> None:
+    reference_video = np.full((1, 24, 1, 2, 2), 7.0, dtype=np.float32)
+    reference_audio = np.full((1, 32, 2, 1), 9.0, dtype=np.float32)
+    seen: list[tuple[tuple[np.ndarray, ...], tuple[np.ndarray, ...], object]] = []
+
+    class Runtime:
+        sampling_step = 0
+        sampling_steps = 0
+        audio_fallback_reason = None
+
+        @staticmethod
+        def prepare_text(states):
+            return states
+
+        @staticmethod
+        def denoise_ref2va_step(
+            video,
+            audio,
+            text_states,
+            sigma,
+            reference_video_latents,
+            reference_audio_latents,
+            layout,
+            text_is_refined=False,
+        ):
+            assert text_is_refined is True
+            seen.append((reference_video_latents, reference_audio_latents, layout))
+            return np.ones_like(video), np.ones_like(audio)
+
+    video = np.zeros((1, 24, 1, 2, 2), dtype=np.float32)
+    audio = np.zeros((1, 32, 2, 1), dtype=np.float32)
+    marker = object()
+    sampled_video, sampled_audio = sample_ref2va_latents(
+        Runtime(),
+        video,
+        audio,
+        np.zeros((1, 5376), dtype=np.float32),
+        [reference_video],
+        [reference_audio],
+        marker,
+        steps=1,
+    )
+
+    np.testing.assert_array_equal(sampled_video, np.ones_like(video))
+    np.testing.assert_array_equal(sampled_audio, np.ones_like(audio))
+    np.testing.assert_array_equal(reference_video, np.full_like(reference_video, 7.0))
+    np.testing.assert_array_equal(reference_audio, np.full_like(reference_audio, 9.0))
+    assert seen[0][2] is marker
 
 def test_sample_latents_passes_conditioning_sigma_to_denoiser() -> None:
     class Runtime:
@@ -636,8 +719,8 @@ def test_sample_latents_keeps_sparse_anchor_clean_and_masks_its_update() -> None
         assert seen[0, 0, 1, 0, 0] == pytest.approx(10.0)
         assert conditioned_indices == (1,)
     assert sampled[0, 0, 1, 0, 0] == pytest.approx(10.0)
-    assert sampled[0, 0, 0, 0, 0] == pytest.approx(0.0)
-    assert sampled[0, 0, 2, 0, 0] == pytest.approx(2.0)
+    assert sampled[0, 0, 0, 0, 0] == pytest.approx(2.0)
+    assert sampled[0, 0, 2, 0, 0] == pytest.approx(4.0)
 
 
 def test_sample_latents_zero_sigma_is_a_pure_reconstruction() -> None:
@@ -701,6 +784,44 @@ def test_single_graph_audio_decoder_accepts_dynamic_frames(tmp_path) -> None:
     waveform = decode_audio_latents_onnx(tmp_path, latents, prefer_cuda=False)
 
     np.testing.assert_array_equal(waveform, latents)
+
+
+def test_audio_encoder_readiness_rejects_legacy_decoder_only_product(tmp_path: Path) -> None:
+    (tmp_path / "audio_decoder.onnx").write_bytes(b"decoder")
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "component": "audio_vae",
+                "layout": "single_graph_decoder",
+                "graphs": ["audio_decoder.onnx"],
+                "validation": {"decoder": {}},
+                "validation_passed": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert audio_vae_encoder_ready(tmp_path) is False
+
+    (tmp_path / "audio_encoder.onnx").write_bytes(b"encoder")
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "component": "audio_vae",
+                "layout": "dual_graph_autoencoder",
+                "sample_rate": 32_000,
+                "samples_per_latent": 800,
+                "audio_channels": 2,
+                "latent_channels": 32,
+                "graphs": ["audio_encoder.onnx", "audio_decoder.onnx"],
+                "validation": {"encoder": {}, "decoder": {}},
+                "validation_passed": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert audio_vae_encoder_ready(tmp_path) is True
 
 
 def test_l1_session_prefetch_overlaps_following_shard(tmp_path) -> None:

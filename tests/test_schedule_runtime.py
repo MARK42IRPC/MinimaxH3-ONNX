@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from h3_workbench.profiles import PROFILE_360P_17F
+from h3_workbench.reference import ReferenceSpec, build_ref2va_packed_layout
 from h3_workbench.schedule_runtime import ScheduleMainRuntime
 
 
@@ -123,6 +124,130 @@ def test_runtime_requires_v2_schedule(tmp_path: Path) -> None:
         ScheduleMainRuntime(tmp_path, _Runner())
 
 
+def test_runtime_activity_labels_follow_loaded_main_product() -> None:
+    runtime = object.__new__(ScheduleMainRuntime)
+
+    runtime._supports_ref2va = True
+    assert runtime._main_module_label == "Ref2VA"
+    assert runtime._loader_module_label == "Ref2VA Loader"
+    assert runtime._diagnostics_module_label == "Ref2VA Diagnostics"
+
+    runtime._supports_ref2va = False
+    assert runtime._main_module_label == "FL2VA"
+    assert runtime._loader_module_label == "FL2VA Loader"
+    assert runtime._diagnostics_module_label == "FL2VA Diagnostics"
+
+
+def test_ref2va_ops_scatter_modalities_and_extract_only_target_rows() -> None:
+    references = [
+        ReferenceSpec(kind="image", path="image.png"),
+        ReferenceSpec(kind="audio", path="voice.wav", has_audio=True),
+    ]
+    layout = build_ref2va_packed_layout(
+        text_token_tags=np.asarray([1, 0], dtype=np.int64),
+        references=references,
+        condition_video_shapes=[(1, 2, 2)],
+        condition_audio_row_counts=[4],
+        target_video_shape=(2, 2, 2),
+        num_target_audio_latents=2,
+    )
+    runtime = object.__new__(ScheduleMainRuntime)
+    runtime.profile = PROFILE_360P_17F
+    runtime._turbo_adapter = None
+    runtime._validate_graph_outputs = False
+    external = {
+        "video": np.zeros((1, 24, 2, 2, 2), dtype=np.float32),
+        "audio": np.zeros((1, 32, 2, 2), dtype=np.float32),
+        "sigma": 0.5,
+        "reference_video_latents": (np.ones((1, 24, 1, 2, 2), dtype=np.float32),),
+        "reference_audio_latents": (np.ones((1, 32, 2, 2), dtype=np.float32),),
+        "ref2va_layout": layout,
+    }
+    constants = {"text_states": np.zeros((2, 5376), dtype=np.float32)}
+    buffers: dict[str, np.ndarray] = {}
+    denoise_step = {
+        "op": "denoise_inputs",
+        "inputs": {
+            "text_states": {"source": "const", "name": "text_states"},
+            "video_latent": {"source": "external", "name": "video"},
+            "audio_latent": {"source": "external", "name": "audio"},
+            "sigma_video": {"source": "external", "name": "sigma"},
+        },
+        "outputs": {
+            name: {"target": "buffer", "name": name}
+            for name in (
+                "video_patches",
+                "audio_patches",
+                "embedding_text_padding",
+                "timesteps",
+                "position_ids",
+                "modulation_ids",
+                "sigma_audio",
+            )
+        },
+    }
+
+    runtime._run_op(denoise_step, external, constants, buffers)
+
+    assert buffers["video_patches"].shape == (3, 96)
+    assert buffers["audio_patches"].shape == (8, 32)
+    np.testing.assert_array_equal(buffers["position_ids"], layout.position_ids.astype(np.float32))
+    np.testing.assert_allclose(buffers["timesteps"][-2:], np.asarray([0.999, 1.0], dtype=np.float32))
+    assert buffers["modulation_ids"].shape == layout.token_tags.shape
+
+    # The official MiniMax-H3 head emits data-ward velocity; the unpack op
+    # must preserve its sign for the scheduler's positive (sigma - next_sigma)
+    # Euler update.
+    unpack_step = {
+        "op": "unpack_velocity",
+        "inputs": {
+            "video_patches": {"source": "buffer", "name": "video_patches"},
+            "audio_patches": {"source": "buffer", "name": "audio_patches"},
+        },
+        "outputs": {
+            "video_velocity": {"target": "external", "name": "video_velocity"},
+            "audio_velocity": {"target": "external", "name": "audio_velocity"},
+        },
+    }
+    buffers["video_patches"] = np.ones((runtime.profile.video_tokens, 96), dtype=np.float32)
+    buffers["audio_patches"] = np.ones((runtime.profile.audio_tokens, 32), dtype=np.float32)
+    runtime._run_op(unpack_step, external, constants, buffers)
+    assert np.all(external["video_velocity"] == 1.0)
+    assert np.all(external["audio_velocity"] == 1.0)
+
+    audio_embeddings = np.full((layout.audio_indices.size, 5376), 20.0, dtype=np.float32)
+    video_embeddings = np.full((layout.video_indices.size, 5376), 30.0, dtype=np.float32)
+    buffers.update(audio_embeddings=audio_embeddings, video_embeddings=video_embeddings)
+    concat_step = {
+        "op": "concat_hidden",
+        "inputs": {
+            "text_states": {"source": "const", "name": "text_states"},
+            "audio_embeddings": {"source": "buffer", "name": "audio_embeddings"},
+            "video_embeddings": {"source": "buffer", "name": "video_embeddings"},
+        },
+        "outputs": {"hidden": {"target": "buffer", "name": "hidden"}},
+    }
+    runtime._run_op(concat_step, external, constants, buffers)
+    np.testing.assert_array_equal(buffers["hidden"][layout.text_indices], constants["text_states"])
+    assert np.all(buffers["hidden"][layout.audio_indices] == 20.0)
+    assert np.all(buffers["hidden"][layout.video_indices] == 30.0)
+
+    split_step = {
+        "op": "split_hidden",
+        "inputs": {
+            "hidden": {"source": "buffer", "name": "hidden"},
+            "text_states": {"source": "const", "name": "text_states"},
+        },
+        "outputs": {
+            "audio_hidden": {"target": "buffer", "name": "target_audio"},
+            "video_hidden": {"target": "buffer", "name": "target_video"},
+        },
+    }
+    runtime._run_op(split_step, external, constants, buffers)
+    assert buffers["target_audio"].shape[0] == layout.target_audio_indices.size
+    assert buffers["target_video"].shape[0] == layout.target_video_indices.size
+
+
 def test_preamble_executes_if_one_hot_and_reuses_session(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "schedule.json").write_text(json.dumps(_schedule()), encoding="utf-8")
     monkeypatch.setattr(
@@ -139,6 +264,41 @@ def test_preamble_executes_if_one_hot_and_reuses_session(tmp_path: Path, monkeyp
     assert runner.built == 1
     assert runtime.warm_fixed_sessions()["warmed_sessions"] == 1
     assert runner.built == 1
+
+
+def test_runtime_prefers_ref2va_virtual_source_weights(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "schedule.json").write_text(json.dumps(_schedule()), encoding="utf-8")
+    monkeypatch.setattr(
+        "h3_workbench.schedule_runtime.validate_runtime_schedule",
+        lambda schedule, directory: None,
+    )
+
+    class VirtualWeights:
+        def __init__(self, directory, runner, graph_paths) -> None:
+            self.graph_paths = graph_paths
+            self.closed = False
+
+        def prime_ram_cache(self):
+            return {"virtual_source": True}
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        "h3_workbench.ref2va_virtual_slicer.ref2va_virtual_ready",
+        lambda directory: True,
+    )
+    monkeypatch.setattr(
+        "h3_workbench.ref2va_virtual_slicer.Ref2VASourceWeights",
+        VirtualWeights,
+    )
+
+    runtime = ScheduleMainRuntime(tmp_path, _Runner())
+
+    assert isinstance(runtime._persistent_weights, VirtualWeights)
+    assert runtime._ram_cache_prime == {"virtual_source": True}
+    runtime.close()
+    assert runtime._persistent_weights is None
 
 
 class _DirectSession:

@@ -19,13 +19,18 @@ def _load_tokenizer(directory: str) -> AutoTokenizer:
     return AutoTokenizer.from_pretrained(directory, local_files_only=True)
 
 
+def load_tokenizer(directory: Path) -> AutoTokenizer:
+    """Load the tokenizer object used to build multimodal presentations."""
+    if not tokenizer_files_ready(directory):
+        raise FileNotFoundError(f"Incomplete H3 tokenizer directory: {directory}")
+    return _load_tokenizer(str(directory.resolve()))
+
+
 def encode_prompt(prompt: str, directory: Path, max_tokens: int = 192) -> np.ndarray:
     prompt = prompt.strip()
     if not prompt:
         raise ValueError("Prompt must not be empty")
-    if not tokenizer_files_ready(directory):
-        raise FileNotFoundError(f"Incomplete H3 tokenizer directory: {directory}")
-    tokenizer = _load_tokenizer(str(directory.resolve()))
+    tokenizer = load_tokenizer(directory)
     token_ids = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
         tokenize=True,

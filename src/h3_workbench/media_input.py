@@ -15,6 +15,7 @@ import torch.nn.functional as F
 InterpolationMode = Literal["nearest", "bilinear", "bicubic", "trilinear"]
 VIDEO_SUFFIXES = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".webp"}
+AUDIO_SUFFIXES = {".aac", ".flac", ".m4a", ".mp3", ".ogg", ".opus", ".wav", ".wma"}
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,24 @@ class VideoInfo:
         }
 
 
+@dataclass(frozen=True)
+class AudioInfo:
+    path: str
+    sample_rate: int
+    channels: int
+    samples: int
+    duration_seconds: float
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "sample_rate": self.sample_rate,
+            "channels": self.channels,
+            "samples": self.samples,
+            "duration_seconds": self.duration_seconds,
+        }
+
+
 def resolve_video_path(workspace: Path, raw_path: str) -> Path:
     candidate = Path(raw_path.strip())
     if not candidate.is_absolute():
@@ -82,6 +101,21 @@ def resolve_image_path(workspace: Path, raw_path: str) -> Path:
         raise ValueError("Input image does not exist")
     if resolved.suffix.lower() not in IMAGE_SUFFIXES:
         raise ValueError(f"Unsupported input image extension: {resolved.suffix or '(none)'}")
+    return resolved
+
+
+def resolve_audio_path(workspace: Path, raw_path: str) -> Path:
+    candidate = Path(raw_path.strip())
+    if not candidate.is_absolute():
+        candidate = workspace / candidate
+    resolved = candidate.resolve()
+    root = workspace.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise ValueError("Input audio must be inside the workspace")
+    if not resolved.is_file():
+        raise ValueError("Input audio does not exist")
+    if resolved.suffix.lower() not in AUDIO_SUFFIXES:
+        raise ValueError(f"Unsupported input audio extension: {resolved.suffix or '(none)'}")
     return resolved
 
 
@@ -231,6 +265,33 @@ def probe_image(path: Path) -> ImageInfo:
     return ImageInfo(path=str(path), width=width, height=height)
 
 
+def probe_audio(path: Path) -> AudioInfo:
+    data = _ffprobe(path)
+    streams = data.get("streams") or []
+    audio = next((item for item in streams if item.get("codec_type") == "audio"), None)
+    if not isinstance(audio, dict):
+        raise ValueError("Input file has no audio stream")
+    sample_rate = int(audio.get("sample_rate") or 0)
+    channels = int(audio.get("channels") or 0)
+    if sample_rate <= 0 or channels <= 0:
+        raise ValueError("Input audio has invalid sample rate or channel count")
+    format_data = data.get("format") or {}
+    duration = _float(audio.get("duration"), _float(format_data.get("duration")))
+    if duration <= 0:
+        duration_ts = _float(audio.get("duration_ts"))
+        time_base = _ratio(str(audio.get("time_base") or ""), default=0.0)
+        duration = duration_ts * time_base
+    if duration <= 0:
+        raise ValueError("Input audio has no readable duration")
+    return AudioInfo(
+        path=str(path),
+        sample_rate=sample_rate,
+        channels=channels,
+        samples=max(1, round(duration * sample_rate)),
+        duration_seconds=duration,
+    )
+
+
 def read_image(path: Path, info: ImageInfo | None = None, max_bytes: int = 128 * 1024**2) -> np.ndarray:
     info = info or probe_image(path)
     expected_bytes = info.width * info.height * 3
@@ -266,6 +327,51 @@ def read_image(path: Path, info: ImageInfo | None = None, max_bytes: int = 128 *
     raw = np.frombuffer(result.stdout[:expected_bytes], dtype=np.uint8)
     image = raw.reshape(info.height, info.width, 3).copy()
     return np.ascontiguousarray(image.transpose(2, 0, 1)[None, :, None], dtype=np.float32) / 255.0
+
+
+def read_reference_image(
+    path: Path,
+    target_height: int,
+    target_width: int,
+    max_bytes: int = 512 * 1024**2,
+) -> np.ndarray:
+    """Decode an image at Ref2VA's LANCZOS-normalized geometry as uint8 HWC."""
+    if target_height < 1 or target_width < 1:
+        raise ValueError("Reference image dimensions must be positive")
+    expected_bytes = target_width * target_height * 3
+    if expected_bytes > max_bytes:
+        raise ValueError(
+            f"Reference image exceeds the decode budget: "
+            f"{expected_bytes / 1024**2:.1f} MiB > {max_bytes / 1024**2:.1f} MiB"
+        )
+    command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        str(path),
+        "-map",
+        "0:v:0",
+        "-vf",
+        f"scale={target_width}:{target_height}:flags=lanczos",
+        "-frames:v",
+        "1",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "pipe:1",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, check=False, timeout=120)
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg was not found on PATH") from exc
+    if result.returncode != 0:
+        raise ValueError(result.stderr.decode("utf-8", errors="replace").strip() or "ffmpeg image decode failed")
+    if len(result.stdout) < expected_bytes:
+        raise ValueError("ffmpeg decoded an incomplete reference image")
+    raw = np.frombuffer(result.stdout[:expected_bytes], dtype=np.uint8)
+    return np.ascontiguousarray(raw.reshape(target_height, target_width, 3).copy())
 
 
 def read_video_frames(path: Path, info: VideoInfo | None = None, max_bytes: int = 2 * 1024**3) -> np.ndarray:
@@ -306,6 +412,116 @@ def read_video_frames(path: Path, info: VideoInfo | None = None, max_bytes: int 
     raw = np.frombuffer(result.stdout[: actual_frames * frame_size], dtype=np.uint8)
     frames = raw.reshape(actual_frames, info.height, info.width, 3).copy()
     return np.ascontiguousarray(frames.transpose(3, 0, 1, 2)[None], dtype=np.float32) / 255.0
+
+
+def read_reference_video_frames(
+    path: Path,
+    info: VideoInfo | None = None,
+    target_fps: float = 24.0,
+    target_height: int | None = None,
+    target_width: int | None = None,
+    max_frames: int | None = None,
+    max_bytes: int = 2 * 1024**3,
+) -> np.ndarray:
+    info = info or probe_video(path)
+    if target_fps <= 0:
+        raise ValueError("Target reference frame rate must be positive")
+    if (target_height is None) != (target_width is None):
+        raise ValueError("Reference target height and width must be provided together")
+    height = target_height or info.height
+    width = target_width or info.width
+    frame_count = max(1, round(info.duration_seconds * target_fps))
+    if max_frames is not None:
+        frame_count = min(frame_count, max_frames)
+    expected_bytes = frame_count * width * height * 3
+    if expected_bytes > max_bytes:
+        raise ValueError(
+            f"Reference video exceeds the decode budget: "
+            f"{expected_bytes / 1024**3:.2f} GiB > {max_bytes / 1024**3:.2f} GiB"
+        )
+    filters = [f"fps={target_fps:g}"]
+    if (height, width) != (info.height, info.width):
+        filters.append(f"scale={width}:{height}:flags=lanczos")
+    command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        str(path),
+        "-map",
+        "0:v:0",
+        "-vf",
+        ",".join(filters),
+        "-frames:v",
+        str(frame_count),
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "pipe:1",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, check=False, timeout=600)
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg was not found on PATH") from exc
+    if result.returncode != 0:
+        raise ValueError(result.stderr.decode("utf-8", errors="replace").strip() or "ffmpeg video decode failed")
+    frame_size = width * height * 3
+    actual_frames = len(result.stdout) // frame_size
+    if actual_frames < 1:
+        raise ValueError("ffmpeg decoded no reference video frames")
+    raw = np.frombuffer(result.stdout[: actual_frames * frame_size], dtype=np.uint8)
+    return raw.reshape(actual_frames, height, width, 3).copy()
+
+
+def read_audio_waveform(
+    path: Path,
+    target_sample_rate: int = 32_000,
+    target_channels: int = 2,
+    max_duration_seconds: float | None = None,
+    max_bytes: int = 512 * 1024**2,
+) -> np.ndarray:
+    if target_sample_rate <= 0 or target_channels <= 0:
+        raise ValueError("Target audio sample rate and channel count must be positive")
+    info = probe_audio(path)
+    duration = info.duration_seconds
+    if max_duration_seconds is not None:
+        if max_duration_seconds <= 0:
+            raise ValueError("Audio decode duration must be positive")
+        duration = min(duration, max_duration_seconds)
+    expected_samples = max(1, math.ceil(duration * target_sample_rate))
+    expected_bytes = expected_samples * target_channels * np.dtype(np.float32).itemsize
+    if expected_bytes > max_bytes:
+        raise ValueError(
+            f"Reference audio exceeds the decode budget: "
+            f"{expected_bytes / 1024**2:.1f} MiB > {max_bytes / 1024**2:.1f} MiB"
+        )
+    command = ["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a:0"]
+    if max_duration_seconds is not None:
+        command.extend(("-t", f"{max_duration_seconds:.9g}"))
+    command.extend(
+        (
+            "-ac",
+            str(target_channels),
+            "-ar",
+            str(target_sample_rate),
+            "-f",
+            "f32le",
+            "pipe:1",
+        )
+    )
+    try:
+        result = subprocess.run(command, capture_output=True, check=False, timeout=600)
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg was not found on PATH") from exc
+    if result.returncode != 0:
+        raise ValueError(result.stderr.decode("utf-8", errors="replace").strip() or "ffmpeg audio decode failed")
+    values = np.frombuffer(result.stdout, dtype="<f4")
+    samples = values.size // target_channels
+    if samples < 1:
+        raise ValueError("ffmpeg decoded no audio samples")
+    values = values[: samples * target_channels].reshape(samples, target_channels).T.copy()
+    return np.ascontiguousarray(values, dtype=np.float32)
 
 
 def resize_video_spatiotemporal(

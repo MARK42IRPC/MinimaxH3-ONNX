@@ -24,8 +24,10 @@ from h3_workbench.device_profile import probe_device_profiles, select_device_pro
 from h3_workbench.jobs import JobManager, resolve_main_model_directory
 from h3_workbench.memory_planner import main_model_shards, plan_shard_batches, probe_gpu_memory
 from h3_workbench.media_input import (
+    AUDIO_SUFFIXES,
     IMAGE_SUFFIXES,
     VIDEO_SUFFIXES,
+    probe_audio,
     probe_image,
     probe_video,
     resolve_video_path,
@@ -71,6 +73,14 @@ def _complete_main_model(directory: Path) -> bool:
         manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, ValueError, TypeError):
         return False
+    if manifest.get("component") == "ref2va_transformer":
+        try:
+            from h3_workbench.ref2va_virtual_slicer import validated_ref2va_virtual_ready
+
+            if not validated_ref2va_virtual_ready(directory):
+                return False
+        except (ImportError, OSError, TypeError, ValueError):
+            return False
     schedule = directory / str(manifest.get("schedule", ""))
     return (
         manifest.get("validation_passed") is True
@@ -129,6 +139,7 @@ class InferenceRequest(BaseModel):
     conditioning_mode: Literal["text", "first", "last", "first_last"] = "text"
     start_image_path: str | None = Field(default=None, max_length=2048)
     end_image_path: str | None = Field(default=None, max_length=2048)
+    references: list[dict[str, object]] | None = None
     attention_query_chunk: int = Field(default=512, ge=32, le=512)
     l1_prefetch_shards: int = Field(default=2, ge=0, le=4)
 
@@ -158,6 +169,40 @@ class InferenceRequest(BaseModel):
                 f"conditioning_mode={self.conditioning_mode!r} requires "
                 f"start_image_path={expected[0]} and end_image_path={expected[1]}"
             )
+        if self.references is not None:
+            if not self.references:
+                self.references = None
+            else:
+                if not self.prompt or not self.prompt.strip():
+                    raise ValueError("Ref2VA references require prompt text")
+                if self.token_ids:
+                    raise ValueError("Ref2VA references require prompt text, not token_ids")
+                if self.use_acceleration_lora:
+                    raise ValueError("Ref2VA references are incompatible with Turbo v4 acceleration")
+                if self.temporal_mode != "native":
+                    raise ValueError("Ref2VA references require native temporal mode")
+                if self.conditioning_mode != "text":
+                    raise ValueError("Ref2VA references are incompatible with frame conditioning")
+                if not 5.0 <= self.duration_seconds <= 15.0:
+                    raise ValueError("Ref2VA generation duration must be from 5 to 15 seconds")
+                if len(self.references) > 12:
+                    raise ValueError("MiniMax-H3 accepts at most 12 references in total")
+                kinds: list[str] = []
+                for reference in self.references:
+                    if not isinstance(reference, dict):
+                        raise ValueError("Each reference must be an object")
+                    kind = str(reference.get("kind") or reference.get("type") or "").strip().lower()
+                    path = str(reference.get("path") or reference.get("uri") or "").strip()
+                    if kind not in {"image", "video", "audio"}:
+                        raise ValueError(f"Unknown reference kind: {kind or '(empty)'}")
+                    if not path or len(path) > 2048:
+                        raise ValueError("Reference path must contain from 1 to 2048 characters")
+                    kinds.append(kind)
+                for kind, limit in (("image", 9), ("video", 3), ("audio", 3)):
+                    if kinds.count(kind) > limit:
+                        raise ValueError(f"MiniMax-H3 accepts at most {limit} {kind} references")
+                if set(kinds) == {"audio"}:
+                    raise ValueError("An audio reference must be paired with an image or video reference")
         return self
 
 
@@ -392,6 +437,40 @@ async def upload_image(request: Request) -> dict[str, object]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/audio/upload", status_code=201)
+async def upload_audio(request: Request) -> dict[str, object]:
+    filename = _decode_upload_filename(request, AUDIO_SUFFIXES, "audio")
+    max_upload_bytes = 256 * 1024**2
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > max_upload_bytes:
+                raise HTTPException(status_code=413, detail="Uploaded audio exceeds the 256 MiB limit")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length") from exc
+    input_root = (settings.workspace / ".h3-workbench" / "inputs").resolve()
+    input_root.mkdir(parents=True, exist_ok=True)
+    destination = (input_root / f"{uuid.uuid4().hex[:12]}-{filename}").resolve()
+    if input_root not in destination.parents:
+        raise HTTPException(status_code=400, detail="Invalid upload filename")
+    written = 0
+    try:
+        with destination.open("wb") as output:
+            async for chunk in request.stream():
+                written += len(chunk)
+                if written > max_upload_bytes:
+                    raise HTTPException(status_code=413, detail="Uploaded audio exceeds the 256 MiB limit")
+                output.write(chunk)
+        info = probe_audio(destination)
+        return {"path": str(destination), "size_bytes": written, "audio": info.to_dict()}
+    except HTTPException:
+        destination.unlink(missing_ok=True)
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 def _source_asset_status(asset: SourceAsset) -> dict[str, object]:
     cached = settings.state_dir / "sources" / asset.repo_id.replace("/", "--") / asset.path
     local = settings.workspace / Path(asset.path).name
@@ -438,6 +517,13 @@ def _preset_product_ready(preset: ExportPreset, directory: Path) -> bool:
         )
     if preset.product_type == "runtime_adapter":
         return _runtime_adapter_ready(directory)
+    if preset.component == "ref2va_transformer":
+        try:
+            from h3_workbench.ref2va_virtual_slicer import validated_ref2va_virtual_ready
+
+            return validated_ref2va_virtual_ready(directory)
+        except (ImportError, OSError, TypeError, ValueError):
+            return False
     if preset.component == "fl2va_transformer":
         return _complete_main_model(directory)
     return _manifest_has_blocks(directory / "manifest.json", 0)
@@ -445,8 +531,13 @@ def _preset_product_ready(preset: ExportPreset, directory: Path) -> bool:
 
 def _preset_product_directory(preset: ExportPreset) -> Path:
     product = settings.workspace / preset.output_dir
-    if preset.component == "fl2va_transformer":
-        resolved = resolve_main_model_directory(settings.workspace, settings.output_dir, accelerated=False)
+    if preset.component in {"fl2va_transformer", "ref2va_transformer"}:
+        resolved = resolve_main_model_directory(
+            settings.workspace,
+            settings.output_dir,
+            accelerated=False,
+            component=preset.component,
+        )
         if resolved is not None:
             product = resolved
     return product
@@ -589,6 +680,7 @@ def create_inference(request: InferenceRequest) -> dict[str, object]:
             conditioning_mode=request.conditioning_mode,
             start_image_path=request.start_image_path,
             end_image_path=request.end_image_path,
+            references=request.references,
         ).to_dict()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -625,6 +717,18 @@ def generation_profiles() -> list[dict[str, object]]:
     device_profiles = probe_device_profiles()
     providers = ort.get_available_providers()
     main_directory = resolve_main_model_directory(settings.workspace, settings.output_dir, accelerated=False)
+    ref2va_directory = resolve_main_model_directory(
+        settings.workspace,
+        settings.output_dir,
+        accelerated=False,
+        component="ref2va_transformer",
+    )
+    fl2va_directory = resolve_main_model_directory(
+        settings.workspace,
+        settings.output_dir,
+        accelerated=False,
+        component="fl2va_transformer",
+    )
     turbo_preset = next(item for item in EXPORT_PRESETS if item.id == "fl2va_turbo_v4")
     turbo_directory = _preset_product_directory(turbo_preset)
     qwen_directory = resolve_qwen_directory(settings.output_dir)
@@ -634,7 +738,28 @@ def generation_profiles() -> list[dict[str, object]]:
         if qwen_directory.name.endswith("_int8_virtual")
         else _manifest_has_blocks(qwen_manifest, 50)
     )
-    acceleration_ready = main_directory is not None and _runtime_adapter_ready(turbo_directory, main_directory)
+    acceleration_ready = fl2va_directory is not None and _runtime_adapter_ready(turbo_directory, fl2va_directory)
+    main_component: str | None = None
+    main_label = "主模型"
+    main_capabilities: list[str] = []
+    if main_directory is not None:
+        try:
+            main_manifest = json.loads((main_directory / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            main_manifest = {}
+        main_component = str(main_manifest.get("component") or "") or None
+        if main_component is None and "fl2va" in main_directory.name.lower():
+            main_component = "fl2va_transformer"
+        raw_capabilities = main_manifest.get("capabilities", [])
+        main_capabilities = [str(item) for item in raw_capabilities if isinstance(item, str)] if isinstance(raw_capabilities, list) else []
+        if main_component == "ref2va_transformer":
+            main_label = "Ref2VA 虚拟切片基座"
+            if not main_capabilities:
+                main_capabilities = ["t2va", "fl2va", "ref2va"]
+        elif main_component == "fl2va_transformer":
+            main_label = "FL2VA 流式基座"
+            if not main_capabilities:
+                main_capabilities = ["t2va", "fl2va"]
     tokenizer_ready = tokenizer_files_ready(settings.workspace / "qwen_tokenizer")
     video_directory = settings.output_dir / "video_vae"
     try:
@@ -648,6 +773,7 @@ def generation_profiles() -> list[dict[str, object]]:
         and persistent_video_vae_ready(video_directory, video_blocks)
     )
     audio_vae_ready = _manifest_has_blocks(settings.output_dir / "audio_vae" / "manifest.json", 0)
+    ref2va_ready = ref2va_directory is not None
     shards = main_model_shards(main_directory) if main_directory is not None else []
     main_ready = main_directory is not None
     result: list[dict[str, object]] = []
@@ -662,6 +788,13 @@ def generation_profiles() -> list[dict[str, object]]:
                 "device_profiles": [item.to_dict() for item in device_profiles],
                 "qwen_ready": qwen_ready,
                 "main_ready": main_ready,
+                "ref2va_ready": ref2va_ready,
+                "ref2va_label": "Ref2VA 虚拟切片基座",
+                "main_component": main_component,
+                "main_label": main_label,
+                "main_capabilities": main_capabilities,
+                "turbo_base_ready": fl2va_directory is not None,
+                "turbo_base_label": "FL2VA 流式基座（Turbo 专用）",
                 "acceleration_ready": acceleration_ready,
                 "acceleration_active": False,
                 "tokenizer_ready": tokenizer_ready,

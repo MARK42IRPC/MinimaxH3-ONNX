@@ -27,6 +27,33 @@ from h3_workbench.vendor.video_vae import (
 from h3_workbench.profiles import video_vae_output_frames
 
 
+def _video_vae_posterior_latents(
+    moments: np.ndarray,
+    *,
+    sample_posterior: bool,
+    posterior_seed: int,
+) -> np.ndarray:
+    """Convert Video VAE moments to normalized conditioning latents."""
+    values = np.asarray(moments, dtype=np.float32)
+    if values.ndim != 5 or values.shape[1] != len(LATENTS_MEAN) * 2:
+        raise ValueError(f"Unexpected Video VAE moments shape: {values.shape}")
+    mean, logvar = np.split(values, 2, axis=1)
+    if sample_posterior:
+        # Match diffusers' DiagonalGaussianDistribution and H3's fresh CPU
+        # generator per reference.  The released pipeline rounds the sampled
+        # latent to FP16 before applying latent mean/std normalization.
+        generator = torch.Generator(device="cpu").manual_seed(int(posterior_seed))
+        noise = torch.randn(mean.shape, generator=generator, dtype=torch.float32).numpy()
+        std = np.exp(0.5 * np.clip(logvar, -30.0, 20.0)).astype(np.float32, copy=False)
+        latent = mean + std * noise
+        latent = latent.astype(np.float16).astype(np.float32)
+    else:
+        latent = mean
+    latent_mean = np.asarray(LATENTS_MEAN, dtype=np.float32).reshape(1, -1, 1, 1, 1)
+    latent_std = np.asarray(LATENTS_STD, dtype=np.float32).reshape(1, -1, 1, 1, 1)
+    return np.ascontiguousarray((latent - latent_mean) / latent_std, dtype=np.float32)
+
+
 def _video_vae_temporal_windows(latent_frames: int) -> tuple[list[tuple[int, int]], int]:
     """Return the reference VAE's seven-token windows at a five-token stride."""
     if latent_frames < 2:
@@ -576,6 +603,28 @@ def video_vae_temporal_encoder_ready(directory: Path) -> bool:
                 (directory / str(graphs[name])).is_file()
                 for name in ("prelude", "late", "tail", "head")
             )
+        )
+    except (OSError, KeyError, TypeError, ValueError):
+        return False
+
+
+def audio_vae_encoder_ready(directory: Path) -> bool:
+    try:
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        validation = manifest["validation"]
+        graphs = set(manifest["graphs"])
+        return (
+            manifest.get("component") == "audio_vae"
+            and manifest.get("layout") == "dual_graph_autoencoder"
+            and manifest.get("validation_passed") is True
+            and isinstance(validation.get("encoder"), dict)
+            and int(manifest.get("sample_rate", 0)) == 32_000
+            and int(manifest.get("samples_per_latent", 0)) == 800
+            and int(manifest.get("audio_channels", 0)) == 2
+            and int(manifest.get("latent_channels", 0)) == 32
+            and {"audio_encoder.onnx", "audio_decoder.onnx"}.issubset(graphs)
+            and (directory / "audio_encoder.onnx").is_file()
+            and (directory / "audio_decoder.onnx").is_file()
         )
     except (OSError, KeyError, TypeError, ValueError):
         return False
@@ -1381,12 +1430,20 @@ class ONNXVideoVAEEncoder:
         temporal_index: int,
         temporal_clips: int,
         callback: Callable[[dict[str, object]], None] | None,
+        spatial_downsample: int = 2,
     ) -> np.ndarray:
+        if spatial_downsample < 1:
+            raise ValueError("Video VAE stage spatial_downsample must be positive")
+        if values.shape[3] % spatial_downsample or values.shape[4] % spatial_downsample:
+            raise ValueError(
+                "Video VAE stage input dimensions must be divisible by spatial_downsample: "
+                f"{values.shape[3:5]} / {spatial_downsample}"
+            )
         y_starts, y_lengths, y_overlaps = _split_tiles(
-            int(values.shape[3]), tile_height, overlap, 2
+            int(values.shape[3]), tile_height, overlap, spatial_downsample
         )
         x_starts, x_lengths, x_overlaps = _split_tiles(
-            int(values.shape[4]), tile_width, overlap, 2
+            int(values.shape[4]), tile_width, overlap, spatial_downsample
         )
         entries = [
             (row, column, y_start, y_length, x_start, x_length)
@@ -1421,8 +1478,8 @@ class ONNXVideoVAEEncoder:
                 1,
                 output_channels,
                 output_frames,
-                y_length // 2,
-                x_length // 2,
+                y_length // spatial_downsample,
+                x_length // spatial_downsample,
             )
             outputs[(row, column)] = self._run_to_host(
                 session,
@@ -1439,11 +1496,11 @@ class ONNXVideoVAEEncoder:
         return _assemble_video_vae_tiles(
             outputs,
             y_starts,
-            [value // 2 for value in y_overlaps],
+            [value // spatial_downsample for value in y_overlaps],
             x_starts,
-            [value // 2 for value in x_overlaps],
-            int(values.shape[3]) // 2,
-            int(values.shape[4]) // 2,
+            [value // spatial_downsample for value in x_overlaps],
+            int(values.shape[3]) // spatial_downsample,
+            int(values.shape[4]) // spatial_downsample,
             canvas_dtype=None,
         )
 
@@ -1529,18 +1586,34 @@ class ONNXVideoVAEEncoder:
             session = next_session.result()
             next_session = executor.submit(self._session, "head")
             try:
-                if self.provider == "CUDAExecutionProvider":
-                    tail = self._run_cuda_to_device(
-                        session,
-                        "stage1_activation",
-                        stage1,
-                        "tail_activation",
-                        tail_shape,
-                    )
-                else:
-                    tail = session.run(  # type: ignore[attr-defined]
-                        ["tail_activation"], {"stage1_activation": stage1}
-                    )[0]
+                # The compact tail still receives the full /4 activation map
+                # for a large 2048px reference image. Keep that map on the
+                # host and run the /4 -> /16 tail one spatial tile at a time;
+                # transferring the whole activation would exceed a 4 GiB GPU.
+                tail = self._run_tiled_stage(
+                    session,
+                    stage1,
+                    input_name="stage1_activation",
+                    output_name="tail_activation",
+                    output_channels=self.channels["tail"],
+                    output_frames=self.temporal_tokens,
+                    tile_height=(
+                        self.stage1_tile_height
+                        if tile_height == self.tile_height
+                        else max(96, tile_height // 2)
+                    ),
+                    tile_width=(
+                        self.stage1_tile_width
+                        if tile_width == self.tile_width
+                        else max(96, tile_width // 2)
+                    ),
+                    overlap=self.stage1_overlap,
+                    stage="tail",
+                    temporal_index=temporal_index,
+                    temporal_clips=temporal_clips,
+                    callback=callback,
+                    spatial_downsample=4,
+                )
             finally:
                 del stage1
                 del session
@@ -1591,6 +1664,10 @@ class ONNXVideoVAEEncoder:
         tile_height: int,
         tile_width: int,
         callback: Callable[[dict[str, object]], None] | None,
+        *,
+        sample_posterior: bool,
+        posterior_seed: int,
+        first_token_only: bool,
     ) -> np.ndarray:
         temporal_clips = int(np.ceil(pixels.shape[2] / self.clip_length))
         clip_moments: list[np.ndarray] = []
@@ -1630,15 +1707,22 @@ class ONNXVideoVAEEncoder:
         moments = np.concatenate(clip_moments, axis=2)
         if self.token_drop > 0:
             moments = moments[:, :, :-self.token_drop]
-        mean = np.split(moments.astype(np.float32, copy=False), 2, axis=1)[0]
-        latent_mean = np.asarray(LATENTS_MEAN, dtype=np.float32).reshape(1, -1, 1, 1, 1)
-        latent_std = np.asarray(LATENTS_STD, dtype=np.float32).reshape(1, -1, 1, 1, 1)
-        return (mean - latent_mean) / latent_std
+        if first_token_only:
+            moments = moments[:, :, :1]
+        return _video_vae_posterior_latents(
+            moments,
+            sample_posterior=sample_posterior,
+            posterior_seed=posterior_seed,
+        )
 
     def encode(
         self,
         pixels: np.ndarray,
         callback: Callable[[dict[str, object]], None] | None = None,
+        *,
+        sample_posterior: bool = False,
+        posterior_seed: int = 42,
+        first_token_only: bool = False,
     ) -> np.ndarray:
         candidates = [
             (self.tile_height, self.tile_width),
@@ -1650,12 +1734,30 @@ class ONNXVideoVAEEncoder:
         last_error: Exception | None = None
         for index, (tile_height, tile_width) in enumerate(candidates):
             try:
-                result = self._encode_with_tiles(pixels, tile_height, tile_width, callback)
+                result = self._encode_with_tiles(
+                    pixels,
+                    tile_height,
+                    tile_width,
+                    callback,
+                    sample_posterior=sample_posterior,
+                    posterior_seed=posterior_seed,
+                    first_token_only=first_token_only,
+                )
                 self.tile_height, self.tile_width = tile_height, tile_width
                 self.tile_size = tile_height
                 return result
             except RuntimeError as exc:
-                if not any(marker in str(exc).lower() for marker in ("out of memory", "cuda error 2")):
+                error_text = str(exc).lower()
+                if not any(
+                    marker in error_text
+                    for marker in (
+                        "out of memory",
+                        "cuda error 2",
+                        "failed to allocate memory",
+                        "bfc arena",
+                        "memcpyfromhost",
+                    )
+                ):
                     raise
                 last_error = exc
                 if index + 1 < len(candidates):
@@ -1672,6 +1774,9 @@ class ONNXVideoVAEEncoder:
         self,
         pixels: np.ndarray,
         callback: Callable[[dict[str, object]], None] | None = None,
+        *,
+        sample_posterior: bool = False,
+        posterior_seed: int = 42,
     ) -> np.ndarray:
         """Encode one image using the causal token equivalent to encode_images()."""
         if pixels.ndim != 5 or pixels.shape[:3] != (1, 3, 1):
@@ -1680,7 +1785,13 @@ class ONNXVideoVAEEncoder:
         # a repeated image, causal token zero is numerically equivalent to the
         # official process_image=True path; later tokens contain video history.
         repeated = np.repeat(pixels, self.clip_length, axis=2)
-        latent = self.encode(np.ascontiguousarray(repeated, dtype=np.float16), callback)
+        latent = self.encode(
+            np.ascontiguousarray(repeated, dtype=np.float16),
+            callback,
+            sample_posterior=sample_posterior,
+            posterior_seed=posterior_seed,
+            first_token_only=True,
+        )
         if latent.shape[2] < 1:
             raise RuntimeError("Video VAE image encode returned no latent token")
         return np.ascontiguousarray(latent[:, :, :1], dtype=np.float32)
@@ -1797,6 +1908,9 @@ def encode_image_frame(
     pixels: np.ndarray,
     callback: Callable[[dict[str, object]], None] | None = None,
     offload_after: bool = True,
+    *,
+    sample_posterior: bool = False,
+    posterior_seed: int = 42,
 ) -> np.ndarray:
     """Encode one reference image into one normalized Video VAE token."""
     if pixels.ndim != 5 or pixels.shape[:3] != (1, 3, 1):
@@ -1815,13 +1929,20 @@ def encode_image_frame(
                     "protocol": "causal_token_zero",
                 }
             )
-        result = model.encode_image(np.ascontiguousarray(pixels, dtype=np.float16), callback)
+        result = model.encode_image(
+            np.ascontiguousarray(pixels, dtype=np.float16),
+            callback,
+            sample_posterior=sample_posterior,
+            posterior_seed=posterior_seed,
+        )
     else:
         result = encode_video_frames(
             model,
             pixels,
             callback=callback,
             offload_after=offload_after,
+            sample_posterior=sample_posterior,
+            posterior_seed=posterior_seed,
         )
     if result.shape[2] != 1:
         raise RuntimeError(f"Video VAE image encode returned {result.shape[2]} latent tokens")
@@ -1836,6 +1957,9 @@ def encode_video_frames(
     pixels: np.ndarray,
     callback: Callable[[dict[str, object]], None] | None = None,
     offload_after: bool = True,
+    *,
+    sample_posterior: bool = False,
+    posterior_seed: int = 42,
 ) -> np.ndarray:
     """Encode ``[1, 3, T, H, W]`` pixels into normalized VAE latents.
 
@@ -1862,7 +1986,12 @@ def encode_video_frames(
                     "backend": "onnxruntime",
                 }
             )
-        result = model.encode(np.ascontiguousarray(pixels, dtype=np.float16), callback)
+        result = model.encode(
+            np.ascontiguousarray(pixels, dtype=np.float16),
+            callback,
+            sample_posterior=sample_posterior,
+            posterior_seed=posterior_seed,
+        )
         if not np.isfinite(result).all():
             invalid = int((~np.isfinite(result)).sum())
             raise FloatingPointError(f"Non-finite Video VAE encoder output: {invalid} invalid values")
@@ -1951,7 +2080,13 @@ def encode_video_frames(
     while latent is None:
         try:
             with torch.inference_mode():
-                latent = model.encode(input_tensor, device=device, callback=encode_progress)
+                latent = model.encode(
+                    input_tensor,
+                    device=device,
+                    callback=encode_progress,
+                    sample_posterior=sample_posterior,
+                    posterior_seed=posterior_seed,
+                )
         except RuntimeError as exc:
             if device.type != "cuda" or not is_cuda_failure(exc):
                 raise
@@ -1988,7 +2123,13 @@ def encode_video_frames(
             torch.cuda.empty_cache()
             device = torch.device("cpu")
             with torch.inference_mode():
-                latent = model.encode(input_tensor, device=device, callback=encode_progress)
+                latent = model.encode(
+                    input_tensor,
+                    device=device,
+                    callback=encode_progress,
+                    sample_posterior=sample_posterior,
+                    posterior_seed=posterior_seed,
+                )
     result = latent.detach().cpu().numpy().astype(np.float32, copy=False)
     if offload_after and next(model.parameters()).device.type == "cuda":
         model.to("cpu")
@@ -2018,6 +2159,52 @@ def decode_audio_latents(
     del model
     gc.collect()
     return waveform
+
+
+def encode_audio_waveform_onnx(
+    directory: Path,
+    waveform: np.ndarray,
+    prefer_cuda: bool = True,
+    callback: Callable[[dict[str, object]], None] | None = None,
+) -> np.ndarray:
+    """Encode a 32 kHz stereo waveform with the complete Audio VAE encoder graph."""
+    from h3_workbench.inference_runtime import ORTGraphRunner
+
+    values = np.asarray(waveform, dtype=np.float32)
+    if values.ndim == 2:
+        values = values[None]
+    if values.ndim != 3 or values.shape[1] != 2:
+        raise ValueError("Audio VAE input must have shape [2, samples] or [batch, 2, samples]")
+    right_pad = (-values.shape[-1]) % 800
+    if right_pad:
+        values = np.pad(values, ((0, 0), (0, 0), (0, right_pad)))
+    if callback is not None:
+        callback({"module": "Audio VAE", "operation": "Loading complete ONNX encoder"})
+    if not audio_vae_encoder_ready(directory):
+        raise RuntimeError(
+            "Reference audio requires audio_encoder.onnx; re-export the Audio VAE product with encoder support"
+        )
+    runner = ORTGraphRunner(prefer_cuda=prefer_cuda, prefetch_depth=1)
+    session = runner.session(directory / "audio_encoder.onnx")
+    try:
+        if callback is not None:
+            callback(
+                {
+                    "module": "Audio VAE",
+                    "operation": "Encoding reference waveform",
+                    "provider": runner.provider,
+                    "audio_samples": int(values.shape[-1]),
+                }
+            )
+        latents = session.run(None, {"waveform": np.ascontiguousarray(values)})[0]
+        if not np.isfinite(latents).all():
+            invalid = int((~np.isfinite(latents)).sum())
+            raise FloatingPointError(f"Non-finite Audio VAE encoder output: {invalid} invalid values")
+        return np.asarray(latents, dtype=np.float32)
+    finally:
+        del session
+        runner.close()
+        gc.collect()
 
 
 def decode_audio_latents_onnx(

@@ -17,6 +17,8 @@ const state = {
     end: { path: null, info: null, previewUrl: null, uploading: false, error: null, fileName: null, uploadId: 0 },
   },
   frameUploadSerial: 0,
+  references: [],
+  referenceUploadSerial: 0,
   superVideo: null,
   superPromptEdited: false,
   superUploadActive: false,
@@ -229,8 +231,25 @@ function presetProductReady(id) {
   return state.exportPresets.find((preset) => preset.id === id)?.product?.ready === true;
 }
 
+function mainPreset() {
+  const profile = state.profiles[0];
+  if (profile?.main_component) {
+    const selected = state.exportPresets.find((preset) => preset.component === profile.main_component);
+    if (selected) return selected;
+  }
+  const ref2va = state.exportPresets.find((preset) => preset.component === "ref2va_transformer");
+  if (ref2va?.product?.ready) return ref2va;
+  return state.exportPresets.find((preset) => preset.component === "fl2va_transformer") || ref2va;
+}
+
 function mainProductReady() {
-  return presetProductReady("fl2va_streaming");
+  return mainPreset()?.product?.ready === true;
+}
+
+function mainModelLabel(profile = state.profiles[0]) {
+  return profile?.main_label || (profile?.main_component === "ref2va_transformer"
+    ? "Ref2VA 虚拟切片基座"
+    : "FL2VA 流式基座");
 }
 
 function presetJob(preset) {
@@ -312,6 +331,7 @@ function renderExportPresets() {
     const dependencyMissing = dependencies.some((dependency) => dependency.ready !== true);
     const status = active ? job.status : preset.status || (preset.product?.ready ? "ready" : "download_required");
     const statusLabel = active ? jobStatusLabel(job.status) : componentStatusLabel(status);
+    const optional = preset.required_for_generation === false;
     const assets = Array.isArray(preset.sources) && preset.sources.length
       ? preset.sources.map((asset, index) => [assetRoleLabel(asset, index), asset])
       : [["原模型", preset.source], ["LoRA", preset.lora], ["辅助文件", preset.support]].filter(([, asset]) => asset);
@@ -342,6 +362,7 @@ function renderExportPresets() {
       : preset.product?.ready
         ? `当前产物 ${formatBytes(preset.product.size_bytes)}`
         : status === "source_ready" ? "源文件已缓存" : "HTTP Range 断点续传";
+    const optionalDetail = optional && !preset.product?.ready ? "可选组件，仅用于兼容 Turbo v4" : actionDetail;
     return `<article class="preset-row">
       <div class="preset-identity">
         <div class="preset-title-line"><strong>${escapeHtml(preset.label)}</strong><span class="status-pill ${safeClass(status)}">${escapeHtml(statusLabel)}</span></div>
@@ -355,7 +376,7 @@ function renderExportPresets() {
       </dl>
       <div class="preset-actions">
         <button class="primary-button preset-export-button" type="button" data-preset="${escapeHtml(preset.id)}" ${active || dependencyMissing ? "disabled" : ""}>${escapeHtml(buttonLabel)}</button>
-        <small>${escapeHtml(actionDetail)}</small>
+        <small>${escapeHtml(optionalDetail)}</small>
       </div>
       ${progress !== null ? `<div class="pipeline-progress"><div class="progress-track"><div class="progress-bar" style="width:${(progress * 100).toFixed(1)}%"></div></div><small>${Math.round(progress * 100)}% · ${escapeHtml(job.message)}</small></div>` : ""}
     </article>`;
@@ -377,7 +398,8 @@ function renderComponents() {
   grid.innerHTML = state.exportPresets.map((preset) => {
     const status = preset.status || (preset.product?.ready ? "ready" : "download_required");
     const runtimeAdapter = preset.product_type === "runtime_adapter";
-    const detail = status === "dependency_required" ? "需要先完成 FL2VA 流式基座"
+    const missingDependency = dependencies.find((dependency) => dependency.ready !== true);
+    const detail = status === "dependency_required" ? `需要先完成 ${missingDependency?.label || "依赖模型"}`
       : preset.product?.ready
         ? runtimeAdapter ? "动态叠加拓扑与适配器清单已验证" : "产物清单与运行拓扑已验证"
         : status === "source_ready" ? runtimeAdapter ? "LoRA 与 SiLU 网格已就绪" : "原文件已就绪，等待切片"
@@ -473,6 +495,12 @@ function activeFrameRoles(mode = conditioningMode()) {
 
 function conditioningModeLabel(mode = conditioningMode()) {
   return { text: "纯文本", first: "首帧", last: "尾帧", first_last: "首尾帧" }[mode] || "纯文本";
+}
+
+function alignReferenceFrames(frames) {
+  let value = Math.max(5, Math.round(frames));
+  while ((value - 5) % 17 !== 0) value += 1;
+  return value;
 }
 
 function renderFrameConditions() {
@@ -575,6 +603,124 @@ async function uploadFrameImage(role, file) {
   }
 }
 
+function referenceKindLabel(kind) {
+  return { image: "图片", video: "视频", audio: "音频" }[kind] || kind;
+}
+
+function referenceInfoLabel(item) {
+  const info = item.info || {};
+  if (item.kind === "image" && info.width && info.height) return `${info.width} × ${info.height}`;
+  if ((item.kind === "video" || item.kind === "audio") && finite(info.duration_seconds) !== null) {
+    return `${Number(info.duration_seconds).toFixed(2)} 秒`;
+  }
+  return item.error ? "不可用" : "等待探测";
+}
+
+function renderReferences() {
+  const list = $("#referenceList");
+  const status = $("#referenceStatus");
+  const budget = $("#referenceBudget");
+  const items = state.references;
+  budget.textContent = `${items.length} / 12`;
+  const counts = { image: 0, video: 0, audio: 0 };
+  items.forEach((item) => { counts[item.kind] = (counts[item.kind] || 0) + 1; });
+  if (!items.length) {
+    list.innerHTML = '<div class="empty-state compact"><strong>暂无参考素材</strong><span>添加后可用箭头调整读取顺序。</span></div>';
+  } else {
+    list.innerHTML = items.map((item, index) => {
+      const media = item.kind === "image"
+        ? `<img class="reference-media-image" data-reference-media="${index}" alt="参考图片 ${index + 1}">`
+        : item.kind === "video"
+          ? `<video class="reference-media-video" data-reference-media="${index}" muted playsinline preload="metadata"></video>`
+          : `<div class="reference-media-audio" data-reference-media="${index}" aria-hidden="true">♫</div>`;
+      const stateLabel = item.uploading ? "上传中" : item.error ? "上传失败" : referenceInfoLabel(item);
+      return `<article class="reference-item ${item.uploading ? "is-uploading" : ""} ${item.error ? "has-error" : ""}" data-reference-index="${index}">
+        <div class="reference-order">${index + 1}</div>
+        <div class="reference-media">${media}</div>
+        <div class="reference-item-copy"><strong>${escapeHtml(referenceKindLabel(item.kind))}${item.fileName ? ` · ${escapeHtml(item.fileName)}` : ""}</strong><span>${escapeHtml(stateLabel)}</span>${item.error ? `<small title="${escapeHtml(item.error)}">${escapeHtml(item.error)}</small>` : ""}</div>
+        <div class="reference-item-actions">
+          <button type="button" class="icon-button reference-move-button" data-reference-action="up" title="上移" aria-label="上移" ${index === 0 ? "disabled" : ""}>↑</button>
+          <button type="button" class="icon-button reference-move-button" data-reference-action="down" title="下移" aria-label="下移" ${index === items.length - 1 ? "disabled" : ""}>↓</button>
+          <button type="button" class="icon-button reference-remove-button" data-reference-action="remove" title="移除" aria-label="移除">×</button>
+        </div>
+      </article>`;
+    }).join("");
+    items.forEach((item, index) => {
+      const media = list.querySelector(`[data-reference-media="${index}"]`);
+      if (media && item.previewUrl && (media.tagName === "IMG" || media.tagName === "VIDEO")) media.src = item.previewUrl;
+    });
+  }
+  const ready = items.length > 0 && items.every((item) => item.path && !item.uploading && !item.error);
+  const uploading = items.some((item) => item.uploading);
+  status.textContent = !items.length ? "未添加" : uploading ? "上传中" : ready ? `${items.length} 项已就绪` : "需要处理";
+  return { count: items.length, ready, uploading, counts };
+}
+
+function removeReference(index) {
+  const item = state.references[index];
+  if (!item) return;
+  if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+  state.references.splice(index, 1);
+  renderProfiles();
+}
+
+function moveReference(index, direction) {
+  const target = index + direction;
+  if (target < 0 || target >= state.references.length) return;
+  const [item] = state.references.splice(index, 1);
+  state.references.splice(target, 0, item);
+  renderProfiles();
+}
+
+async function uploadReference(kind, file) {
+  if (!file) return;
+  const limits = { image: 32, video: 1024, audio: 256 };
+  if (file.size > limits[kind] * 1024 ** 2) {
+    showToast(`${referenceKindLabel(kind)}不能超过 ${limits[kind]} MiB`, true);
+    return;
+  }
+  if (state.references.length >= 12) {
+    showToast("参考素材总数不能超过 12 项", true);
+    return;
+  }
+  const item = {
+    kind,
+    path: null,
+    info: null,
+    previewUrl: URL.createObjectURL(file),
+    uploading: true,
+    error: null,
+    fileName: file.name,
+    uploadId: ++state.referenceUploadSerial,
+  };
+  const uploadId = item.uploadId;
+  state.references.push(item);
+  renderProfiles();
+  const endpoint = { image: "/api/images/upload", video: "/api/media/upload", audio: "/api/audio/upload" }[kind];
+  const payloadKey = { image: "image", video: "video", audio: "audio" }[kind];
+  try {
+    const payload = await api(endpoint, {
+      method: "POST",
+      headers: fileUploadHeaders(file),
+      body: file,
+    });
+    const current = state.references.find((value) => value.uploadId === uploadId);
+    if (!current) return;
+    current.path = payload.path;
+    current.info = payload[payloadKey];
+    showToast(`${referenceKindLabel(kind)}参考已上传`);
+  } catch (error) {
+    const current = state.references.find((value) => value.uploadId === uploadId);
+    if (!current) return;
+    current.error = error.message;
+    showToast(`${referenceKindLabel(kind)}上传失败：${error.message}`, true);
+  } finally {
+    const current = state.references.find((value) => value.uploadId === uploadId);
+    if (current) current.uploading = false;
+    renderProfiles();
+  }
+}
+
 function parsedTokenIds() {
   const raw = $("#tokenIdsInput").value.trim();
   if (!raw) return { values: [], valid: true };
@@ -598,6 +744,22 @@ function renderProfiles() {
   const provider = $("#inferenceProvider");
   const prompt = $("#promptInput").value.trim();
   const tokens = parsedTokenIds();
+  const references = renderReferences();
+  const hasReferences = references.count > 0;
+  $$('input[name="temporalMode"]').forEach((input) => {
+    input.disabled = hasReferences;
+    if (hasReferences && input.value === "native") input.checked = true;
+  });
+  $$('input[name="conditioningMode"]').forEach((input) => {
+    input.disabled = hasReferences && input.value !== "text";
+    if (hasReferences && input.value === "text") input.checked = true;
+  });
+  $("#accelerationLoraInput").disabled = hasReferences;
+  if (hasReferences) $("#accelerationLoraInput").checked = false;
+  $("#tokenIdsInput").disabled = hasReferences;
+  $("#durationInput").min = hasReferences ? "5" : "0.1";
+  if (hasReferences && (finite($("#durationInput").value) || 0) < 5) $("#durationInput").value = "5";
+  $(".frame-conditioning-section").classList.toggle("reference-disabled", hasReferences);
   const frameCondition = renderFrameConditions();
   $("#promptCounter").textContent = `${$("#promptInput").value.length} / 4000`;
 
@@ -614,18 +776,22 @@ function renderProfiles() {
 
   const width = clamp(finite($("#widthInput").value) || profile.output_width || 640, 128, 1024);
   const height = clamp(finite($("#heightInput").value) || profile.output_height || 360, 128, 1024);
-  const duration = clamp(finite($("#durationInput").value) || profile.frames / profile.fps, 0.1, 15);
+  const duration = clamp(finite($("#durationInput").value) || profile.frames / profile.fps, hasReferences ? 5 : 0.1, 15);
   const steps = clamp(finite($("#stepsInput").value) || 4, 1, 50);
   const paddedWidth = Math.ceil(width / 32) * 32;
   const paddedHeight = Math.ceil(height / 32) * 32;
-  const targetFrames = Math.max(1, Math.round(duration * profile.fps));
-  const mode = temporalMode();
+  const rawTargetFrames = Math.max(1, Math.round(duration * profile.fps));
+  const targetFrames = hasReferences ? alignReferenceFrames(rawTargetFrames) : rawTargetFrames;
+  const mode = hasReferences ? "native" : temporalMode();
   const segments = mode === "segmented" ? Math.ceil(targetFrames / profile.frames) : 1;
   const turboSteps = steps >= 4 && steps <= 8;
-  const accelerationRequested = $("#accelerationLoraInput").checked;
+  const accelerationRequested = !hasReferences && $("#accelerationLoraInput").checked;
   const baseReady = Boolean(profile.main_ready);
   const adapterReady = Boolean(profile.acceleration_ready);
-  const accelerationActive = Boolean(accelerationRequested && baseReady && adapterReady && turboSteps);
+  const turboBaseReady = Boolean(profile.turbo_base_ready);
+  const accelerationActive = Boolean(accelerationRequested && baseReady && turboBaseReady && adapterReady && turboSteps);
+  const baseLabel = hasReferences ? (profile.ref2va_label || "Ref2VA 虚拟切片基座") : mainModelLabel(profile);
+  const activeBaseLabel = accelerationActive ? (profile.turbo_base_label || "FL2VA 流式基座") : baseLabel;
   const latentFrames = mode === "native" ? videoLatentFramesForOutput(targetFrames) : profile.video_latent_frames;
   const audioTokens = mode === "native" ? Math.ceil(targetFrames * 40 / profile.fps) * 2 : profile.audio_tokens;
   const videoTokens = latentFrames * (paddedHeight / 32) * (paddedWidth / 32);
@@ -635,15 +801,21 @@ function renderProfiles() {
   const queryChunk = Number($("#queryChunkSelect").value) || 512;
   const videoReady = presetProductReady("video_vae");
   const audioReady = presetProductReady("audio_vae");
-  const contentReady = Boolean(prompt || tokens.values.length) && tokens.valid;
+  const contentReady = hasReferences
+    ? Boolean(prompt)
+    : Boolean(prompt || tokens.values.length) && tokens.valid;
   const tokenizerReady = !prompt || Boolean(profile.tokenizer_ready);
-  const mainReady = baseReady;
+  const mainReady = hasReferences ? Boolean(profile.ref2va_ready) : baseReady;
   const stepScheduleReady = !accelerationRequested || (turboSteps && accelerationActive);
   const dimensionsReady = width >= 128 && width <= 1024 && height >= 128 && height <= 1024;
   const componentsKnown = state.loaded.presets;
   const mediaReady = !componentsKnown || (videoReady === true && audioReady === true);
-  const frameConditionReady = frameCondition.ready;
-  const canStart = Boolean(profile.generation_ready && mainReady && stepScheduleReady && contentReady && tokenizerReady && dimensionsReady && mediaReady && frameConditionReady);
+  const frameConditionReady = hasReferences ? true : frameCondition.ready;
+  const referenceLimitsReady = references.counts.image <= 9 && references.counts.video <= 3 && references.counts.audio <= 3;
+  const generationReady = hasReferences
+    ? Boolean(profile.qwen_ready && profile.ref2va_ready && profile.tokenizer_ready && profile.video_vae_ready && profile.audio_vae_ready)
+    : Boolean(profile.generation_ready);
+  const canStart = Boolean(generationReady && mainReady && stepScheduleReady && contentReady && tokenizerReady && dimensionsReady && mediaReady && frameConditionReady && (!hasReferences || (references.ready && referenceLimitsReady)));
 
   provider.className = `header-status ${profile.cuda_provider_available ? "" : "warning"}`.trim();
   provider.querySelector("span:last-child").textContent = profile.cuda_provider_available ? "CUDA 推理" : "CPU 推理（较慢）";
@@ -651,11 +823,11 @@ function renderProfiles() {
   const checks = [
     ["执行后端", profile.cuda_provider_available ? "CUDAExecutionProvider 可用" : "将使用 CPUExecutionProvider", profile.cuda_provider_available ? "passed" : "warning", profile.cuda_provider_available ? "CUDA" : "CPU"],
     ["Qwen 文本编码器", profile.qwen_ready ? "验证产物可用" : "缺少或未通过验证", profile.qwen_ready ? "passed" : "failed", profile.qwen_ready ? "通过" : "阻塞"],
-    ["FL2VA 流式基座", mainReady ? "50 Block 基座产物可用" : "缺少或未通过验证", mainReady ? "passed" : "failed", mainReady ? "通过" : "阻塞"],
-    ["Turbo v4 动态 LoRA", !accelerationRequested ? "手动关闭，使用流式基座" : !turboSteps ? "已开启，但仅支持 4–8 步" : adapterReady ? "手动开启，将动态叠加" : "已开启，但运行时适配器未就绪", stepScheduleReady ? "passed" : "failed", accelerationActive ? "启用" : stepScheduleReady ? "未启用" : "阻塞"],
+    [baseLabel, mainReady ? "50 Block 基座产物可用" : "缺少或未通过验证", mainReady ? "passed" : "failed", mainReady ? "通过" : "阻塞"],
+    ["Turbo v4 动态 LoRA", hasReferences ? "全能参考模式自动关闭" : !accelerationRequested ? `手动关闭，使用${baseLabel}` : !turboSteps ? "已开启，但仅支持 4–8 步" : !turboBaseReady ? "当前主基座不兼容，Turbo 仅支持 FL2VA" : adapterReady ? "手动开启，将动态叠加" : "已开启，但运行时适配器未就绪", stepScheduleReady ? "passed" : "failed", accelerationActive ? "启用" : stepScheduleReady ? "未启用" : "阻塞"],
     ["Video / Audio VAE", !componentsKnown ? "组件状态尚未返回" : mediaReady ? "编码与解码组件均可用" : "缺少 Video VAE 或 Audio VAE", !componentsKnown ? "warning" : mediaReady ? "passed" : "failed", !componentsKnown ? "待检查" : mediaReady ? "通过" : "阻塞"],
     ["文本输入", contentReady && tokenizerReady ? (prompt ? "Tokenizer 与提示词可用" : `${tokens.values.length} 个 Token IDs`) : !tokens.valid ? tokens.message : prompt ? "Tokenizer 文件不完整" : "请输入提示词或 Token IDs", contentReady && tokenizerReady ? "passed" : "failed", contentReady && tokenizerReady ? "通过" : "阻塞"],
-    ["帧条件", frameCondition.active.length === 0 ? "纯文本模式，不使用图片条件" : frameConditionReady ? `${conditioningModeLabel(frameCondition.mode)}条件已上传` : frameCondition.uploading ? "条件图片正在上传" : `还需 ${frameCondition.active.filter((role) => !state.frameImages[role].path).length} 张条件图片`, frameConditionReady ? "passed" : "failed", frameConditionReady ? conditioningModeLabel(frameCondition.mode) : "阻塞"],
+    [hasReferences ? "全能参考" : "帧条件", hasReferences ? (!references.ready ? "参考素材正在上传或不可用" : referenceLimitsReady ? `${references.count} 项按序参考已就绪` : "超出单类数量限制") : frameCondition.active.length === 0 ? "纯文本模式，不使用图片条件" : frameConditionReady ? `${conditioningModeLabel(frameCondition.mode)}条件已上传` : frameCondition.uploading ? "条件图片正在上传" : `还需 ${frameCondition.active.filter((role) => !state.frameImages[role].path).length} 张条件图片`, hasReferences ? (references.ready && referenceLimitsReady ? "passed" : "failed") : frameConditionReady ? "passed" : "failed", hasReferences ? (references.ready && referenceLimitsReady ? "通过" : "阻塞") : frameConditionReady ? conditioningModeLabel(frameCondition.mode) : "阻塞"],
     ["输出规格", dimensionsReady ? `${width} × ${height}，${targetFrames} 帧` : "宽高必须在 128–1024 之间", dimensionsReady ? "passed" : "failed", dimensionsReady ? "通过" : "阻塞"],
   ];
   $("#preflightList").innerHTML = checks.map((row) => preflightRow(...row)).join("");
@@ -665,9 +837,9 @@ function renderProfiles() {
   const rows = [
     ["输出", `${width} × ${height} / ${targetFrames} 帧`],
     ["预计时长", `${(targetFrames / profile.fps).toFixed(2)} 秒 @ ${profile.fps} FPS`],
-    ["主模型", "FL2VA 流式基座"],
+    ["主模型", activeBaseLabel],
     ["运行时适配", accelerationActive ? "Turbo v4 动态 LoRA" : "未启用"],
-    ["生成模式", conditioningModeLabel(frameCondition.mode)],
+    ["生成模式", hasReferences ? "全能参考 · Ref2VA" : conditioningModeLabel(frameCondition.mode)],
     ["时序", mode === "native" ? `${latentFrames} latent / 整体` : `${segments} 段 / ${segments * steps} 次去噪`],
     ["注意力", `${sequenceTokens} tokens / query ${queryChunk}`],
     ["CPU QKV 缓存", formatBytes(qkvCpuBytes)],
@@ -677,20 +849,23 @@ function renderProfiles() {
 
   const notices = [];
   if (!profile.cuda_provider_available) notices.push("当前 ONNX Runtime 没有 CUDAExecutionProvider，CPU 执行会非常缓慢。");
+  if (hasReferences && !profile.ref2va_ready) notices.push("全能参考需要已验证的 Ref2VA 虚拟切片基座。");
+  if (hasReferences && !references.ready) notices.push("请等待所有参考素材上传完成，并移除失败项目。");
   if (accelerationRequested && !turboSteps) notices.push("Turbo v4 加速 LoRA 仅支持 4–8 步，请调整采样步数或关闭加速 LoRA。");
-  if (accelerationRequested && turboSteps && !adapterReady) notices.push("已手动开启 Turbo v4 加速 LoRA，但适配器未就绪，请先在模型页生成适配器。");
-  if (!baseReady && adapterReady) notices.push("动态 LoRA 不能独立运行，请先完成 FL2VA 流式基座。");
-  if (mode === "segmented" && segments > 1) notices.push("分段模式尚未接入首帧续接，多段画面可能出现跳变。");
+  if (accelerationRequested && turboSteps && !turboBaseReady) notices.push("当前使用 Ref2VA 虚拟切片基座；Turbo v4 仅兼容 FL2VA 基座，请关闭加速 LoRA或安装 FL2VA 兼容基座。");
+  if (accelerationRequested && turboSteps && turboBaseReady && !adapterReady) notices.push("已手动开启 Turbo v4 加速 LoRA，但适配器未就绪，请先在模型页生成适配器。");
+  if (!baseReady && adapterReady) notices.push("动态 LoRA 不能独立运行，请先完成主基座模型。");
+  if (!hasReferences && mode === "segmented" && segments > 1) notices.push("分段模式尚未接入首帧续接，多段画面可能出现跳变。");
   if (frameCondition.mode === "first_last" && mode === "segmented" && segments > 1) notices.push("首尾条件分别作用于第一段和最后一段；整体长序列能提供更强的双端关联。");
   if (mode === "native" && targetFrames > profile.frames) notices.push("长序列 Video VAE 会使用 GPU 时间窗口解码。");
-  if (steps < 4) notices.push("当前步数使用流式基座；低步数可能导致画面语义或音频数值不稳定。");
+  if (steps < 4) notices.push("当前步数使用主基座；低步数可能导致画面语义或音频数值不稳定。");
   const warning = $("#runtimeWarning");
   warning.classList.toggle("hidden", notices.length === 0);
   warning.textContent = notices.join(" ");
 
   $("#generateButton").disabled = !canStart;
   $("#submitSummary").textContent = canStart ? `${width} × ${height} · ${targetFrames} 帧 · ${steps} 步` : "预检尚未通过";
-  $("#submitHint").textContent = canStart ? `${accelerationActive ? "基座 + Turbo v4 动态 LoRA" : "流式基座"} · ${mode === "native" ? "整体长序列" : "低显存分段"}` : "处理所有阻塞项后即可启动";
+  $("#submitHint").textContent = canStart ? `${accelerationActive ? "基座 + Turbo v4 动态 LoRA" : baseLabel} · ${mode === "native" ? "整体长序列" : "低显存分段"}` : "处理所有阻塞项后即可启动";
 }
 
 function updateResolutionPreset() {
@@ -745,12 +920,14 @@ function renderSuperResolution() {
   const accelerationRequested = $("#superAccelerationLoraInput").checked;
   const adapterReady = Boolean(profile && profile.acceleration_ready);
   const baseReady = Boolean(profile && profile.main_ready);
+  const turboBaseReady = Boolean(profile && profile.turbo_base_ready);
+  const baseLabel = mainModelLabel(profile);
   const promptReady = Boolean(prompt || info.prompt);
   const videoReady = Boolean(profile && profile.video_vae_ready) && presetProductReady("video_vae");
   const tokenizerReady = Boolean(profile && profile.tokenizer_ready);
   const componentsKnown = state.loaded.profiles && state.loaded.presets;
   const contentReady = promptReady && tokenizerReady;
-  const accelerationReady = !accelerationRequested || (turboSteps && adapterReady);
+  const accelerationReady = !accelerationRequested || (turboSteps && turboBaseReady && adapterReady);
   const processingReady = processingMode !== "direct" || info.frames <= 360;
   const canStart = Boolean(
     componentsKnown && profile && baseReady && videoReady && contentReady && dimensionsReady && accelerationReady && processingReady,
@@ -771,12 +948,12 @@ function renderSuperResolution() {
   const checks = [
     ["执行后端", profile.cuda_provider_available ? "CUDAExecutionProvider 可用" : "将使用 CPUExecutionProvider", profile.cuda_provider_available ? "passed" : "warning", profile.cuda_provider_available ? "CUDA" : "CPU"],
     ["Qwen 文本编码器", profile.qwen_ready ? "验证产物可用" : "缺少或未通过验证", profile.qwen_ready ? "passed" : "failed", profile.qwen_ready ? "通过" : "阻塞"],
-    ["FL2VA 流式基座", baseReady ? "50 Block 基座产物可用" : "缺少或未通过验证", baseReady ? "passed" : "failed", baseReady ? "通过" : "阻塞"],
+    [baseLabel, baseReady ? "50 Block 基座产物可用" : "缺少或未通过验证", baseReady ? "passed" : "failed", baseReady ? "通过" : "阻塞"],
     ["Video VAE", videoReady ? "编码与解码产物可用" : "缺少或未通过验证", videoReady ? "passed" : "failed", videoReady ? "通过" : "阻塞"],
     ["条件提示词", contentReady ? (prompt ? "使用手动提示词" : "使用视频 metadata prompt") : tokenizerReady ? "未找到 prompt" : "Tokenizer 文件不完整", contentReady ? "passed" : "failed", contentReady ? "通过" : "阻塞"],
     ["输出规格", dimensionsReady ? outputWidth + " × " + outputHeight : "超过 2048 px 或 4 MP 限制", dimensionsReady ? "passed" : "failed", dimensionsReady ? "通过" : "阻塞"],
     ["处理方式", processingReady ? (processingMode === "direct" ? "完整视频直接推理" : "17 帧分片推理") : "直接推理最多支持 360 帧", processingReady ? "passed" : "failed", processingReady ? "通过" : "阻塞"],
-    ["Turbo v4 LoRA", !accelerationRequested ? "手动关闭" : !turboSteps ? "仅支持 4–8 步" : adapterReady ? "手动开启，适配器可用" : "适配器未就绪", accelerationReady ? "passed" : "failed", accelerationReady && accelerationRequested ? "启用" : accelerationReady ? "关闭" : "阻塞"],
+    ["Turbo v4 LoRA", !accelerationRequested ? "手动关闭" : !turboSteps ? "仅支持 4–8 步" : !turboBaseReady ? "当前主基座不兼容，Turbo 仅支持 FL2VA" : adapterReady ? "手动开启，适配器可用" : "适配器未就绪", accelerationReady ? "passed" : "failed", accelerationReady && accelerationRequested ? "启用" : accelerationReady ? "关闭" : "阻塞"],
   ];
   $("#superPreflightList").innerHTML = checks.map((row) => preflightRow(...row)).join("");
   $("#superPreflightSummary").textContent = checks.filter((row) => row[2] === "passed").length + " / " + checks.length + " 通过";
@@ -790,10 +967,11 @@ function renderSuperResolution() {
   const warnings = [];
   if (outputWidth > 1024 || outputHeight > 1024) warnings.push("输出超过 1024 px，RTX 3050 需要较小 Query 分块并可能显著变慢。");
   if (outputWidth * outputHeight > 1048576) warnings.push("当前输出超过 1 MP，任务会把输入帧驻留主内存。");
-  if (processingMode === "direct") warnings.push("直接推理会把完整视频放入一个 FL2VA 时间序列，显存和注意力开销显著增加。");
+  if (processingMode === "direct") warnings.push("直接推理会把完整视频放入一个主模型时间序列，显存和注意力开销显著增加。");
   if (!processingReady) warnings.push("直接推理最多支持 360 帧，请切换到视频分片。");
   if (accelerationRequested && !turboSteps) warnings.push("Turbo v4 加速 LoRA 仅支持 4–8 步。");
-  if (accelerationRequested && turboSteps && !adapterReady) warnings.push("已开启 Turbo v4，但适配器尚未就绪。");
+  if (accelerationRequested && turboSteps && !turboBaseReady) warnings.push("当前使用 Ref2VA 虚拟切片基座；Turbo v4 仅兼容 FL2VA 基座。");
+  if (accelerationRequested && turboSteps && turboBaseReady && !adapterReady) warnings.push("已开启 Turbo v4，但适配器尚未就绪。");
   const warning = $("#superRuntimeWarning");
   warning.classList.toggle("hidden", warnings.length === 0);
   warning.textContent = warnings.join(" ");
@@ -1456,13 +1634,22 @@ async function startInference(event) {
   if (!form.reportValidity()) return;
   const prompt = $("#promptInput").value.trim();
   const tokens = parsedTokenIds();
+  const references = renderReferences();
   const frameCondition = renderFrameConditions();
-  if (!tokens.valid) {
+  if (!references.count && !tokens.valid) {
     showToast(tokens.message, true);
     return;
   }
-  if (!prompt && tokens.values.length === 0) {
+  if (references.count && !prompt) {
+    showToast("全能参考模式需要提示词", true);
+    return;
+  }
+  if (!references.count && !prompt && tokens.values.length === 0) {
     showToast("请输入提示词或 Token IDs", true);
+    return;
+  }
+  if (references.count && !references.ready) {
+    showToast("请先完成所有参考素材上传", true);
     return;
   }
   if (!frameCondition.ready) {
@@ -1477,17 +1664,18 @@ async function startInference(event) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         prompt: prompt || null,
-        token_ids: prompt ? null : tokens.values,
+        token_ids: references.count || prompt ? null : tokens.values,
         steps: Number($("#stepsInput").value),
-        use_acceleration_lora: $("#accelerationLoraInput").checked,
+        use_acceleration_lora: references.count ? false : $("#accelerationLoraInput").checked,
         seed: Number($("#seedInput").value),
         width: Number($("#widthInput").value),
         height: Number($("#heightInput").value),
         duration_seconds: Number($("#durationInput").value),
-        temporal_mode: temporalMode(),
-        conditioning_mode: frameCondition.mode,
-        start_image_path: frameCondition.active.includes("start") ? state.frameImages.start.path : null,
-        end_image_path: frameCondition.active.includes("end") ? state.frameImages.end.path : null,
+        temporal_mode: references.count ? "native" : temporalMode(),
+        conditioning_mode: references.count ? "text" : frameCondition.mode,
+        start_image_path: references.count ? null : frameCondition.active.includes("start") ? state.frameImages.start.path : null,
+        end_image_path: references.count ? null : frameCondition.active.includes("end") ? state.frameImages.end.path : null,
+        references: references.count ? state.references.map((item) => ({ kind: item.kind, path: item.path })) : null,
         attention_query_chunk: Number($("#queryChunkSelect").value),
         l1_prefetch_shards: Number($("#l1PrefetchSelect").value),
       }),
@@ -1548,6 +1736,18 @@ function bindEvents() {
   $("#endFrameFile").addEventListener("change", (event) => uploadFrameImage("end", event.target.files[0]));
   $("#startFrameClear").addEventListener("click", () => clearFrameImage("start"));
   $("#endFrameClear").addEventListener("click", () => clearFrameImage("end"));
+  $("#referenceImageFile").addEventListener("change", (event) => uploadReference("image", event.target.files[0]));
+  $("#referenceVideoFile").addEventListener("change", (event) => uploadReference("video", event.target.files[0]));
+  $("#referenceAudioFile").addEventListener("change", (event) => uploadReference("audio", event.target.files[0]));
+  $("#referenceList").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-reference-action]");
+    const item = event.target.closest("[data-reference-index]");
+    if (!button || !item) return;
+    const index = Number(item.dataset.referenceIndex);
+    if (button.dataset.referenceAction === "up") moveReference(index, -1);
+    else if (button.dataset.referenceAction === "down") moveReference(index, 1);
+    else if (button.dataset.referenceAction === "remove") removeReference(index);
+  });
   $("#superResolutionForm").addEventListener("submit", startSuperResolution);
   $("#superProbeButton").addEventListener("click", probeSuperVideo);
   $("#superSourcePath").addEventListener("change", () => {

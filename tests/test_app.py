@@ -43,8 +43,16 @@ def test_export_presets_only_expose_validated_variants() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert {item["id"] for item in payload["presets"]} == {
-        "tokenizer", "audio_vae", "video_vae", "qwen", "fl2va_streaming", "fl2va_turbo_v4"
+        "tokenizer", "audio_vae", "video_vae", "qwen", "ref2va", "fl2va_streaming", "fl2va_turbo_v4"
     }
+    ref2va = next(item for item in payload["presets"] if item["id"] == "ref2va")
+    assert ref2va["component"] == "ref2va_transformer"
+    assert ref2va["required_for_generation"] is True
+    assert ref2va["source"]["path"] == "diffusion_models/minimax_h3_ref2va_pruned_bf16.safetensors"
+    assert ref2va["output_dir"].endswith("_ref2va_pruned_bf16_virtual")
+    assert ref2va["output_size_bytes"] < 4 * 1024**3
+    fl2va = next(item for item in payload["presets"] if item["id"] == "fl2va_streaming")
+    assert fl2va["required_for_generation"] is False
     turbo = next(item for item in payload["presets"] if item["id"] == "fl2va_turbo_v4")
     assert turbo["label"] == "Turbo v4 动态 LoRA"
     assert turbo["component"] == "acceleration_lora"
@@ -82,7 +90,7 @@ def test_turbo_adapter_preset_exposes_base_dependency(monkeypatch, tmp_path) -> 
     assert turbo["dependencies"] == [
         {
             "id": "fl2va_streaming",
-            "label": "FL2VA 流式基座",
+            "label": "FL2VA 流式基座（Turbo 专用）",
             "ready": False,
             "path": str((models / "minimax_h3_fl2va_pruned_fp8_scaled_streaming").resolve()),
         }
@@ -115,6 +123,7 @@ def test_webui_contains_live_job_elapsed_timer() -> None:
     assert "/performance" in response.text
     assert "Turbo v4 动态 LoRA" in response.text
     assert "手动开启" in response.text
+    assert "仅兼容 FL2VA 基座" in response.text
     assert "use_acceleration_lora" in response.text
     assert "Turbo v4 尚未就绪，将使用流式基座模型" not in response.text
 
@@ -157,6 +166,40 @@ def test_image_upload_decodes_utf8_filename(monkeypatch, tmp_path) -> None:
     assert payload["path"].endswith("-首帧测试.png")
     assert payload["image"]["width"] == 320
     assert payload["image"]["height"] == 180
+
+
+def test_audio_upload_decodes_utf8_filename_and_returns_probe(monkeypatch, tmp_path) -> None:
+    from h3_workbench import app as app_module
+    from h3_workbench.media_input import AudioInfo
+
+    monkeypatch.setattr(
+        app_module,
+        "settings",
+        replace(
+            app_module.settings,
+            workspace=tmp_path,
+            output_dir=tmp_path / "onnx_models",
+            state_dir=tmp_path / ".h3-workbench",
+        ),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "probe_audio",
+        lambda path: AudioInfo(str(path), 32_000, 2, 160_000, 5.0),
+    )
+
+    response = TestClient(app_module.app).post(
+        "/api/audio/upload",
+        headers={"x-filename": quote("参考声音.wav", safe=""), "content-type": "audio/wav"},
+        content=b"audio-data",
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["path"].endswith("-参考声音.wav")
+    assert payload["size_bytes"] == len(b"audio-data")
+    assert payload["audio"]["sample_rate"] == 32_000
+    assert payload["audio"]["channels"] == 2
 
 
 def test_performance_log_endpoint(monkeypatch, tmp_path) -> None:
@@ -404,6 +447,43 @@ def test_prompt_inference_request_accepts_dynamic_resolution() -> None:
     assert request.temporal_mode == "native"
     assert request.attention_query_chunk == 64
     assert request.l1_prefetch_shards == 3
+
+
+def test_inference_request_preserves_ordered_mixed_references() -> None:
+    references = [
+        {"kind": "video", "path": "motion.mp4"},
+        {"kind": "image", "path": "subject.png"},
+        {"kind": "audio", "path": "voice.wav"},
+    ]
+
+    request = InferenceRequest(
+        prompt="Use all references in order",
+        duration_seconds=5.0,
+        temporal_mode="native",
+        references=references,
+    )
+
+    assert request.references == references
+
+
+def test_inference_request_rejects_audio_only_reference() -> None:
+    with pytest.raises(ValidationError, match="paired with"):
+        InferenceRequest(
+            prompt="Use the voice",
+            duration_seconds=5.0,
+            temporal_mode="native",
+            references=[{"kind": "audio", "path": "voice.wav"}],
+        )
+
+
+def test_inference_request_requires_native_temporal_mode_for_references() -> None:
+    with pytest.raises(ValidationError, match="native temporal mode"):
+        InferenceRequest(
+            prompt="Use the picture",
+            duration_seconds=5.0,
+            temporal_mode="segmented",
+            references=[{"kind": "image", "path": "subject.png"}],
+        )
 
 
 def test_inference_request_accepts_explicit_acceleration_lora() -> None:

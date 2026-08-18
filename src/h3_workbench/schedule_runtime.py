@@ -102,7 +102,30 @@ class ScheduleMainRuntime:
         validate_runtime_schedule(self.schedule, self.directory)
         self.shards = {shard["id"]: shard for shard in self.schedule["shards"]}
         self._persistent_weights: Any | None = None
-        if self._turbo_adapter is not None or (
+        virtual_weights = None
+        try:
+            from h3_workbench.ref2va_virtual_slicer import (
+                Ref2VASourceWeights,
+                ref2va_virtual_ready,
+            )
+
+            virtual_ready = ref2va_virtual_ready(self.directory)
+        except (ImportError, OSError, ValueError, TypeError):
+            virtual_ready = False
+        if virtual_ready and self._turbo_adapter is not None:
+            raise RuntimeError(
+                "Turbo LoRA is tied to the FL2VA FP8 base and cannot be applied to a Ref2VA virtual product"
+            )
+        if virtual_ready:
+            graph_paths = {
+                graph: self.directory / shard["file"]
+                for shard in self.schedule["shards"]
+                for graph in shard["graphs"]
+            }
+            virtual_weights = Ref2VASourceWeights(self.directory, runner, graph_paths)
+            self._persistent_weights = virtual_weights
+            self._ram_cache_prime = virtual_weights.prime_ram_cache()
+        elif self._turbo_adapter is not None or (
             getattr(runner, "provider", "CPUExecutionProvider") == "CUDAExecutionProvider"
             and os.environ.get("H3_PERSISTENT_WEIGHTS", "1") != "0"
         ):
@@ -157,6 +180,7 @@ class ScheduleMainRuntime:
                 "ram_cache_budget_bytes": 0,
                 "ram_cache_scheduled": 0,
             }
+        self._supports_ref2va = bool(virtual_ready)
         self.steps_by_phase = {
             phase: [step for step in self.schedule["steps"] if step["phase"] == phase]
             for phase in ("preamble", "denoise")
@@ -249,6 +273,18 @@ class ScheduleMainRuntime:
             )
         )
 
+    @property
+    def _main_module_label(self) -> str:
+        return "Ref2VA" if self._supports_ref2va else "FL2VA"
+
+    @property
+    def _loader_module_label(self) -> str:
+        return f"{self._main_module_label} Loader"
+
+    @property
+    def _diagnostics_module_label(self) -> str:
+        return f"{self._main_module_label} Diagnostics"
+
     def report_activity(self, module: str, operation: str, **details: object) -> None:
         if self.activity_callback is None:
             return
@@ -265,7 +301,7 @@ class ScheduleMainRuntime:
             return cached
         shard = self.shards[shard_id]
         self.report_activity(
-            "FL2VA Loader",
+            self._loader_module_label,
             "Building shard session",
             shard=int(shard_id.rsplit("_", 1)[1]) + 1,
             shards=len(self.shards),
@@ -276,7 +312,7 @@ class ScheduleMainRuntime:
         self._metrics["session_builds"] += 1
         self._metrics["session_build_seconds"] += elapsed
         self.report_activity(
-            "FL2VA Loader",
+            self._loader_module_label,
             "Shard session ready",
             shard=int(shard_id.rsplit("_", 1)[1]) + 1,
             shards=len(self.shards),
@@ -477,7 +513,7 @@ class ScheduleMainRuntime:
             if invalid and first_invalid is None:
                 first_invalid = (port, invalid)
         self.report_activity(
-            "FL2VA Diagnostics",
+            self._diagnostics_module_label,
             operation,
             event="output_stats",
             outputs=statistics,
@@ -577,7 +613,7 @@ class ScheduleMainRuntime:
                 self._metrics["persistent_session_builds"] += 1
                 self._metrics["persistent_session_build_seconds"] += build_seconds
                 self.report_activity(
-                    "FL2VA Loader",
+                    self._loader_module_label,
                     "Persistent topology session ready",
                     topology=step["graph"].rsplit("_", 1)[-1],
                     elapsed_seconds=round(build_seconds, 3),
@@ -632,7 +668,7 @@ class ScheduleMainRuntime:
             np.savez(temporary, **{name: self._numpy(value) for name, value in selected.items()})
             os.replace(temporary, self._capture_graph_path)
             self.report_activity(
-                "FL2VA Diagnostics",
+                self._diagnostics_module_label,
                 step["graph"],
                 event="inputs_captured",
                 path=str(self._capture_graph_path),
@@ -684,7 +720,7 @@ class ScheduleMainRuntime:
                     f"available={sorted(available_outputs)}"
                 )
         self.report_activity(
-            "FL2VA",
+            self._main_module_label,
             step["graph"],
             shard=int(step["shard"].rsplit("_", 1)[1]) + 1,
             shards=len(self.shards),
@@ -721,7 +757,7 @@ class ScheduleMainRuntime:
         if persistent is not None and self._recycle_persistent_sessions:
             persistent.release_session(step["graph"])
         self.report_activity(
-            "FL2VA",
+            self._main_module_label,
             step["graph"],
             event="graph_complete",
             shard=int(step["shard"].rsplit("_", 1)[1]) + 1,
@@ -769,23 +805,78 @@ class ScheduleMainRuntime:
 
             text_count = int(np.asarray(values["text_states"]).shape[0])
             sigma_video = float(values["sigma_video"])
-            times, modulation = modulation_ids(
-                self.profile,
-                text_count,
-                sigma_video,
-                external.get("conditioned_video_indices", ()),
-            )
             from h3_workbench.inference_runtime import time_shift_sigma
 
-            outputs = {
-                "video_patches": patchify_video(np.asarray(values["video_latent"], dtype=np.float32)),
-                "audio_patches": pack_audio(np.asarray(values["audio_latent"], dtype=np.float32)),
-                "embedding_text_padding": np.zeros((1, 5120), dtype=np.float16),
-                "timesteps": times,
-                "position_ids": packed_position_ids(self.profile, text_count),
-                "modulation_ids": modulation,
-                "sigma_audio": np.asarray(time_shift_sigma(sigma_video, 12.0, 3.0), dtype=np.float32),
-            }
+            sigma_audio = time_shift_sigma(sigma_video, 12.0, 3.0)
+            ref2va_layout = external.get("ref2va_layout")
+            if ref2va_layout is None:
+                times, modulation = modulation_ids(
+                    self.profile,
+                    text_count,
+                    sigma_video,
+                    external.get("conditioned_video_indices", ()),
+                )
+                outputs = {
+                    "video_patches": patchify_video(np.asarray(values["video_latent"], dtype=np.float32)),
+                    "audio_patches": pack_audio(np.asarray(values["audio_latent"], dtype=np.float32)),
+                    "embedding_text_padding": np.zeros((1, 5120), dtype=np.float16),
+                    "timesteps": times,
+                    "position_ids": packed_position_ids(self.profile, text_count),
+                    "modulation_ids": modulation,
+                    "sigma_audio": np.asarray(sigma_audio, dtype=np.float32),
+                }
+            else:
+                from h3_workbench.reference import build_row_timesteps
+
+                if int(ref2va_layout.text_indices.size) != text_count:
+                    raise ValueError(
+                        "Ref2VA text rows do not match the refined text sequence: "
+                        f"{ref2va_layout.text_indices.size} != {text_count}"
+                    )
+                video_latents = (
+                    *external.get("reference_video_latents", ()),
+                    np.asarray(values["video_latent"], dtype=np.float32),
+                )
+                audio_latents = (
+                    *external.get("reference_audio_latents", ()),
+                    np.asarray(values["audio_latent"], dtype=np.float32),
+                )
+                video_patches = np.concatenate(
+                    [patchify_video(np.asarray(latent, dtype=np.float32)) for latent in video_latents],
+                    axis=0,
+                )
+                audio_patches = np.concatenate(
+                    [pack_audio(np.asarray(latent, dtype=np.float32)) for latent in audio_latents],
+                    axis=0,
+                )
+                if video_patches.shape[0] != ref2va_layout.video_indices.size:
+                    raise ValueError(
+                        "Ref2VA visual latent rows do not match the packed layout: "
+                        f"{video_patches.shape[0]} != {ref2va_layout.video_indices.size}"
+                    )
+                if audio_patches.shape[0] != ref2va_layout.audio_indices.size:
+                    raise ValueError(
+                        "Ref2VA audio latent rows do not match the packed layout: "
+                        f"{audio_patches.shape[0]} != {ref2va_layout.audio_indices.size}"
+                    )
+                times, timestep_indices = build_row_timesteps(
+                    ref2va_layout,
+                    video_timestep=1.0 - sigma_video,
+                    audio_timestep=1.0 - sigma_audio,
+                )
+                modulation = timestep_indices.astype(np.int64, copy=False) * 3 + np.asarray(
+                    ref2va_layout.token_tags,
+                    dtype=np.int64,
+                )
+                outputs = {
+                    "video_patches": video_patches,
+                    "audio_patches": audio_patches,
+                    "embedding_text_padding": np.zeros((1, 5120), dtype=np.float16),
+                    "timesteps": times,
+                    "position_ids": np.asarray(ref2va_layout.position_ids, dtype=np.float32),
+                    "modulation_ids": modulation,
+                    "sigma_audio": np.asarray(sigma_audio, dtype=np.float32),
+                }
             if self._turbo_adapter is not None:
                 silu_timestep_embedding = np.ascontiguousarray(
                     self._turbo_adapter.silu_timestep_embeddings(times),
@@ -799,12 +890,18 @@ class ScheduleMainRuntime:
                     )
                 constants["silu_timestep_embedding"] = silu_timestep_embedding
         elif op == "concat_hidden":
-            outputs = {
-                "hidden": np.concatenate(
+            ref2va_layout = external.get("ref2va_layout")
+            if ref2va_layout is None:
+                hidden = np.concatenate(
                     (values["text_states"], values["audio_embeddings"], values["video_embeddings"]),
                     axis=0,
                 ).astype(np.float32, copy=False)
-            }
+            else:
+                hidden = np.empty((ref2va_layout.token_tags.size, 5376), dtype=np.float32)
+                hidden[ref2va_layout.text_indices] = np.asarray(values["text_states"], dtype=np.float32)
+                hidden[ref2va_layout.audio_indices] = np.asarray(values["audio_embeddings"], dtype=np.float32)
+                hidden[ref2va_layout.video_indices] = np.asarray(values["video_embeddings"], dtype=np.float32)
+            outputs = {"hidden": hidden}
         elif op == "sdpa":
             from h3_workbench.inference_runtime import select_attention_query_chunk, streamed_attention
             from h3_workbench.memory_planner import probe_gpu_memory
@@ -844,11 +941,21 @@ class ScheduleMainRuntime:
             if isinstance(outputs["attended"], ort.OrtValue):
                 self._metrics["device_sdpa_runs"] += 1
         elif op == "split_hidden":
-            text_count = int(np.asarray(values["text_states"]).shape[0])
-            audio_start = text_count
-            video_start = audio_start + self.profile.audio_tokens
             hidden = self._numpy(values["hidden"])
-            outputs = {"audio_hidden": hidden[audio_start:video_start], "video_hidden": hidden[video_start:]}
+            ref2va_layout = external.get("ref2va_layout")
+            if ref2va_layout is None:
+                text_count = int(np.asarray(values["text_states"]).shape[0])
+                audio_start = text_count
+                video_start = audio_start + self.profile.audio_tokens
+                outputs = {
+                    "audio_hidden": hidden[audio_start:video_start],
+                    "video_hidden": hidden[video_start:],
+                }
+            else:
+                outputs = {
+                    "audio_hidden": hidden[ref2va_layout.target_audio_indices],
+                    "video_hidden": hidden[ref2va_layout.target_video_indices],
+                }
         elif op in {"select_head_timestep", "select_head_timestep_turbo"}:
             times = np.asarray(values["timesteps"])
             sigma_video = float(values["sigma_video"])
@@ -881,13 +988,13 @@ class ScheduleMainRuntime:
             from h3_workbench.inference_runtime import unpack_audio, unpatchify_video
 
             outputs = {
-                "video_velocity": -unpatchify_video(
+                "video_velocity": unpatchify_video(
                     np.asarray(values["video_patches"]),
                     self.profile.video_latent_frames,
                     self.profile.video_latent_height,
                     self.profile.video_latent_width,
                 ),
-                "audio_velocity": -unpack_audio(np.asarray(values["audio_patches"])),
+                "audio_velocity": unpack_audio(np.asarray(values["audio_patches"])),
             }
         else:
             raise ValueError(f"Unsupported schedule op: {op}")
@@ -956,6 +1063,37 @@ class ScheduleMainRuntime:
             "audio_latent": audio_latent,
             "sigma_video": float(sigma_video),
             "conditioned_video_indices": conditioned_video_indices,
+        }
+        external, _ = self._execute_phase("denoise", external, {"text_states": refined})
+        return np.asarray(external["video_velocity"]), np.asarray(external["audio_velocity"])
+
+    def denoise_ref2va_step(
+        self,
+        video_latent: np.ndarray,
+        audio_latent: np.ndarray,
+        text_states: np.ndarray,
+        sigma_video: float,
+        reference_video_latents: tuple[np.ndarray, ...],
+        reference_audio_latents: tuple[np.ndarray, ...],
+        layout: Any,
+        text_is_refined: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run one dynamic Ref2VA packed-sequence denoise pass.
+
+        Reference rows are embedded and attended on every step but only target
+        rows are passed through the output head.  The caller therefore keeps
+        reference latents immutable across the Euler loop.
+        """
+        if not self._supports_ref2va:
+            raise RuntimeError("Ref2VA denoising requires a validated Ref2VA virtual model")
+        refined = text_states if text_is_refined else self.prepare_text(text_states)
+        external = {
+            "video_latent": video_latent,
+            "audio_latent": audio_latent,
+            "sigma_video": float(sigma_video),
+            "reference_video_latents": tuple(reference_video_latents),
+            "reference_audio_latents": tuple(reference_audio_latents),
+            "ref2va_layout": layout,
         }
         external, _ = self._execute_phase("denoise", external, {"text_states": refined})
         return np.asarray(external["video_velocity"]), np.asarray(external["audio_velocity"])

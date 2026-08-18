@@ -21,6 +21,7 @@ from h3_workbench.qwen_persistent import (
     runtime_file_identity,
     validated_int8_virtual_qwen_ready,
 )
+from h3_workbench.qwen_int8_graph import install_split_qwen_attention
 from h3_workbench.qwen_virtual_validation import run as run_virtual_validation
 from h3_workbench.qwen_virtual_slicer import (
     ATTENTION_SOURCES,
@@ -298,3 +299,44 @@ def test_virtual_slicer_requires_bound_convrot_hadamard(tmp_path: Path) -> None:
         assert "missing ConvRot initializer" in str(exc)
     else:
         raise AssertionError("a ConvRot product must reject a topology without its Hadamard transform")
+
+
+def test_install_split_attention_revokes_previous_validation(monkeypatch, tmp_path: Path) -> None:
+    directory, _, _ = _virtual_product(tmp_path)
+    manifest_path = directory / "manifest.json"
+    fingerprint = int8_virtual_product_fingerprint(directory)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "component": "text_encoder",
+                "validation_passed": True,
+                "validated_product_fingerprint": fingerprint,
+                "validation": {"status": "passed", "product_fingerprint": fingerprint},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def write_split_graph(path: Path, outputs: list[str], input_name: str) -> None:
+        input_info = helper.make_tensor_value_info(input_name, TensorProto.FLOAT, [1])
+        output_infos = [helper.make_tensor_value_info(name, TensorProto.FLOAT, [1]) for name in outputs]
+        nodes = [helper.make_node("Identity", [input_name], [name]) for name in outputs]
+        graph = helper.make_graph(nodes, path.stem, [input_info], output_infos)
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 20)], ir_version=9)
+        onnx.save_model(model, path)
+
+    def fake_build(_fused: Path, qkv: Path, output: Path) -> tuple[Path, Path]:
+        write_split_graph(qkv, ["add_154", "add_222", "view_8"], "hidden_states")
+        write_split_graph(output, ["hidden_states_out"], "attended")
+        return qkv, output
+
+    monkeypatch.setattr("h3_workbench.qwen_int8_graph.build_split_qwen_attention_graphs", fake_build)
+
+    install_split_qwen_attention(directory)
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["validation_passed"] is False
+    assert "validated_product_fingerprint" not in manifest
+    assert manifest["validation"]["status"] == "invalidated"
+    assert int8_virtual_qwen_ready(directory)
+    assert not validated_int8_virtual_qwen_ready(directory)

@@ -43,6 +43,7 @@ class ExportPreset:
     extra_sources: tuple[SourceAsset, ...] = ()
     product_type: str = "onnx_model"
     depends_on: tuple[str, ...] = ()
+    required_for_generation: bool = True
 
     @property
     def sources(self) -> tuple[SourceAsset, ...]:
@@ -145,8 +146,22 @@ EXPORT_PRESETS: tuple[ExportPreset, ...] = (
         "INT8 原权重零拷贝虚拟切片，代表层与 50 层全链校验",
     ),
     ExportPreset(
+        "ref2va",
+        "Ref2VA 虚拟切片基座",
+        "ref2va_transformer",
+        SourceAsset(
+            OFFICIAL_REPO,
+            "diffusion_models/minimax_h3_ref2va_pruned_bf16.safetensors",
+            40225724176,
+            _modelscope_url(OFFICIAL_REPO, "diffusion_models/minimax_h3_ref2va_pruned_bf16.safetensors"),
+        ),
+        "onnx_models/minimax_h3_ref2va_pruned_bf16_virtual",
+        3384704300,
+        "BF16 原权重零拷贝虚拟切片；复用共享 Block 拓扑，支持已验证的 T2VA、FL2VA 与 Ref2VA 推理",
+    ),
+    ExportPreset(
         "fl2va_streaming",
-        "FL2VA 流式基座",
+        "FL2VA 流式基座（Turbo 专用）",
         "fl2va_transformer",
         SourceAsset(
             OFFICIAL_REPO,
@@ -156,7 +171,8 @@ EXPORT_PRESETS: tuple[ExportPreset, ...] = (
         ),
         "onnx_models/minimax_h3_fl2va_pruned_fp8_scaled_streaming",
         40764106323,
-        "实测成功的 pruned FP8 scaled 基座与流式注意力",
+        "可选的 pruned FP8 scaled 基座，仅用于兼容现有 Turbo v4 动态 LoRA；普通生成不再需要",
+        required_for_generation=False,
     ),
     ExportPreset(
         "fl2va_turbo_v4",
@@ -181,6 +197,7 @@ EXPORT_PRESETS: tuple[ExportPreset, ...] = (
         ),
         product_type="runtime_adapter",
         depends_on=("fl2va_streaming",),
+        required_for_generation=False,
     ),
 )
 

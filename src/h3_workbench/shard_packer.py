@@ -440,6 +440,9 @@ def build_sharded_model(
     _atomic_json(staging_dir / "manifest.json", source_manifest)
     graph_names = [filename.removesuffix(".onnx") for filename in source_manifest["graphs"]]
     reader = CheckpointReader(checkpoint)
+    virtual_source = str(source_manifest.get("weight_storage", "")).startswith(
+        "source_safetensors"
+    )
     total_graphs = len(graph_names)
     for index, graph_name in enumerate(graph_names, 1):
         if callback:
@@ -448,7 +451,7 @@ def build_sharded_model(
             continue
         source_graph = source_dir / f"{graph_name}.onnx"
         match = re_match_mlp(graph_name)
-        if match is None:
+        if match is None or virtual_source:
             paths = _atomic_copy_graph(source_dir, staging_dir, graph_name)
         else:
             paths = fp8_quantize_mlp_graph(source_graph, staging_dir, reader, match)

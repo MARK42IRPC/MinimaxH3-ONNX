@@ -16,6 +16,7 @@ import numpy as np
 from h3_workbench.exporter import _metrics
 from h3_workbench.inference_runtime import ORTGraphRunner
 from h3_workbench.main_benchmark import JsonlLogger
+from h3_workbench.qwen_transformer import streamed_qwen_causal_attention
 from h3_workbench.qwen_persistent import (
     QwenInt8SourceWeights,
     int8_virtual_product_fingerprint,
@@ -98,6 +99,9 @@ def _run_full_chain(
     attention: Any,
     mlp: Any,
     tokens: int,
+    attention_qkv: Any | None = None,
+    attention_output: Any | None = None,
+    runner: ORTGraphRunner | None = None,
 ) -> np.ndarray:
     base_ids = np.asarray([1, 42, 1000, 151935], dtype=np.int64)
     token_ids = np.resize(base_ids, tokens)
@@ -114,15 +118,85 @@ def _run_full_chain(
         ),
     }
     for block in range(50):
-        hidden = attention.run(
-            None,
-            {"hidden_states": hidden, **shared, **weights.inputs("attention", block)},
-        )[0]
+        if attention_qkv is None or attention_output is None or runner is None:
+            hidden = attention.run(
+                None,
+                {"hidden_states": hidden, **shared, **weights.inputs("attention", block)},
+            )[0]
+        else:
+            query, key, value = attention_qkv.run(
+                None,
+                {
+                    "hidden_states": hidden,
+                    "cosine": shared["cosine"],
+                    "sine": shared["sine"],
+                    **weights.inputs("attention_qkv", block),
+                },
+            )
+            attended = streamed_qwen_causal_attention(
+                query,
+                key,
+                value,
+                query_chunk_tokens=max(1, tokens),
+                use_cuda=runner.provider == "CUDAExecutionProvider",
+                device_index=int(getattr(runner, "device_index", 0)),
+                output_dtype=np.dtype(np.float16),
+            )
+            hidden = attention_output.run(
+                None,
+                {
+                    "hidden_states": hidden,
+                    "sine": shared["sine"],
+                    "attended": attended.reshape(-1, 32, 256).astype(np.float32),
+                    **weights.inputs("attention_output", block),
+                },
+            )[0]
         hidden = mlp.run(
             None,
             {"hidden_states": hidden, **weights.inputs("mlp", block)},
         )[0]
     return np.ascontiguousarray(hidden)
+
+
+def _run_split_attention(
+    qkv: Any,
+    output: Any,
+    runner: ORTGraphRunner,
+    weights: QwenInt8SourceWeights,
+    block: int,
+    feeds: dict[str, np.ndarray],
+) -> np.ndarray:
+    """Run the split attention path exactly as the multimodal runtime does."""
+    query, key, value = qkv.run(
+        None,
+        {
+            "hidden_states": feeds["hidden_states"],
+            "cosine": feeds["cosine"],
+            "sine": feeds["sine"],
+            **weights.inputs("attention_qkv", block),
+        },
+    )
+    attended = streamed_qwen_causal_attention(
+        query,
+        key,
+        value,
+        query_chunk_tokens=max(1, int(feeds["hidden_states"].shape[0])),
+        use_cuda=runner.provider == "CUDAExecutionProvider",
+        device_index=int(getattr(runner, "device_index", 0)),
+        output_dtype=np.dtype(np.float16),
+    )
+    return np.asarray(
+        output.run(
+            None,
+            {
+                "hidden_states": feeds["hidden_states"],
+                "sine": feeds["sine"],
+                "attended": attended.reshape(-1, 32, 256).astype(np.float32),
+                **weights.inputs("attention_output", block),
+            },
+        )[0],
+        dtype=np.float32,
+    )
 
 
 def run(args: argparse.Namespace) -> int:
@@ -145,6 +219,11 @@ def run(args: argparse.Namespace) -> int:
         runner = ORTGraphRunner(prefer_cuda=True, prefetch_depth=0)
         weights = QwenInt8SourceWeights(model)
         attention = runner.session(weights.graph("attention"))
+        split = weights.attention_split
+        if not isinstance(split, dict) or "qkv" not in split or "output" not in split:
+            raise RuntimeError("Qwen virtual product is missing split attention graphs")
+        attention_qkv = runner.session(weights.graph("attention_qkv"))
+        attention_output = runner.session(weights.graph("attention_output"))
         mlp = runner.session(weights.graph("mlp"))
         logger.write(
             "started",
@@ -161,19 +240,31 @@ def run(args: argparse.Namespace) -> int:
             attention_feeds = _attention_inputs(args.tokens, block)
             attention_expected = _source_expected(weights.source, "attention", block, attention_feeds)
             attention_actual = attention.run(None, {**attention_feeds, **weights.inputs("attention", block)})[0]
+            attention_split_actual = _run_split_attention(
+                attention_qkv,
+                attention_output,
+                runner,
+                weights,
+                block,
+                attention_feeds,
+            )
             attention_metrics = _metrics(attention_expected, attention_actual)
+            attention_split_metrics = _metrics(attention_actual, attention_split_actual)
             mlp_feeds = {"hidden_states": attention_expected}
             mlp_expected = _source_expected(weights.source, "mlp", block, mlp_feeds)
             mlp_actual = mlp.run(None, {**mlp_feeds, **weights.inputs("mlp", block)})[0]
             mlp_metrics = _metrics(mlp_expected, mlp_actual)
             passed = (
                 np.isfinite(attention_actual).all()
+                and np.isfinite(attention_split_actual).all()
                 and np.isfinite(mlp_actual).all()
                 and attention_metrics["relative_l2"] <= args.relative_l2_max
+                and attention_split_metrics["relative_l2"] <= args.relative_l2_max
                 and mlp_metrics["relative_l2"] <= args.relative_l2_max
             )
             record = {
                 "attention": attention_metrics,
+                "attention_split": attention_split_metrics,
                 "mlp": mlp_metrics,
                 "passed": bool(passed),
             }
@@ -189,7 +280,15 @@ def run(args: argparse.Namespace) -> int:
 
         full_chain: dict[str, Any] | None = None
         if getattr(args, "run_full_chain", False):
-            output = _run_full_chain(weights, attention, mlp, args.tokens)
+            output = _run_full_chain(
+                weights,
+                attention,
+                mlp,
+                args.tokens,
+                attention_qkv=attention_qkv,
+                attention_output=attention_output,
+                runner=runner,
+            )
             full_chain = {
                 "executed": True,
                 "shape": list(output.shape),

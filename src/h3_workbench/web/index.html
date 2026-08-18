@@ -79,7 +79,7 @@
           <div class="section-bar">
             <div>
               <h3>验证方案</h3>
-              <p>基座模型在本机自动切片；Turbo 只生成动态叠加拓扑，不复制或合并一份主模型。</p>
+              <p>主模型在本机自动切片；Ref2VA 使用虚拟权重切片，Turbo 只为兼容的 FL2VA 基座生成动态叠加拓扑。</p>
             </div>
             <button class="text-button" id="checkModelsButton" type="button"><span aria-hidden="true">↻</span>重新检查</button>
           </div>
@@ -139,6 +139,22 @@
               <label class="field prompt-field"><span>提示词</span><textarea id="promptInput" rows="7" maxlength="4000" placeholder="例如：雨后的城市街道，镜头缓慢向前移动，远处传来电车声……" autocomplete="off"></textarea></label>
             </section>
 
+            <section class="form-section reference-section" id="referenceSection">
+              <div class="form-section-heading">
+                <div><h3>全能参考</h3><p>按顺序混合图片、视频和独立音频；视频自带音轨会随视频一起作为参考。</p></div>
+                <span id="referenceStatus">未添加</span>
+              </div>
+              <div class="reference-upload-actions">
+                <label class="reference-file-button"><input id="referenceImageFile" type="file" accept="image/png,image/jpeg,image/webp,image/bmp"><span>＋ 图片</span></label>
+                <label class="reference-file-button"><input id="referenceVideoFile" type="file" accept="video/*"><span>＋ 视频</span></label>
+                <label class="reference-file-button"><input id="referenceAudioFile" type="file" accept="audio/*"><span>＋ 音频</span></label>
+                <span class="reference-budget" id="referenceBudget">0 / 12</span>
+              </div>
+              <div class="reference-list" id="referenceList">
+                <div class="empty-state compact"><strong>暂无参考素材</strong><span>添加后可用箭头调整读取顺序。</span></div>
+              </div>
+            </section>
+
             <section class="form-section frame-conditioning-section">
               <div class="form-section-heading"><div><h3>帧条件</h3><p>选择生成边界，图片会编码到 Video VAE 潜空间。</p></div><span id="frameConditionStatus">纯文本</span></div>
               <fieldset class="mode-field frame-mode-field">
@@ -189,7 +205,7 @@
                 <label class="toggle-field">
                   <input id="accelerationLoraInput" type="checkbox">
                   <span class="toggle-control" aria-hidden="true"><i></i></span>
-                  <span class="toggle-copy"><strong>加载 Turbo v4 加速 LoRA</strong><small>手动开启，仅支持 4–8 步；关闭时始终使用流式基座</small></span>
+                  <span class="toggle-copy"><strong>加载 Turbo v4 加速 LoRA</strong><small>手动开启，仅支持 4–8 步；仅兼容 FL2VA 基座</small></span>
                 </label>
               </fieldset>
             </section>
@@ -233,7 +249,7 @@
           <div>
             <span class="eyebrow">VIDEO SUPER-RESOLUTION</span>
             <h2>超分</h2>
-            <p>读取输入视频提示词，将时空块放大后编码为条件 latent，再复用 FL2VA 推理链。</p>
+            <p>读取输入视频提示词，将时空块放大后编码为条件 latent，再复用主模型推理链。</p>
           </div>
           <div class="header-status neutral" id="superResolutionProvider"><span class="status-dot"></span><span>正在预检</span></div>
         </header>
@@ -275,7 +291,7 @@
                 <label class="toggle-field">
                   <input id="superAccelerationLoraInput" type="checkbox">
                   <span class="toggle-control" aria-hidden="true"><i></i></span>
-                  <span class="toggle-copy"><strong>加载 Turbo v4 加速 LoRA</strong><small>手动开启，仅支持 4–8 步</small></span>
+                  <span class="toggle-copy"><strong>加载 Turbo v4 加速 LoRA</strong><small>手动开启，仅支持 4–8 步；仅兼容 FL2VA 基座</small></span>
                 </label>
               </fieldset>
             </section>

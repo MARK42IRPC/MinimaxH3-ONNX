@@ -3,7 +3,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from h3_workbench.acceleration import LoRAMerger, shifted_flow_sigmas
+from h3_workbench.acceleration import LoRAMerger, minimax_h3_euler_step, shifted_flow_sigmas
 
 
 def test_six_step_shifted_flow_schedule() -> None:
@@ -25,6 +25,20 @@ def test_shifted_flow_schedule_can_start_from_conditioning_sigma() -> None:
 def test_shifted_flow_schedule_rejects_invalid_start_sigma() -> None:
     with pytest.raises(ValueError, match="start_sigma"):
         shifted_flow_sigmas(4, start_sigma=1.1)
+
+
+def test_minimax_h3_euler_step_matches_official_dataward_velocity_update() -> None:
+    sample = np.asarray([2.0, -1.0], dtype=np.float16)
+    velocity = np.asarray([3.0, 4.0], dtype=np.float16)
+
+    actual = minimax_h3_euler_step(sample, velocity, sigma=0.8, sigma_next=0.2)
+
+    np.testing.assert_allclose(actual, np.asarray([3.8, 1.4], dtype=np.float16), rtol=0, atol=1e-3)
+
+
+def test_minimax_h3_euler_step_rejects_reverse_sigma() -> None:
+    with pytest.raises(ValueError, match="sigma_next"):
+        minimax_h3_euler_step(np.zeros(1), np.zeros(1), sigma=0.2, sigma_next=0.3)
 
 
 def test_lora_merger_applies_b_times_a(tmp_path) -> None:

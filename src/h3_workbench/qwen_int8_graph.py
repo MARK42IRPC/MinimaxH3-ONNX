@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,211 @@ MLP_WEIGHT_TO_SOURCE = {
     "up.linear.weight": "mlp.up_proj",
     "down.linear.weight": "mlp.down_proj",
 }
+
+
+def _atomic_json(path: Path, payload: dict[str, object]) -> None:
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _invalidate_product_validation(directory: Path, reason: str) -> None:
+    """Revoke a product validation before publishing a changed runtime manifest."""
+    manifest_path = directory / "manifest.json"
+    if not manifest_path.is_file():
+        return
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["validation_passed"] = False
+    manifest.pop("validated_product_fingerprint", None)
+    validation = manifest.get("validation")
+    if not isinstance(validation, dict):
+        validation = {}
+    validation.update({"status": "invalidated", "reason": reason})
+    manifest["validation"] = validation
+    _atomic_json(manifest_path, manifest)
+
+
+def _tensor_producers(model: onnx.ModelProto) -> dict[str, onnx.NodeProto]:
+    return {
+        output: node
+        for node in model.graph.node
+        for output in node.output
+        if output
+    }
+
+
+def _copy_value_info(value: onnx.ValueInfoProto) -> onnx.ValueInfoProto:
+    result = onnx.ValueInfoProto()
+    result.CopyFrom(value)
+    return result
+
+
+def _extract_qwen_subgraph(
+    model: onnx.ModelProto,
+    outputs: list[str],
+    replacements: dict[str, onnx.ValueInfoProto] | None = None,
+) -> onnx.ModelProto:
+    """Extract a dependency-closed graph while treating replacements as inputs."""
+    replacements = replacements or {}
+    producers = _tensor_producers(model)
+    graph_inputs = {value.name: value for value in model.graph.input}
+    initializers = {value.name: value for value in model.graph.initializer}
+    needed_nodes: set[int] = set()
+    needed_tensors = list(outputs)
+    while needed_tensors:
+        tensor = needed_tensors.pop()
+        if tensor in replacements or tensor in graph_inputs or tensor in initializers:
+            continue
+        node = producers.get(tensor)
+        if node is None:
+            raise ValueError(f"Qwen topology has no producer for required tensor {tensor!r}")
+        node_index = next(index for index, candidate in enumerate(model.graph.node) if candidate is node)
+        if node_index in needed_nodes:
+            continue
+        needed_nodes.add(node_index)
+        needed_tensors.extend(name for name in node.input if name)
+
+    nodes = []
+    for index, original in enumerate(model.graph.node):
+        if index not in needed_nodes:
+            continue
+        node = onnx.NodeProto()
+        node.CopyFrom(original)
+        for input_index, input_name in enumerate(node.input):
+            if input_name in replacements:
+                node.input[input_index] = replacements[input_name].name
+        nodes.append(node)
+
+    used_names = {name for node in nodes for name in node.input if name}
+    inputs = []
+    for value in model.graph.input:
+        if value.name in used_names:
+            inputs.append(_copy_value_info(value))
+    for value in replacements.values():
+        if value.name not in {item.name for item in inputs}:
+            inputs.append(_copy_value_info(value))
+    output_infos: list[onnx.ValueInfoProto] = []
+    known_values = {
+        value.name: value
+        for value in (*model.graph.input, *model.graph.value_info, *model.graph.output)
+    }
+    for name in outputs:
+        if name in replacements:
+            output_infos.append(_copy_value_info(replacements[name]))
+        elif name in known_values:
+            output_infos.append(_copy_value_info(known_values[name]))
+        else:
+            raise ValueError(f"Qwen topology has no value info for output {name!r}")
+
+    used_initializers = {name for node in nodes for name in node.input if name in initializers}
+    graph = helper.make_graph(
+        nodes,
+        "qwen_attention_split",
+        inputs,
+        output_infos,
+        initializer=[initializers[name] for name in initializers if name in used_initializers],
+    )
+    result = onnx.ModelProto()
+    result.CopyFrom(model)
+    result.graph.CopyFrom(graph)
+    result.graph.name = "qwen_attention_split"
+    onnx.checker.check_model(result, full_check=False)
+    return result
+
+
+def build_split_qwen_attention_graphs(
+    fused_topology: Path,
+    qkv_output: Path,
+    attention_output: Path,
+) -> tuple[Path, Path]:
+    """Split the validated fused Qwen attention topology at the SDPA boundary."""
+    fused_topology = fused_topology.resolve()
+    model = onnx.shape_inference.infer_shapes(onnx.load(str(fused_topology), load_external_data=False))
+    available = {value.name for value in (*model.graph.input, *model.graph.value_info, *model.graph.output)}
+    required = ("add_154", "add_222", "view_8", "view_9")
+    missing = [name for name in required if name not in available]
+    if missing:
+        raise ValueError(f"Unsupported Qwen attention topology; missing split tensors: {missing}")
+
+    qkv_model = _extract_qwen_subgraph(model, ["add_154", "add_222", "view_8"])
+    # The fused graph applies the output projection's ConvRot in groups of
+    # 256 after reshaping the 64x128 attention result to [S, 32, 256].
+    attended_info = helper.make_tensor_value_info(
+        "attended", TensorProto.FLOAT, ["sequence", 32, 256]
+    )
+    output_model = _extract_qwen_subgraph(model, ["hidden_states_out"], {"view_9": attended_info})
+    qkv_output = qkv_output.resolve()
+    attention_output = attention_output.resolve()
+    qkv_output.parent.mkdir(parents=True, exist_ok=True)
+    attention_output.parent.mkdir(parents=True, exist_ok=True)
+    qkv_temporary = qkv_output.with_name(f"{qkv_output.name}.{os.getpid()}.tmp")
+    output_temporary = attention_output.with_name(f"{attention_output.name}.{os.getpid()}.tmp")
+    try:
+        onnx.save_model(qkv_model, str(qkv_temporary), save_as_external_data=False)
+        onnx.save_model(output_model, str(output_temporary), save_as_external_data=False)
+        os.replace(qkv_temporary, qkv_output)
+        os.replace(output_temporary, attention_output)
+    finally:
+        qkv_temporary.unlink(missing_ok=True)
+        output_temporary.unlink(missing_ok=True)
+    return qkv_output, attention_output
+
+
+def install_split_qwen_attention(directory: Path) -> dict[str, object]:
+    """Publish split attention graphs and their source-weight specifications."""
+    from h3_workbench.qwen_persistent import (
+        RUNTIME_INT8_MANIFEST,
+        int8_virtual_product_fingerprint,
+        runtime_file_identity,
+    )
+
+    directory = directory.resolve()
+    manifest_path = directory / RUNTIME_INT8_MANIFEST
+    _invalidate_product_validation(directory, "qwen_split_attention_graphs_changed")
+    runtime = json.loads(manifest_path.read_text(encoding="utf-8"))
+    fused = directory / str(runtime["kinds"]["attention"]["graph"])
+    qkv_name = "runtime_qwen_attention_qkv_int8.onnx"
+    output_name = "runtime_qwen_attention_output_int8.onnx"
+    build_split_qwen_attention_graphs(fused, directory / qkv_name, directory / output_name)
+    base_specs = list(runtime["kinds"]["attention"]["inputs"])
+    qkv_inputs = {value.name for value in onnx.load(str(directory / qkv_name), load_external_data=False).graph.input}
+    output_inputs = {value.name for value in onnx.load(str(directory / output_name), load_external_data=False).graph.input}
+
+    def specs(names: set[str]) -> list[dict[str, object]]:
+        return [item for item in base_specs if str(item["name"]) in names]
+
+    runtime["attention_split"] = {
+        "format": "qkv_sdpa_output_v1",
+        "qkv": {
+            "graph": qkv_name,
+            "graph_identity": runtime_file_identity(directory / qkv_name),
+            "inputs": specs(qkv_inputs),
+            "outputs": ["add_154", "add_222", "view_8"],
+        },
+        "output": {
+            "graph": output_name,
+            "graph_identity": runtime_file_identity(directory / output_name),
+            "inputs": specs(output_inputs),
+            "outputs": ["hidden_states_out"],
+        },
+    }
+    _atomic_json(manifest_path, runtime)
+
+    # The split graphs are part of the runtime product identity.  A product
+    # validated before they were installed must remain unavailable until the
+    # split path itself has been validated.
+    product_manifest_path = directory / "manifest.json"
+    if product_manifest_path.is_file():
+        product_manifest = json.loads(product_manifest_path.read_text(encoding="utf-8"))
+        product_manifest["validation_passed"] = False
+        product_manifest.pop("validated_product_fingerprint", None)
+        product_manifest["validation"] = {
+            "status": "invalidated",
+            "reason": "qwen_split_attention_graphs_changed",
+            "product_fingerprint": int8_virtual_product_fingerprint(directory),
+        }
+        _atomic_json(product_manifest_path, product_manifest)
+    return runtime["attention_split"]
 
 
 def _external_fields(tensor: TensorProto) -> dict[str, str]:

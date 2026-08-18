@@ -10,7 +10,7 @@ import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,7 +27,9 @@ from h3_workbench.inference_runtime import (
     QwenTextRuntime,
     VideoLatentCondition,
     initial_latents,
+    initial_ref2va_latents,
     sample_latents,
+    sample_ref2va_latents,
 )
 from h3_workbench.qwen_persistent import resolve_qwen_directory
 from h3_workbench.media_output import (
@@ -37,6 +39,7 @@ from h3_workbench.media_output import (
     decode_video_latents_onnx,
     encode_image_frame,
     encode_video_frames,
+    audio_vae_encoder_ready,
     load_video_vae_onnx_encoder,
     select_video_vae_encoder_backend,
     video_vae_temporal_encoder_ready,
@@ -62,8 +65,20 @@ from h3_workbench.profiles import (
     video_latent_frames_for_output,
     video_vae_output_frames,
 )
-from h3_workbench.tokenizer import encode_prompt
+from h3_workbench.tokenizer import encode_prompt, load_tokenizer
 from h3_workbench.tokenizer import tokenizer_files_ready
+from h3_workbench.reference import (
+    H3_FPS,
+    ReferenceSpec,
+    align_num_frames,
+    resolve_reference_specs,
+)
+from h3_workbench.reference_conditioning import (
+    build_reference_layout,
+    encode_reference_latents,
+    encode_reference_vision,
+    normalize_reference_media,
+)
 from h3_workbench.model_registry import inspect_checkpoint
 from h3_workbench.memory_planner import probe_gpu_memory
 from h3_workbench.source_catalog import ExportPreset, SourceAsset, export_preset
@@ -86,6 +101,14 @@ def _complete_main_model(directory: Path) -> bool:
         manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
+    if manifest.get("component") == "ref2va_transformer":
+        try:
+            from h3_workbench.ref2va_virtual_slicer import validated_ref2va_virtual_ready
+
+            if not validated_ref2va_virtual_ready(directory):
+                return False
+        except (ImportError, OSError, TypeError, ValueError):
+            return False
     schedule = directory / str(manifest.get("schedule", ""))
     return (
         manifest.get("validation_passed") is True
@@ -100,6 +123,7 @@ def resolve_main_model_directory(
     workspace: Path,
     output_root: Path,
     accelerated: bool,
+    component: str | None = None,
 ) -> Path | None:
     """Resolve a validated main product by capability instead of a legacy folder name."""
     candidates: list[Path] = []
@@ -119,6 +143,15 @@ def resolve_main_model_directory(
             manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        if component is not None:
+            manifest_component = manifest.get("component")
+            legacy_component_match = (
+                manifest_component is None
+                and component == "fl2va_transformer"
+                and "fl2va" in directory.name.lower()
+            )
+            if manifest_component != component and not legacy_component_match:
+                continue
         if bool(manifest.get("acceleration")) == accelerated:
             ready.append(directory)
     if not ready:
@@ -149,6 +182,28 @@ def _close_qwen_runtime_weights(runtime: QwenTextRuntime | None) -> None:
     for weights in (runtime.int8_virtual, runtime.persistent):
         if weights is not None:
             weights.close()
+
+
+def _resolve_qwen_visual_checkpoint(directory: Path) -> Path:
+    """Resolve the visual tower from the same source as the Qwen virtual runtime."""
+    candidates = (directory / "runtime_int8_manifest.json", directory / "manifest.json")
+    for manifest_path in candidates:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        raw_source = manifest.get("source_checkpoint") or manifest.get("source")
+        if not raw_source:
+            continue
+        source = Path(str(raw_source))
+        if not source.is_absolute():
+            source = directory / source
+        source = source.resolve()
+        if source.is_file():
+            return source
+    raise RuntimeError(
+        "The Qwen virtual runtime does not expose a readable source checkpoint for the visual tower"
+    )
 
 
 def _release_video_encoder(encoder: Any | None) -> None:
@@ -253,6 +308,7 @@ class JobManager:
             "video_vae": "video_vae",
             "text_encoder": "qwen3vl_32b_minimax_h3_int8_virtual",
             "fl2va_transformer": "minimax_h3_fl2va_pruned_fp8_scaled_streaming",
+            "ref2va_transformer": "minimax_h3_ref2va_pruned_bf16_virtual",
         }.get(record.component, source.stem.replace(".safetensors", ""))
         destination = self.output_root / component_dir
         job.output_dir = str(destination)
@@ -363,6 +419,7 @@ class JobManager:
                     self.workspace,
                     self.output_root,
                     accelerated=False,
+                    component="fl2va_transformer",
                 )
                 if base_main_dir is None:
                     raise RuntimeError(
@@ -442,6 +499,7 @@ class JobManager:
         conditioning_mode: str = "text",
         start_image_path: str | None = None,
         end_image_path: str | None = None,
+        references: list[dict[str, object]] | None = None,
     ) -> Job:
         if not 1 <= steps <= 50:
             raise ValueError("Inference steps must be from 1 to 50")
@@ -470,10 +528,27 @@ class JobManager:
         supplied = (bool(start_image_path), bool(end_image_path))
         if supplied != expected:
             raise ValueError(f"Frame conditioning inputs do not match mode {conditioning_mode!r}")
+        reference_specs: tuple[ReferenceSpec, ...] = ()
+        if references:
+            if not prompt or not prompt.strip():
+                raise ValueError("Ref2VA references require a prompt")
+            if token_ids:
+                raise ValueError("Ref2VA references require prompt text, not token IDs")
+            if use_acceleration_lora:
+                raise ValueError("Ref2VA references are incompatible with Turbo v4 acceleration")
+            if temporal_mode != "native":
+                raise ValueError("Ref2VA references require native temporal mode")
+            if conditioning_mode != "text" or start_image_path or end_image_path:
+                raise ValueError("Ref2VA references are incompatible with first/last frame conditioning")
+            if not 5.0 <= duration_seconds <= 15.0:
+                raise ValueError("Ref2VA generation duration must be from 5 to 15 seconds")
+            reference_specs = resolve_reference_specs(self.workspace, references)
         # Keep the model's validated temporal/FPS geometry as an internal template;
         # output dimensions and duration are always supplied explicitly by the caller.
         base_profile = PROFILE_360P_17F.resized(width, height)
         target_frames = max(1, round(duration_seconds * base_profile.fps))
+        if reference_specs:
+            target_frames = align_num_frames(target_frames)
         if conditioning_mode == "first_last" and target_frames < 2:
             raise ValueError("First/last conditioning requires an output of at least two frames")
         segment_count = math.ceil(target_frames / base_profile.frames) if temporal_mode == "segmented" else 1
@@ -514,6 +589,7 @@ class JobManager:
             destination,
             use_acceleration_lora,
             frame_conditioning=frame_conditioning,
+            references=reference_specs or None,
         )
         return job
 
@@ -687,6 +763,524 @@ class JobManager:
                 error="".join(traceback.format_exception(exc)),
             )
 
+    def _run_ref2va_inference(
+        self,
+        job_id: str,
+        token_ids: list[int] | None,
+        prompt: str | None,
+        profile: GenerationProfile,
+        steps: int,
+        seed: int,
+        target_frames: int,
+        attention_query_chunk: int,
+        l1_prefetch_shards: int,
+        destination: Path,
+        references: tuple[ReferenceSpec, ...],
+    ) -> None:
+        """Run the ordered multimodal Ref2VA path against the virtual base."""
+        del token_ids
+        runner: ORTGraphRunner | None = None
+        qwen: QwenTextRuntime | None = None
+        runtime: H3MainRuntime | None = None
+        video_encoder: Any | None = None
+        monitor: PerformanceMonitor | None = None
+        reservation_token = f"{os.getpid()}-{job_id}"
+        reservation_active = False
+        heartbeat_stop = threading.Event()
+        runtime_profile = profile
+        provider_name = "unknown"
+        main_dir: Path | None = None
+        qwen_dir: Path | None = None
+        video_onnx = self.output_root / "video_vae"
+        audio_onnx = self.output_root / "audio_vae"
+        normalized = None
+        vision = None
+        vision_metadata: dict[str, object] = {}
+        condition_video: tuple[np.ndarray, ...] = ()
+        condition_audio: tuple[np.ndarray, ...] = ()
+        noised_video: tuple[np.ndarray, ...] = ()
+        video: np.ndarray | None = None
+        audio: np.ndarray | None = None
+        text_states: np.ndarray | None = None
+        main_runtime_metrics: dict[str, object] = {}
+        audio_warning: str | None = None
+        audio_status = "generated"
+
+        def update(progress: float, message: str, activity: dict[str, object]) -> None:
+            self._update(job_id, progress=progress, message=message, activity=activity)
+
+        def report_activity(activity: dict[str, object], **context: object) -> None:
+            details = {"phase": "ref2va", **activity, **context}
+            module = str(details.get("module", "Ref2VA"))
+            operation = str(details.get("operation", "Running"))
+            self._update(job_id, message=f"{module}: {operation}", activity=details)
+
+        try:
+            try:
+                monitor = PerformanceMonitor(
+                    self.performance_log_path(job_id)
+                    or self.workspace / ".h3-workbench" / "performance" / f"h3-{job_id}.jsonl",
+                    lambda: self._performance_state(job_id),
+                    lambda record: self._update(job_id, performance=record),
+                )
+                monitor.start()
+            except Exception as exc:
+                monitor = None
+                self._update(
+                    job_id,
+                    performance={"timestamp": _now(), "monitor_error": f"Performance monitor unavailable: {exc}"},
+                )
+            self._update(
+                job_id,
+                status="running",
+                started_at=_now(),
+                progress=0.01,
+                message="Preparing Ref2VA references",
+                activity={
+                    "phase": "ref2va_prepare",
+                    "module": "Ref2VA",
+                    "operation": "Checking ordered reference assets",
+                    "references": len(references),
+                },
+            )
+            if not prompt or not prompt.strip():
+                raise ValueError("Ref2VA references require a non-empty prompt")
+            if target_frames < 1 or profile.frames != target_frames:
+                raise ValueError("Ref2VA profile frame geometry is not aligned with the request")
+            main_dir = resolve_main_model_directory(
+                self.workspace,
+                self.output_root,
+                accelerated=False,
+                component="ref2va_transformer",
+            )
+            if main_dir is None:
+                raise RuntimeError("No validated Ref2VA virtual model is installed")
+            qwen_dir = resolve_qwen_directory(self.output_root)
+            if not tokenizer_files_ready(self.workspace / "qwen_tokenizer"):
+                raise RuntimeError("The H3 tokenizer is not installed")
+            if not video_vae_temporal_encoder_ready(video_onnx):
+                raise RuntimeError(
+                    "Ref2VA references require the staged Video VAE encoder; "
+                    "re-export the Video VAE product with encoder support"
+                )
+            if not audio_vae_encoder_ready(audio_onnx):
+                raise RuntimeError(
+                    "Ref2VA references require the complete Audio VAE encoder and decoder product"
+                )
+
+            # The multimodal path has no useful CPU fallback: the visual
+            # tower and the split Qwen text runtime are both CUDA-bound on the
+            # supported product.  Check the provider before loading the large
+            # visual tower so a misconfigured runtime fails without allocating
+            # it first.
+            runner = ORTGraphRunner(prefer_cuda=True)
+            provider_name = runner.provider
+            if provider_name != "CUDAExecutionProvider":
+                raise RuntimeError(
+                    "Ref2VA multimodal conditioning requires CUDAExecutionProvider for the Qwen INT8 virtual runtime"
+                )
+            if not qwen_dir.name.endswith("_int8_virtual"):
+                raise RuntimeError("Ref2VA requires the validated Qwen INT8 virtual runtime")
+
+            tokenizer = load_tokenizer(self.workspace / "qwen_tokenizer")
+            visual_checkpoint = _resolve_qwen_visual_checkpoint(qwen_dir)
+            normalized = normalize_reference_media(
+                references,
+                target_frames,
+                callback=lambda details: report_activity(details, phase="reference_normalize"),
+            )
+            update(
+                0.08,
+                "Encoding reference vision",
+                {
+                    "phase": "reference_vision",
+                    "module": "Qwen Vision",
+                    "operation": "Loading visual tower",
+                    "checkpoint": str(visual_checkpoint),
+                },
+            )
+            vision = encode_reference_vision(
+                visual_checkpoint,
+                tokenizer,
+                prompt,
+                normalized,
+                prefer_cuda=True,
+                callback=lambda details: report_activity(details, phase="reference_vision"),
+            )
+            update(
+                0.22,
+                "Encoding reference latents",
+                {
+                    "phase": "reference_vae",
+                    "module": "Video/Audio VAE",
+                    "operation": "Loading staged encoders",
+                },
+            )
+            video_encoder = load_video_vae_onnx_encoder(video_onnx)
+            condition_video, condition_audio = encode_reference_latents(
+                video_encoder,
+                audio_onnx,
+                normalized,
+                prefer_cuda=True,
+                posterior_seed=42,
+                callback=lambda details: report_activity(details, phase="reference_vae"),
+            )
+            layout = build_reference_layout(
+                normalized,
+                vision.presentation,
+                condition_video,
+                condition_audio,
+                (
+                    profile.video_latent_frames,
+                    profile.video_latent_height,
+                    profile.video_latent_width,
+                ),
+                profile.audio_latent_frames,
+            )
+            runtime_profile = replace(
+                profile,
+                text_tokens=int(vision.presentation.token_ids.size),
+            )
+            vision_metadata = {
+                "qwen_position_shape": list(vision.position_ids.shape),
+                "qwen_image_grid_thw": vision.image_grid_thw.tolist(),
+                "qwen_video_grid_thw": vision.video_grid_thw.tolist(),
+                "video_timestamps": [list(value) for value in vision.video_timestamps],
+            }
+            _release_video_encoder(video_encoder)
+            video_encoder = None
+            del normalized
+            normalized = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            qwen = QwenTextRuntime(qwen_dir, runner, l1_prefetch_shards)
+            if qwen.int8_virtual is None:
+                raise RuntimeError("The Qwen INT8 virtual runtime is not ready for multimodal conditioning")
+            if not isinstance(qwen.int8_virtual.attention_split, dict):
+                raise RuntimeError(
+                    "The Qwen INT8 virtual runtime is missing split attention graphs required by Ref2VA"
+                )
+
+            snapshot = probe_gpu_memory()
+            requested = max(
+                0,
+                snapshot.free_bytes
+                - 768 * 1024**2
+                - runtime_profile.attention_workspace_bytes,
+            )
+            if acquire_reservation(reservation_token, requested, device=snapshot.device_key):
+                reservation_active = True
+
+                def reservation_heartbeat() -> None:
+                    while not heartbeat_stop.wait(30.0):
+                        refresh_reservation(reservation_token)
+
+                threading.Thread(
+                    target=reservation_heartbeat,
+                    name=f"h3-ref2va-vram-{job_id}",
+                    daemon=True,
+                ).start()
+
+            update(
+                0.30,
+                "Encoding multimodal prompt",
+                {
+                    "phase": "text",
+                    "module": "Qwen",
+                    "operation": "Injecting visual features and running text tower",
+                    "tokens": int(vision.presentation.token_ids.size),
+                    "image_tokens": int(vision.visual_condition["image_mask"].sum()),
+                    "video_tokens": int(vision.visual_condition["video_mask"].sum()),
+                },
+            )
+            assert qwen is not None
+            assert vision is not None
+            text_states = qwen.encode_token_ids(
+                vision.presentation.token_ids,
+                lambda operation, current, total: self._update(
+                    job_id,
+                    progress=0.30 + 0.14 * current / max(1, total),
+                    message=f"Qwen: {operation}",
+                    activity={
+                        "phase": "text",
+                        "module": "Qwen",
+                        "operation": operation,
+                        "current": current,
+                        "total": total,
+                    },
+                ),
+                lambda activity: self._update(
+                    job_id,
+                    prefetch={"phase": "text", "provider": provider_name, **activity},
+                ),
+                position_ids=vision.position_ids,
+                visual_condition=vision.visual_condition,
+            )
+            _close_qwen_runtime_weights(qwen)
+            qwen = None
+            vision = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            noised_video, video, audio = initial_ref2va_latents(
+                runtime_profile,
+                seed,
+                condition_video,
+                condition_timestep=0.999,
+            )
+            update(
+                0.46,
+                "Sampling Ref2VA sequence",
+                {
+                    "phase": "sampling",
+                    "module": "Ref2VA",
+                    "operation": "Preparing packed reference rows",
+                    "condition_video_rows": layout.num_condition_video_rows,
+                    "condition_audio_rows": layout.num_condition_audio_rows,
+                    "sequence_tokens": int(layout.token_tags.size),
+                },
+            )
+
+            def report_main(activity: dict[str, object]) -> None:
+                details = {"phase": "sampling", **activity, "provider": provider_name}
+                sampling_step = int(details.get("sampling_step", 1))
+                shard = int(details.get("shard", 0))
+                shards = max(1, int(details.get("shards", 1)))
+                fraction = (sampling_step - 1 + (shard / shards if shard else 0.0)) / steps
+                self._update(
+                    job_id,
+                    progress=0.46 + 0.34 * fraction,
+                    message=f"{details.get('module', 'Ref2VA')}: {details.get('operation', 'Running')}",
+                    activity=details,
+                )
+
+            assert main_dir is not None
+            assert runner is not None
+            assert video is not None and audio is not None and text_states is not None
+            runtime = H3MainRuntime(
+                main_dir,
+                runner,
+                runtime_profile,
+                attention_query_chunk,
+                report_main,
+                l1_prefetch_shards,
+            )
+            video, audio = sample_ref2va_latents(
+                runtime,
+                video,
+                audio,
+                text_states,
+                noised_video,
+                condition_audio,
+                layout,
+                steps,
+                lambda current, total: self._update(
+                    job_id,
+                    progress=0.46 + 0.34 * current / max(1, total),
+                    message=f"Ref2VA sampling step {current}/{total}",
+                    activity={
+                        "phase": "sampling",
+                        "module": "Ref2VA",
+                        "operation": "Sampling step completed",
+                        "sampling_step": current,
+                        "sampling_steps": total,
+                    },
+                ),
+            )
+            main_runtime_metrics = runtime.metrics()
+            runtime.close()
+            runtime = None
+            runner.close()
+            runner = None
+            del text_states
+            text_states = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            update(
+                0.82,
+                "Decoding generated video",
+                {"phase": "video_decode", "module": "Video VAE", "operation": "Decoding target rows"},
+            )
+            assert video is not None and audio is not None
+            if (video_onnx / "manifest.json").is_file():
+                pixels = decode_video_latents_onnx(
+                    video_onnx,
+                    video,
+                    profile.output_height,
+                    profile.output_width,
+                    callback=lambda details: report_activity(details, phase="video_decode"),
+                )
+            else:
+                pixels = decode_video_latents(
+                    self.workspace / "minimax_h3_video_vae_fp16.safetensors",
+                    video,
+                    profile.output_height,
+                    profile.output_width,
+                    callback=lambda details: report_activity(details, phase="video_decode"),
+                )
+            pixels = np.ascontiguousarray(pixels[:, :, :target_frames], dtype=np.float32)
+            target_audio_frames = runtime_profile.audio_latent_frames
+            audio = np.ascontiguousarray(audio[:, :, :, :target_audio_frames], dtype=np.float32)
+            update(
+                0.91,
+                "Decoding generated audio",
+                {"phase": "audio_decode", "module": "Audio VAE", "operation": "Decoding target rows"},
+            )
+            if not np.isfinite(audio).all():
+                invalid = int((~np.isfinite(audio)).sum())
+                audio_status = "silent_fallback"
+                audio_warning = f"Non-finite Ref2VA audio latent: {invalid} invalid values"
+                waveform = np.zeros((1, 2, target_audio_frames * 800), dtype=np.float32)
+            else:
+                try:
+                    waveform = decode_audio_latents_onnx(
+                        audio_onnx,
+                        audio,
+                        callback=lambda details: report_activity(details, phase="audio_decode"),
+                    )
+                except FloatingPointError as exc:
+                    audio_status = "silent_fallback"
+                    audio_warning = str(exc)
+                    waveform = np.zeros((1, 2, target_audio_frames * 800), dtype=np.float32)
+
+            update(
+                0.97,
+                "Writing Ref2VA MP4",
+                {"phase": "mux", "module": "FFmpeg", "operation": "Encoding H.264/AAC"},
+            )
+            completed_at = _now()
+            metadata = {
+                "schema": "h3-workbench-output-v1",
+                "job": {
+                    "id": job_id,
+                    "created_at": self.get(job_id).created_at if self.get(job_id) is not None else None,
+                    "started_at": self.get(job_id).started_at if self.get(job_id) is not None else None,
+                    "completed_at": completed_at,
+                    "performance_log": str(self.performance_log_path(job_id) or ""),
+                },
+                "input": {
+                    "prompt": prompt,
+                    "references": [reference.to_dict() for reference in references],
+                    "reference_order": [list(reference.labels) for reference in references],
+                },
+                "sampling": {
+                    "seed": seed,
+                    "steps": steps,
+                    "scheduler": "minimax_h3",
+                    "video_shift": 12.0,
+                    "audio_shift": 3.0,
+                    "reference_condition_timestep": 0.999,
+                    "reference_audio_timestep": 1.0,
+                    "condition_noise_order": "visual_references_then_target_video_then_target_audio",
+                    "video_sigmas": shifted_flow_sigmas(steps, 12.0, 1.0),
+                    "audio_schedule": "dual_clock_time_shift_from_video_12_to_audio_3",
+                },
+                "reference_conditioning": {
+                    "layout_sequence_tokens": int(layout.token_tags.size),
+                    "condition_video_rows": layout.num_condition_video_rows,
+                    "condition_audio_rows": layout.num_condition_audio_rows,
+                    "visual_latent_shapes": [list(value.shape) for value in condition_video],
+                    "audio_latent_shapes": [list(value.shape) for value in condition_audio],
+                    **vision_metadata,
+                },
+                "output": {
+                    "path": str(destination),
+                    "width": profile.output_width,
+                    "height": profile.output_height,
+                    "frames": target_frames,
+                    "fps": H3_FPS,
+                    "duration_seconds": target_frames / H3_FPS,
+                    "audio_sample_rate": 32000,
+                    "audio_status": audio_status,
+                    "audio_warning": audio_warning,
+                },
+                "temporal": {"mode": "native", "segments": 1, "profile": runtime_profile.to_dict()},
+                "runtime": {
+                    "provider": provider_name,
+                    "main_variant": "base",
+                    "use_acceleration_lora": False,
+                    "attention_query_chunk": attention_query_chunk,
+                    "l1_prefetch_shards": l1_prefetch_shards,
+                    "segments": [main_runtime_metrics],
+                },
+                "models": {
+                    "main": _manifest_identity(main_dir),
+                    "text_encoder": _manifest_identity(qwen_dir),
+                    "visual_source": str(visual_checkpoint),
+                    "video_vae": _manifest_identity(video_onnx),
+                    "audio_vae": _manifest_identity(audio_onnx),
+                },
+            }
+            metadata_path = write_mp4(destination, pixels, waveform, H3_FPS, metadata)
+            self._update(
+                job_id,
+                status="completed",
+                progress=1.0,
+                message=(
+                    "Ref2VA video generation completed with silent audio"
+                    if audio_status == "silent_fallback"
+                    else "Ref2VA video generation completed"
+                ),
+                activity={
+                    "phase": "completed",
+                    "module": "Output",
+                    "operation": "MP4 completed",
+                    "audio_status": audio_status,
+                    "audio_warning": audio_warning,
+                },
+                finished_at=completed_at,
+                result={
+                    "output": str(destination),
+                    "metadata": str(metadata_path) if metadata_path is not None else None,
+                    "prompt": prompt,
+                    "main_variant": "base",
+                    "use_acceleration_lora": False,
+                    "profile": runtime_profile.to_dict(),
+                    "steps": steps,
+                    "seed": seed,
+                    "frames": target_frames,
+                    "duration_seconds": target_frames / H3_FPS,
+                    "segments": 1,
+                    "temporal_mode": "native",
+                    "attention_query_chunk": attention_query_chunk,
+                    "l1_prefetch_shards": l1_prefetch_shards,
+                    "audio_status": audio_status,
+                    "audio_warning": audio_warning,
+                    "references": [reference.to_dict() for reference in references],
+                },
+            )
+        except Exception as exc:
+            self._update(
+                job_id,
+                status="failed",
+                message=str(exc),
+                activity={"phase": "failed", "module": "Ref2VA", "operation": str(exc)},
+                finished_at=_now(),
+                error="".join(traceback.format_exception(exc)),
+            )
+        finally:
+            heartbeat_stop.set()
+            if runtime is not None:
+                runtime.close()
+            _close_qwen_runtime_weights(qwen)
+            if video_encoder is not None:
+                _release_video_encoder(video_encoder)
+            if runner is not None:
+                runner.close()
+            if reservation_active:
+                release_reservation(reservation_token)
+            if monitor is not None:
+                monitor.stop()
+            del normalized, vision, condition_video, condition_audio, noised_video, video, audio, text_states
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     def _run_inference(
         self,
         job_id: str,
@@ -705,7 +1299,23 @@ class JobManager:
         output_fps: float | None = None,
         super_resolution: dict[str, Any] | None = None,
         frame_conditioning: dict[str, str] | None = None,
+        references: tuple[ReferenceSpec, ...] | None = None,
     ) -> None:
+        if references:
+            self._run_ref2va_inference(
+                job_id,
+                token_ids,
+                prompt,
+                profile,
+                steps,
+                seed,
+                target_frames,
+                attention_query_chunk,
+                l1_prefetch_shards,
+                destination,
+                references,
+            )
+            return
         self._update(
             job_id,
             status="running",
@@ -751,14 +1361,21 @@ class JobManager:
                 token_ids = encode_prompt(prompt, self.workspace / "qwen_tokenizer").tolist()
             assert token_ids
             qwen_dir = resolve_qwen_directory(self.output_root)
-            base_main_dir = resolve_main_model_directory(self.workspace, self.output_root, accelerated=False)
+            base_main_dir = resolve_main_model_directory(
+                self.workspace,
+                self.output_root,
+                accelerated=False,
+                component="fl2va_transformer" if use_acceleration_lora else None,
+            )
             base_ready = base_main_dir is not None
             use_acceleration = use_acceleration_lora
             if not base_ready:
-                raise RuntimeError(
-                    "No validated FL2VA streaming Base model is installed. "
-                    "The dynamic Turbo adapter also depends on this Base product."
-                )
+                if use_acceleration:
+                    raise RuntimeError(
+                        "Turbo v4 requires a validated FL2VA base model; "
+                        "the Ref2VA virtual base does not support this adapter."
+                    )
+                raise RuntimeError("No validated Ref2VA or FL2VA main model is installed.")
             main_dir = base_main_dir
             assert main_dir is not None
             turbo_manifest: dict[str, Any] | None = None
@@ -803,7 +1420,14 @@ class JobManager:
                     base_model_dir=main_dir,
                 )
 
-            model_label = "Turbo v4 dynamic LoRA" if use_acceleration else "FL2VA Base"
+            main_component = str(_manifest_identity(main_dir).get("component") or "")
+            if not main_component and "fl2va" in main_dir.name.lower():
+                main_component = "fl2va_transformer"
+            base_label = {
+                "ref2va_transformer": "Ref2VA Base",
+                "fl2va_transformer": "FL2VA Base",
+            }.get(main_component, "Main Base")
+            model_label = "Turbo v4 dynamic LoRA" if use_acceleration else base_label
             self._update(
                 job_id,
                 message=f"Selected {model_label}",
@@ -1499,7 +2123,7 @@ class JobManager:
                 "sampling": {
                     "seed": seed,
                     "steps": steps,
-                    "scheduler": "simple_shifted_flow",
+                    "scheduler": "minimax_h3",
                     "video_shift": 12.0,
                     "audio_shift": 3.0,
                     "start_sigma": sampling_start_sigma,

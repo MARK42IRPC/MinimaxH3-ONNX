@@ -4,6 +4,7 @@ import argparse
 import gc
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -185,10 +186,22 @@ def _require_close(
 class AudioEncoder(nn.Module):
     def __init__(self, model: MiniMaxH3AudioVAE):
         super().__init__()
-        self.model = model
+        self.encoder = model.encoder
+        self.pre_block = model.pre_block
+        self.mean_proj = model.mean_proj
+        self.register_buffer("latents_mean", model.latents_mean.detach().clone())
+        self.register_buffer("latents_std", model.latents_std.detach().clone())
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
-        return self.model.encode(waveform)
+        batch, stereo_channels, _ = waveform.shape
+        hidden = waveform.reshape(batch * stereo_channels, 1, -1)
+        hidden = self.encoder(hidden)
+        hidden = self.pre_block(hidden.transpose(1, 2)).transpose(1, 2)
+        latents = self.mean_proj(hidden)
+        mean = self.latents_mean.view(1, -1, 1).to(device=latents.device, dtype=latents.dtype)
+        std = self.latents_std.view(1, -1, 1).to(device=latents.device, dtype=latents.dtype)
+        latents = (latents - mean) / std
+        return latents.reshape(batch, stereo_channels, latents.shape[1], latents.shape[2]).permute(0, 2, 1, 3)
 
 
 class AudioDecoder(nn.Module):
@@ -595,15 +608,30 @@ def export_audio(path: Path, output_dir: Path, callback: ProgressCallback | None
     model = _load_model(path, "audio_vae")
     assert isinstance(model, MiniMaxH3AudioVAE)
     torch.manual_seed(7)
+    audio_samples = 4 * model.samples_per_latent
+    waveform = torch.randn(1, 2, audio_samples, dtype=torch.float32).clamp(-1.0, 1.0)
     latent_frames = 29
     latents = torch.randn(1, 32, 2, latent_frames, dtype=torch.float32)
+    encoder = AudioEncoder(model)
     decoder = AudioDecoder(model)
 
     with torch.inference_mode():
+        expected_encoded = encoder(waveform)
         expected_decoded = decoder(latents)
 
+    encoder_path = output_dir / "audio_encoder.onnx"
     decoder_path = output_dir / "audio_decoder.onnx"
-    _progress(callback, 0.25, "Exporting complete audio decoder")
+    _progress(callback, 0.16, "Exporting complete audio encoder")
+    _export_graph(
+        encoder,
+        (waveform,),
+        encoder_path,
+        ["waveform"],
+        ["latents"],
+        {"waveform": {2: "audio_samples"}, "latents": {3: "latent_frames"}},
+    )
+
+    _progress(callback, 0.48, "Exporting complete audio decoder")
     _export_graph(
         decoder,
         (latents,),
@@ -613,28 +641,40 @@ def export_audio(path: Path, output_dir: Path, callback: ProgressCallback | None
         {"latents": {3: "latent_frames"}, "waveform": {2: "audio_samples"}},
     )
 
-    _progress(callback, 0.82, "Validating complete Audio VAE decoder with ONNX Runtime")
+    _progress(callback, 0.78, "Validating complete Audio VAE encoder with ONNX Runtime")
+    actual_encoded = _ort_run(encoder_path, {"waveform": waveform.numpy()})[0]
+    _progress(callback, 0.9, "Validating complete Audio VAE decoder with ONNX Runtime")
     actual_decoded = _ort_run(decoder_path, {"latents": latents.numpy()})[0]
-    validation = {"decoder": _metrics(expected_decoded, actual_decoded)}
+    validation = {
+        "encoder": _metrics(expected_encoded, actual_encoded),
+        "decoder": _metrics(expected_decoded, actual_decoded),
+    }
+    _require_close("Audio encoder", validation["encoder"], max_abs=2e-3, min_cosine=0.9999)
     _require_close("Audio decoder", validation["decoder"], max_abs=1e-3, min_cosine=0.9999)
     manifest = {
         "format": "h3-workbench-onnx-v1",
         "source": str(path.resolve()),
         "component": "audio_vae",
-        "layout": "single_graph_decoder",
+        "layout": "dual_graph_autoencoder",
         "activation_dtype": "float32",
+        "sample_rate": model.sample_rate,
+        "samples_per_latent": model.samples_per_latent,
+        "audio_channels": 2,
+        "latent_channels": 32,
         "opset": OPSET_VERSION,
         "profiles": {
+            "validation_waveform_input": list(waveform.shape),
+            "validation_encoded_latents": list(expected_encoded.shape),
             "validation_latents": [1, 32, 2, latent_frames],
             "validation_waveform": list(expected_decoded.shape),
         },
         "dynamic_dimensions": ["latent_frames", "audio_samples"],
-        "graphs": [decoder_path.name],
+        "graphs": [encoder_path.name, decoder_path.name],
         "validation": validation,
         "validation_passed": True,
     }
     _write_manifest(output_dir, manifest)
-    _progress(callback, 1.0, "Single-graph Audio VAE decoder export and validation completed")
+    _progress(callback, 1.0, "Audio VAE encoder/decoder export and validation completed")
     return manifest
 
 
@@ -1429,6 +1469,385 @@ def export_main(
     return manifest
 
 
+def export_ref2va_virtual(
+    path: Path,
+    output_dir: Path,
+    callback: ProgressCallback | None = None,
+    lora_path: Path | None = None,
+    lora_strength: float = 1.0,
+) -> dict[str, Any]:
+    """Export Ref2VA with reusable block topologies and source-backed weights."""
+    if lora_path is not None:
+        raise ValueError("Ref2VA virtual export does not accept the FL2VA Turbo LoRA")
+    del lora_strength
+    from h3_workbench.ref2va_virtual_slicer import (
+        RUNTIME_MANIFEST,
+        append_graphs,
+        build_virtual_ref2va_product,
+    )
+    from h3_workbench.ref2va_virtual_validation import validate_virtual_ref2va_product
+    from h3_workbench.shard_packer import build_sharded_model
+    from h3_workbench.shard_planner import file_sha256
+
+    path = path.resolve()
+    output_dir = output_dir.resolve()
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    if output_dir.exists():
+        if any(output_dir.iterdir()):
+            raise FileExistsError(f"Ref2VA target directory is not empty: {output_dir}")
+        output_dir.rmdir()
+
+    torch.manual_seed(19)
+    video_patches = torch.randn(1, 96, dtype=torch.float32)
+    audio_patches = torch.randn(1, 32, dtype=torch.float32)
+    text_states = torch.randn(1, 5120, dtype=torch.float16)
+    hidden_states = torch.randn(3, 5376, dtype=torch.float32) * 0.25
+    timesteps = torch.tensor([0.5], dtype=torch.float32)
+    position_ids = torch.tensor(
+        [[0.0, 0.0, 0.0], [1.0, 0.5, -0.5], [2.0, 1.0, 1.0]],
+        dtype=torch.float32,
+    )
+    modulation_ids = torch.tensor([0, 1, 2], dtype=torch.int64)
+    static_graphs: list[str] = []
+    validation: dict[str, Any] = {"static": {}, "representatives": {}}
+
+    with tempfile.TemporaryDirectory(
+        prefix="h3-ref2va-virtual-source-", dir=output_dir.parent
+    ) as temporary_name:
+        source_dir = Path(temporary_name)
+        topology_paths: dict[str, Path] = {}
+
+        _progress(callback, 0.01, "Exporting Ref2VA input projections")
+        reader = CheckpointReader(path)
+        embeddings = MainEmbeddings(reader).eval()
+        embeddings_path = source_dir / "main_embeddings.onnx"
+        with torch.inference_mode():
+            expected_embeddings = embeddings(video_patches, audio_patches, text_states)
+        _export_graph(
+            embeddings,
+            (video_patches, audio_patches, text_states),
+            embeddings_path,
+            ["video_patches", "audio_patches", "text_states"],
+            ["video_embeddings", "audio_embeddings", "text_embeddings"],
+            {
+                "video_patches": {0: "video_sequence"},
+                "audio_patches": {0: "audio_sequence"},
+                "text_states": {0: "text_sequence"},
+                "video_embeddings": {0: "video_sequence"},
+                "audio_embeddings": {0: "audio_sequence"},
+                "text_embeddings": {0: "text_sequence"},
+            },
+        )
+        actual_embeddings = _ort_run(
+            embeddings_path,
+            {
+                "video_patches": video_patches.numpy(),
+                "audio_patches": audio_patches.numpy(),
+                "text_states": text_states.numpy(),
+            },
+        )
+        validation["static"]["embeddings"] = {
+            name: _metrics(expected, actual)
+            for name, expected, actual in zip(
+                ("video", "audio", "text"), expected_embeddings, actual_embeddings, strict=True
+            )
+        }
+        for name, metrics in validation["static"]["embeddings"].items():
+            _require_close(f"Ref2VA {name} embeddings", metrics, max_abs=2e-2, min_cosine=0.999)
+        static_graphs.append(embeddings_path.name)
+        text_hidden = expected_embeddings[2]
+        del embeddings, expected_embeddings, actual_embeddings, reader
+        gc.collect()
+
+        for index in range(2):
+            _progress(callback, 0.04 + index * 0.025, f"Exporting Ref2VA token refiner {index + 1}/2")
+            attention_path = source_dir / f"main_token_refiner_block_{index:02d}_attention.onnx"
+            expected_attention = _export_main_shard(
+                "refiner_attention",
+                index,
+                path,
+                attention_path,
+                {"hidden_states": text_hidden.numpy()},
+            )
+            actual_attention = _ort_run(attention_path, {"hidden_states": text_hidden.numpy()})[0]
+            attention_metrics = _metrics(expected_attention, actual_attention)
+            _require_close(
+                f"Ref2VA token refiner {index} attention",
+                attention_metrics,
+                max_abs=64.0,
+                min_cosine=0.999,
+                max_relative_l2=2e-3,
+            )
+            static_graphs.append(attention_path.name)
+
+            mlp_path = source_dir / f"main_token_refiner_block_{index:02d}_mlp.onnx"
+            expected_mlp = _export_main_shard(
+                "refiner_mlp",
+                index,
+                path,
+                mlp_path,
+                {"hidden_states": expected_attention.numpy()},
+                gpu_native_fp16=False,
+            )
+            actual_mlp = _ort_run(mlp_path, {"hidden_states": expected_attention.numpy()})[0]
+            mlp_metrics = _metrics(expected_mlp, actual_mlp)
+            _require_close(
+                f"Ref2VA token refiner {index} MLP",
+                mlp_metrics,
+                max_abs=64.0,
+                min_cosine=0.999,
+                max_relative_l2=2e-3,
+            )
+            validation.setdefault("static", {}).setdefault("token_refiner", {})[str(index)] = {
+                "attention": attention_metrics,
+                "mlp": mlp_metrics,
+            }
+            static_graphs.append(mlp_path.name)
+            text_hidden = expected_mlp
+            del expected_attention, actual_attention, expected_mlp, actual_mlp
+            gc.collect()
+
+        reader = CheckpointReader(path)
+        refiner_norm = RefinerNorm(reader.tensor("token_refiner.final_norm.weight")).eval()
+        refiner_norm_path = source_dir / "main_token_refiner_norm.onnx"
+        with torch.inference_mode():
+            expected_norm = refiner_norm(text_hidden)
+        _export_graph(
+            refiner_norm,
+            (text_hidden,),
+            refiner_norm_path,
+            ["hidden_states"],
+            ["hidden_states_out"],
+            _main_dynamic_axes("hidden_states", "hidden_states_out"),
+        )
+        actual_norm = _ort_run(refiner_norm_path, {"hidden_states": text_hidden.numpy()})[0]
+        validation["static"]["token_refiner_norm"] = _metrics(expected_norm, actual_norm)
+        _require_close("Ref2VA token refiner norm", validation["static"]["token_refiner_norm"], 1e-2, 0.9999)
+        static_graphs.append(refiner_norm_path.name)
+        del refiner_norm, expected_norm, actual_norm, text_hidden, reader
+        gc.collect()
+
+        _progress(callback, 0.10, "Exporting Ref2VA timestep curve and RoPE")
+        reader = CheckpointReader(path)
+        conditioning = MainConditioning(reader).eval()
+        conditioning_path = source_dir / "main_conditioning.onnx"
+        with torch.inference_mode():
+            conditioning_outputs = conditioning(timesteps, position_ids)
+            timestep_embedding, rotary_table = conditioning_outputs[:2]
+        _export_graph(
+            conditioning,
+            (timesteps, position_ids),
+            conditioning_path,
+            ["timesteps", "position_ids"],
+            ["timestep_embedding", "rotary_table"],
+            {
+                "timesteps": {0: "timestep_count"},
+                "position_ids": {0: "sequence"},
+                "timestep_embedding": {0: "timestep_count"},
+                "rotary_table": {1: "sequence"},
+            },
+        )
+        actual_conditioning = _ort_run(
+            conditioning_path,
+            {"timesteps": timesteps.numpy(), "position_ids": position_ids.numpy()},
+        )
+        validation["static"]["conditioning"] = {
+            "timestep_embedding": _metrics(timestep_embedding, actual_conditioning[0]),
+            "rotary_table": _metrics(rotary_table, actual_conditioning[1]),
+        }
+        _require_close("Ref2VA timestep curve", validation["static"]["conditioning"]["timestep_embedding"], 1e-5, 0.99999)
+        _require_close("Ref2VA RoPE", validation["static"]["conditioning"]["rotary_table"], 2e-3, 0.9999)
+        static_graphs.append(conditioning_path.name)
+        del conditioning, actual_conditioning, reader
+        gc.collect()
+
+        common_inputs = {
+            "hidden_states": hidden_states.numpy(),
+            "timestep_embedding": timestep_embedding.numpy(),
+            "modulation_ids": modulation_ids.numpy(),
+            "rotary_table": rotary_table.numpy(),
+        }
+        for position, index in enumerate((0, 24, 49)):
+            start = 0.14 + 0.42 * position / 3.0
+            block_record: dict[str, Any] = {}
+            _progress(callback, start, f"Exporting Ref2VA representative block {index + 1}/50")
+            qkv_path = source_dir / f"ref2va_reference_{index:02d}_qkv.onnx"
+            qkv_expected = _export_main_shard(
+                "dit_attention_qkv",
+                index,
+                path,
+                qkv_path,
+                common_inputs,
+            )
+            qkv_actual = _ort_run(qkv_path, common_inputs)[0]
+            block_record["attention_qkv"] = _metrics(qkv_expected, qkv_actual)
+            _require_close(
+                f"Ref2VA block {index} QKV",
+                block_record["attention_qkv"],
+                64.0,
+                0.999,
+                2e-3,
+            )
+            if index == 0:
+                topology_paths["attention_qkv"] = qkv_path
+
+            output_inputs = {
+                "hidden_states": hidden_states.numpy(),
+                "attended": np.random.default_rng(200 + index).standard_normal((3, 7168), dtype=np.float32),
+                "timestep_embedding": timestep_embedding.numpy(),
+                "modulation_ids": modulation_ids.numpy(),
+            }
+            output_path = source_dir / f"ref2va_reference_{index:02d}_output.onnx"
+            output_expected = _export_main_shard(
+                "dit_attention_output",
+                index,
+                path,
+                output_path,
+                output_inputs,
+                gpu_native_fp16=False,
+            )
+            output_actual = _ort_run(output_path, output_inputs)[0]
+            block_record["attention_output"] = _metrics(output_expected, output_actual)
+            _require_close(
+                f"Ref2VA block {index} attention output",
+                block_record["attention_output"],
+                256.0,
+                0.999,
+                2e-3,
+            )
+            if index == 0:
+                topology_paths["attention_output"] = output_path
+
+            mlp_inputs = {
+                "hidden_states": hidden_states.numpy(),
+                "timestep_embedding": timestep_embedding.numpy(),
+                "modulation_ids": modulation_ids.numpy(),
+            }
+            mlp_path = source_dir / f"ref2va_reference_{index:02d}_mlp.onnx"
+            mlp_expected = _export_main_shard(
+                "dit_mlp",
+                index,
+                path,
+                mlp_path,
+                mlp_inputs,
+                gpu_native_fp16=False,
+            )
+            mlp_actual = _ort_run(mlp_path, mlp_inputs)[0]
+            block_record["mlp"] = _metrics(mlp_expected, mlp_actual)
+            _require_close(
+                f"Ref2VA block {index} MLP",
+                block_record["mlp"],
+                256.0,
+                0.999,
+                2e-3,
+            )
+            if index == 0:
+                topology_paths["mlp"] = mlp_path
+            validation["representatives"][str(index)] = block_record
+            del qkv_expected, qkv_actual, output_expected, output_actual, mlp_expected, mlp_actual
+            gc.collect()
+
+        _progress(callback, 0.57, "Exporting Ref2VA video/audio output head")
+        reader = CheckpointReader(path)
+        head = MainHead(reader).eval()
+        head_path = source_dir / "main_head.onnx"
+        video_hidden = hidden_states[:1]
+        audio_hidden = hidden_states[1:2]
+        with torch.inference_mode():
+            expected_head = head(
+                video_hidden,
+                audio_hidden,
+                timestep_embedding,
+                timestep_embedding,
+            )
+        _export_graph(
+            head,
+            (video_hidden, audio_hidden, timestep_embedding, timestep_embedding),
+            head_path,
+            [
+                "video_hidden",
+                "audio_hidden",
+                "video_timestep_embedding",
+                "audio_timestep_embedding",
+            ],
+            ["video_patches", "audio_patches"],
+            {
+                "video_hidden": {0: "video_sequence"},
+                "audio_hidden": {0: "audio_sequence"},
+                "video_patches": {0: "video_sequence"},
+                "audio_patches": {0: "audio_sequence"},
+            },
+        )
+        actual_head = _ort_run(
+            head_path,
+            {
+                "video_hidden": video_hidden.numpy(),
+                "audio_hidden": audio_hidden.numpy(),
+                "video_timestep_embedding": timestep_embedding.numpy(),
+                "audio_timestep_embedding": timestep_embedding.numpy(),
+            },
+        )
+        validation["head"] = {
+            "video": _metrics(expected_head[0], actual_head[0]),
+            "audio": _metrics(expected_head[1], actual_head[1]),
+        }
+        for name, metrics in validation["head"].items():
+            _require_close(f"Ref2VA {name} head", metrics, max_abs=2e-2, min_cosine=0.999)
+        static_graphs.append(head_path.name)
+        del head, expected_head, actual_head, reader
+        gc.collect()
+
+        _progress(callback, 0.57, "Publishing Ref2VA virtual block slices")
+        build_virtual_ref2va_product(path, source_dir, topology_paths)
+        append_graphs(source_dir, static_graphs)
+        source_manifest = json.loads((source_dir / "manifest.json").read_text(encoding="utf-8"))
+        source_manifest["export_validation"] = validation
+        source_manifest["validation"] = {"status": "pending_virtual_validation"}
+        source_manifest["validation_passed"] = False
+        source_manifest["build_complete"] = True
+        (source_dir / "manifest.json").write_text(
+            json.dumps(source_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        def pack_report(phase: str, current: int, total: int) -> None:
+            _progress(callback, 0.58 + 0.25 * current / max(1, total), f"Packing Ref2VA {phase} {current}/{total}")
+
+        build_sharded_model(source_dir, output_dir, path, blocks=50, callback=pack_report)
+        shutil.copy2(source_dir / RUNTIME_MANIFEST, output_dir / RUNTIME_MANIFEST)
+        manifest_path = output_dir / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        runtime_path = output_dir / RUNTIME_MANIFEST
+        manifest["source"] = str(path)
+        manifest["component"] = "ref2va_transformer"
+        manifest["source_quantization"] = "bfloat16"
+        manifest["conversion"] = "bf16_source_virtual_weight_slices_mixed_precision_runtime_topologies"
+        manifest["export_validation"] = validation
+        manifest.setdefault("artifacts", {})[RUNTIME_MANIFEST] = {
+            "bytes": runtime_path.stat().st_size,
+            "sha256": file_sha256(runtime_path),
+        }
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    _progress(callback, 0.84, "Validating Ref2VA virtual layers 1, 25, and 50")
+    virtual_validation = validate_virtual_ref2va_product(
+        output_dir,
+        output_dir / "validation.json",
+        blocks=(0, 24, 49),
+        tokens=3,
+        relative_l2_max=3e-3,
+    )
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    manifest["validation"] = virtual_validation
+    manifest["validation_passed"] = True
+    manifest["validated_product_fingerprint"] = virtual_validation["product_fingerprint"]
+    manifest["build_complete"] = True
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    _progress(callback, 1.0, "Ref2VA virtual slicing and validation completed")
+    return manifest
+
+
 def export_qwen(
     path: Path,
     output_dir: Path,
@@ -1592,7 +2011,11 @@ def _export_qwen_int8_virtual(
 ) -> dict[str, Any]:
     """Build and validate the compact runtime topology for an INT8 Qwen source."""
     from h3_workbench.qwen_attention_benchmark import ATTENTION_WEIGHT_TO_SOURCE, _inputs
-    from h3_workbench.qwen_int8_graph import build_int8_qdq_graph, build_weight_input_topology
+    from h3_workbench.qwen_int8_graph import (
+        build_int8_qdq_graph,
+        build_weight_input_topology,
+        install_split_qwen_attention,
+    )
     from h3_workbench.qwen_virtual_slicer import build_virtual_qwen_product
     from h3_workbench.qwen_virtual_validation import validate_virtual_qwen_product
 
@@ -1641,8 +2064,10 @@ def _export_qwen_int8_virtual(
 
         _progress(callback, 0.52, "Publishing zero-copy Qwen virtual slices")
         build_virtual_qwen_product(path, output_dir, attention_topology, mlp_topology)
+        _progress(callback, 0.56, "Installing split Qwen attention graphs")
+        install_split_qwen_attention(output_dir)
 
-    _progress(callback, 0.58, "Validating Qwen layers 1, 25, and 50")
+    _progress(callback, 0.60, "Validating Qwen layers 1, 25, and 50")
     validation = validate_virtual_qwen_product(
         output_dir,
         log_path,
@@ -1675,7 +2100,9 @@ def export_checkpoint(
         return export_audio(path, output_dir, callback)
     if record.component == "video_vae":
         return export_video(path, output_dir, video_blocks, callback)
-    if record.component in {"fl2va_transformer", "ref2va_transformer"}:
+    if record.component == "ref2va_transformer":
+        return export_ref2va_virtual(path, output_dir, callback, lora_path, lora_strength)
+    if record.component == "fl2va_transformer":
         return export_main(path, output_dir, video_blocks, callback, lora_path, lora_strength)
     if record.component == "text_encoder":
         return export_qwen(path, output_dir, video_blocks, callback)

@@ -2,23 +2,23 @@
 
 Local model inventory, staged ONNX export, numerical validation, and a lightweight WebUI for MiniMax H3 edge experiments.
 
-Small companion assets: [ModelScope](https://www.modelscope.cn/models/Mark42IRPC/Minimax-H3-int8-fl2va-onnx-50CLIPS). The WebUI downloads the H3 tokenizer and Turbo timestep grid from this collection, while large source checkpoints come from the official [Comfy-Org/MiniMax-H3 files](https://www.modelscope.cn/models/Comfy-Org/MiniMax-H3/files). This GitHub repository intentionally does not contain the multi-hundred-gigabyte model artifacts.
+Small companion assets: [ModelScope](https://www.modelscope.cn/models/Mark42IRPC/Minimax-H3-int8-fl2va-onnx-50CLIPS). The WebUI downloads the H3 tokenizer and Turbo timestep grid from this collection, while the single-file source checkpoints come from [Comfy-Org/MiniMax-H3 files](https://www.modelscope.cn/models/Comfy-Org/MiniMax-H3/files). The architecture and task-family reference was checked against the official [MiniMax/MiniMax-H3 files](https://www.modelscope.cn/models/MiniMax/MiniMax-H3/files). This GitHub repository intentionally does not contain the multi-hundred-gigabyte model artifacts.
 
-The current exporter supports the Comfy-Org H3 VAE and FL2VA Transformer checkpoints:
+The current exporter supports the Comfy-Org H3 VAE, Qwen INT8, and Ref2VA BF16 Transformer checkpoints:
 
 - `minimax_h3_audio_vae_fp32.safetensors`
 - `minimax_h3_video_vae_fp16.safetensors`
-- `minimax_h3_fl2va_pruned_fp8_scaled.safetensors`
+- `minimax_h3_ref2va_pruned_bf16.safetensors`
 
 Video VAE export is deliberately sharded into a CNN encoder, decoder prelude, individual Transformer blocks, and a decoder head. This keeps ONNX Runtime from loading the full 4.85 GB decoder at once.
 
-The FL2VA Transformer is split into input projections, two token-refiner Attention/MLP pairs, conditioning, 50 DiT QKV/output/MLP groups, and a final video/audio head. FP8 weights are dequantized to FP16 storage and linear operations are streamed in FP32 to avoid FP16 overflow on later blocks. Main attention is exact full-sequence attention: ONNX handles QKV and output projections, while runtime SDPA processes query chunks without materializing the full attention matrix.
+The Ref2VA Transformer is split into input projections, two token-refiner Attention/MLP pairs, conditioning, 50 DiT QKV/output/MLP groups, and a final video/audio head. Its BF16 checkpoint is published as a Qwen-style virtual product: reusable ONNX topologies remain small, while per-block weights are read from the original SafeTensors source through validated memory-mapped slices and converted only at runtime. Main attention is exact full-sequence attention: ONNX handles QKV and output projections, while runtime SDPA processes query chunks without materializing the full attention matrix. The validated product exposes T2VA, FL2VA, and Ref2VA capabilities.
 
 ## Start
 
 On Windows, run `install.bat` once. It creates the Python 3.11 environment and installs the locked dependencies, including the official PyTorch CUDA 12.6 wheel. The installer detects a usable NVIDIA device with `nvidia-smi` and adds the optional `gpu` extra (`cuda-python`, CuPy, and CUTLASS) automatically. Set `H3_INSTALL_GPU=0` before running it to skip those optional tools, or `H3_INSTALL_GPU=1` to force them. Installation ends with Torch CUDA and ONNX Runtime provider checks; ONNX Runtime remains the primary sharded graph backend and `CPUExecutionProvider` remains available as a fallback.
 
-The WebUI's `切片` page can reproduce the validated package directly from ModelScope. Large VAE, Qwen INT8, and FL2VA source checkpoints are downloaded from the official Comfy-Org ModelScope repository. The tokenizer and validated `h3_silu_temb_grid.safetensors` support file come from the companion collection. The Turbo v4 preset still downloads Larryvrh's custom `minimax_h3_turbo_v4_step600_ema.safetensors` because that exact adapter is not published in the official repository.
+The WebUI's `切片` page can reproduce the validated package directly from ModelScope. Large VAE, Qwen INT8, and Ref2VA BF16 source checkpoints are downloaded from the official Comfy-Org ModelScope repository. The old FL2VA FP8 product is optional and is shown only for users who need the legacy Turbo v4 adapter; it is not required for ordinary generation. The tokenizer and validated `h3_silu_temb_grid.safetensors` support file come from the companion collection. The Turbo v4 preset still downloads Larryvrh's custom `minimax_h3_turbo_v4_step600_ema.safetensors` because that exact adapter is not published in the official repository.
 
 ```powershell
 uv sync --locked --extra dev --no-editable
@@ -37,7 +37,7 @@ The workbench scans the current directory by default. Override it with `--worksp
 uv run python -m h3_workbench.exporter inspect .
 uv run python -m h3_workbench.exporter export minimax_h3_audio_vae_fp32.safetensors --output onnx_models/audio_vae
 uv run python -m h3_workbench.exporter export minimax_h3_video_vae_fp16.safetensors --output onnx_models/video --video-blocks all
-uv run python -m h3_workbench.exporter export minimax_h3_fl2va_pruned_fp8_scaled.safetensors --output onnx_models/main --main-blocks all
+uv run python -m h3_workbench.exporter export minimax_h3_ref2va_pruned_bf16.safetensors --output onnx_models/minimax_h3_ref2va_pruned_bf16_virtual --main-blocks all
 ```
 
 Use `--video-blocks 0` for a quick block-level smoke export before committing several gigabytes of output.
@@ -51,7 +51,7 @@ uv run h3-infer plan
 uv run h3-infer generate --token-ids 1,42,1000,151935 --steps 6 --output output.mp4
 ```
 
-The runtime probes free VRAM before every denoising step and streams the validated Base shards within the available budget. Larryvrh Turbo v4 is installed as a runtime adapter over that Base product; 4 steps is the default and 4-8 is its supported quality range. The WebUI exposes a manual `加载 Turbo v4 加速 LoRA` switch, which is off by default; step count no longer silently selects the adapter. When enabled, the request must use 4-8 steps and the validated adapter must be ready. The workbench does not export or retain a second merged 40GB main model.
+The runtime probes free VRAM before every denoising step and streams the validated Ref2VA virtual product within the available budget. Larryvrh Turbo v4 remains a runtime adapter for the legacy FL2VA FP8 base only; it cannot be applied to the Ref2VA virtual source. The WebUI exposes a manual `加载 Turbo v4 加速 LoRA` switch, which is off by default. When enabled, the request must use 4-8 steps, the FL2VA base must be installed, and the validated adapter must be ready. The workbench does not export or retain a second merged 40GB main model.
 
 Device support, GPU selection, VRAM tiers, and the first compatibility phase are documented in [docs/DEVICE_COMPATIBILITY_AND_PHASE1.md](docs/DEVICE_COMPATIBILITY_AND_PHASE1.md). Set `H3_CUDA_DEVICE` to a GPU index, UUID, or `auto` when more than one NVIDIA GPU is visible.
 
@@ -61,9 +61,9 @@ The WebUI accepts a natural-language prompt and dynamically pads requested outpu
 
 Inference supports text-only, first-frame, last-frame, and first-plus-last-frame modes. Each reference image is encoded as one Video VAE latent using the official single-image causal-token semantics. The boundary slot remains clean at timestep `t=1` during every Transformer pass, all spatial patches in that slot use the clean video modulation row, and the slot is excluded from Euler updates. Last-frame conditioning is aligned to the latent token that contains the final retained output frame.
 
-The WebUI also provides a `超分` page. A source video can be uploaded or referenced by a path inside the workspace. Prompt lookup prefers the same-name `.metadata.json` sidecar, then JSON or plain text in the container `comment`, `description`, and `title` tags; a manual prompt overrides metadata. Processing mode is selected manually: `视频分片` uses H3's 22-frame native windows with a 17-frame stride and 5-frame temporal overlap for lower VRAM usage, while `直接推理` sends the complete video through one native FL2VA temporal sequence for better temporal consistency and is limited to 360 input frames. In both modes, the source is interpolated to the requested spatial scale and Video VAE temporal window, center-padded to the model grid, and encoded by a progressive four-stage Video VAE runtime. Segmented conditioning is encoded once and sliced into the same 7-token / 5-token-stride windows when the combined FP16 canvas fits the host-memory gate. Encoder sessions are released before FL2VA sampling.
+The WebUI also provides a `超分` page. A source video can be uploaded or referenced by a path inside the workspace. Prompt lookup prefers the same-name `.metadata.json` sidecar, then JSON or plain text in the container `comment`, `description`, and `title` tags; a manual prompt overrides metadata. Processing mode is selected manually: `视频分片` uses H3's 22-frame native windows with a 17-frame stride and 5-frame temporal overlap for lower VRAM usage, while `直接推理` sends the complete video through one native main-model temporal sequence for better temporal consistency and is limited to 360 input frames. In both modes, the source is interpolated to the requested spatial scale and Video VAE temporal window, center-padded to the model grid, and encoded by a progressive four-stage Video VAE runtime. Segmented conditioning is encoded once and sliced into the same 7-token / 5-token-stride windows when the combined FP16 canvas fits the host-memory gate. Encoder sessions are released before main-model sampling.
 
-The initial super-resolution latent uses the recorded linear mix `conditioning * (1 - strength) + standard_normal * strength`, where strength is the WebUI's `噪声混合强度` in `[0, 1]`. The FL2VA schedule now starts at that same sigma; `strength=0` skips FL2VA entirely and is a pure Video VAE reconstruction after interpolation. Video VAE decoding then reuses the ordinary inference path. Output frame count and source frame rate are preserved, and the source audio stream is remuxed as AAC instead of being regenerated. Super-resolution metadata records the source identity, prompt source, scale, interpolation mode, processing mode, overlap geometry, noise formula, start sigma, latent conditioning policy, and audio policy.
+The initial super-resolution latent uses the recorded linear mix `conditioning * (1 - strength) + standard_normal * strength`, where strength is the WebUI's `噪声混合强度` in `[0, 1]`. The main-model schedule now starts at that same sigma; `strength=0` skips denoising entirely and is a pure Video VAE reconstruction after interpolation. Video VAE decoding then reuses the ordinary inference path. Output frame count and source frame rate are preserved, and the source audio stream is remuxed as AAC instead of being regenerated. Super-resolution metadata records the source identity, prompt source, scale, interpolation mode, processing mode, overlap geometry, noise formula, start sigma, latent conditioning policy, and audio policy.
 
 Each completed MP4 embeds a compact JSON record in its container comment and is accompanied by a same-name `.metadata.json` sidecar. The sidecar preserves the complete prompt and token IDs, seed, steps, dual video/audio schedule, output geometry, temporal mode, active model/LoRA manifest identity, runtime cache settings, audio status, and performance-log path for reproducible A/B tests.
 

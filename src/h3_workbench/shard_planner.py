@@ -669,6 +669,8 @@ def validate_schedule(schedule: dict, model_dir: Path) -> None:
     steps = schedule.get("steps")
     if not isinstance(shards, list) or not isinstance(steps, list):
         raise ValueError("schedule shards and steps must be arrays")
+    manifest = json.loads((model_dir / "manifest.json").read_text(encoding="utf-8"))
+    virtual_source = str(manifest.get("weight_storage", "")).startswith("source_safetensors")
     graph_to_shard: dict[str, str] = {}
     for shard in shards:
         for graph in shard.get("graphs", []):
@@ -702,7 +704,42 @@ def validate_schedule(schedule: dict, model_dir: Path) -> None:
             if graph not in graph_to_shard or step.get("shard") != graph_to_shard[graph]:
                 raise ValueError(f"Invalid graph/shard reference at step {expected_id}")
             expected_inputs, expected_outputs = _model_ports(model_dir / f"{graph}.onnx")
-            if set(inputs) != expected_inputs or set(outputs) != expected_outputs:
+            schedule_inputs = set(inputs)
+            inputs_match = schedule_inputs == expected_inputs
+            if virtual_source and str(graph).startswith("main_block_"):
+                # Ref2VA virtual topologies expose source-backed weights as
+                # graph inputs; the persistent weight provider supplies them
+                # alongside the schedule's activation feeds.
+                graph_name = str(graph)
+                if graph_name.endswith("_attention_qkv"):
+                    functional_inputs = {
+                        "hidden_states",
+                        "timestep_embedding",
+                        "modulation_ids",
+                        "rotary_table",
+                    }
+                elif graph_name.endswith("_attention_output"):
+                    functional_inputs = {
+                        "hidden_states",
+                        "attended",
+                        "timestep_embedding",
+                        "modulation_ids",
+                    }
+                elif graph_name.endswith("_mlp"):
+                    functional_inputs = {"hidden_states", "timestep_embedding", "modulation_ids"}
+                else:
+                    functional_inputs = set()
+                if "silu_timestep_embedding" in expected_inputs:
+                    functional_inputs.add("silu_timestep_embedding")
+                virtual_weight_inputs = expected_inputs - functional_inputs
+                if schedule_inputs != functional_inputs or not virtual_weight_inputs:
+                    raise ValueError(
+                        f"Virtual graph port mismatch for {graph}: schedule inputs "
+                        f"{sorted(schedule_inputs)} != functional inputs {sorted(functional_inputs)}; "
+                        f"weight inputs={sorted(virtual_weight_inputs)}"
+                    )
+                inputs_match = True
+            if not inputs_match or set(outputs) != expected_outputs:
                 raise ValueError(
                     f"Graph port mismatch for {graph}: inputs {sorted(inputs)} != {sorted(expected_inputs)}, "
                     f"outputs {sorted(outputs)} != {sorted(expected_outputs)}"
