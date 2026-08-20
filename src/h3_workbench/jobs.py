@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import json
+import logging
 import math
 import os
 import shutil
@@ -78,15 +79,16 @@ from h3_workbench.reference_conditioning import (
     encode_reference_latents,
     encode_reference_vision,
     normalize_reference_media,
+    resolve_reference_image_short_edge,
 )
 from h3_workbench.model_registry import inspect_checkpoint
 from h3_workbench.memory_planner import probe_gpu_memory
 from h3_workbench.source_catalog import ExportPreset, SourceAsset, export_preset
-from h3_workbench.turbo_lora import (
-    TURBO_ADAPTER_VARIANT,
-    TurboLoraAdapter,
-    publish_turbo_adapter,
-    validate_turbo_adapter,
+from h3_workbench.ref2va_lora import (
+    REF2VA_ADAPTER_VARIANT,
+    Ref2VALoraAdapter,
+    publish_ref2va_adapter,
+    validate_ref2va_adapter,
 )
 from h3_workbench.vram_reservation import (
     acquire_reservation,
@@ -94,6 +96,9 @@ from h3_workbench.vram_reservation import (
     refresh_reservation,
     release_reservation,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _complete_main_model(directory: Path) -> bool:
@@ -377,10 +382,29 @@ class JobManager:
 
         return download_file(asset.url, destination, asset.size_bytes, report)
 
+    def _ref2va_acceleration_assets(
+        self, main_dir: Path
+    ) -> tuple[Path, Path, dict[str, Any]]:
+        preset = export_preset("ref2va_turbo_v0_1")
+        adapter_dir = (self.workspace / preset.output_dir).resolve()
+        lora_path = self._existing_source_asset(preset.source)
+        if lora_path is None:
+            raise RuntimeError(
+                "Ref2VA Turbo LoRA is missing; install the Ref2VA acceleration adapter from the Models page"
+            )
+        try:
+            manifest = validate_ref2va_adapter(adapter_dir, base_model_dir=main_dir)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                "Ref2VA Turbo LoRA is not ready for the installed Ref2VA base; "
+                "rebuild the runtime adapter from the Models page"
+            ) from exc
+        return adapter_dir, lora_path, manifest
+
     def _run_preset_export(self, job_id: str, preset: ExportPreset) -> None:
         try:
             self._update(job_id, status="running", started_at=_now(), progress=0.01, message="Preparing verified export preset", activity={"phase": "download", "module": preset.label, "operation": "Checking source files"})
-            source_label = "Turbo v4 LoRA" if preset.component == "acceleration_lora" else "Original checkpoint"
+            source_label = "Ref2VA Turbo LoRA" if preset.component == "acceleration_lora" else "Original checkpoint"
             source = self._download_source_asset(job_id, preset.source, source_label)
             if preset.component == "tokenizer":
                 downloaded = [source]
@@ -408,45 +432,37 @@ class JobManager:
                 )
                 return
             if preset.component == "acceleration_lora":
-                if preset.support is None:
-                    raise RuntimeError("Turbo runtime adapter requires the SiLU timestep grid")
-                grid_path = self._download_source_asset(
-                    job_id,
-                    preset.support,
-                    "Turbo timestep grid",
-                )
                 base_main_dir = resolve_main_model_directory(
                     self.workspace,
                     self.output_root,
                     accelerated=False,
-                    component="fl2va_transformer",
+                    component="ref2va_transformer",
                 )
                 if base_main_dir is None:
                     raise RuntimeError(
-                        "Turbo v4 dynamic LoRA requires the validated FL2VA streaming Base product"
+                        "Ref2VA Turbo LoRA requires the validated Ref2VA virtual base product"
                     )
                 destination = self.workspace / preset.output_dir
                 self._update(
                     job_id,
                     progress=0.20,
-                    message="Publishing graph-only Turbo adapter",
+                    message="Publishing graph-only Ref2VA adapter",
                     activity={
                         "phase": "export",
                         "module": preset.label,
                         "operation": "Building runtime overlay topologies",
                     },
                 )
-                manifest = publish_turbo_adapter(
+                manifest = publish_ref2va_adapter(
                     base_main_dir,
                     destination,
                     source,
-                    grid_path,
                 )
                 self._update(
                     job_id,
                     status="completed",
                     progress=1.0,
-                    message="Turbo v4 runtime adapter completed",
+                    message="Ref2VA Turbo runtime adapter completed",
                     activity={
                         "phase": "completed",
                         "module": preset.label,
@@ -456,18 +472,17 @@ class JobManager:
                     result={
                         "preset": preset.id,
                         "source": str(source),
-                        "support": str(grid_path),
                         "base": str(base_main_dir),
                         "output": str(destination),
                         "adapter": manifest,
                     },
                 )
                 return
-            lora_path = self._download_source_asset(job_id, preset.lora, "Turbo v4 LoRA") if preset.lora else None
+            lora_path = self._download_source_asset(job_id, preset.lora, "Acceleration LoRA") if preset.lora else None
             if preset.support:
-                support_path = self._download_source_asset(job_id, preset.support, "Turbo timestep grid")
+                support_path = self._download_source_asset(job_id, preset.support, "Acceleration support asset")
                 if lora_path is None:
-                    raise RuntimeError("Turbo support file requires a LoRA checkpoint")
+                    raise RuntimeError("Acceleration support asset requires a LoRA checkpoint")
                 colocated = lora_path.with_name("h3_silu_temb_grid.safetensors")
                 if not colocated.is_file() or colocated.stat().st_size != support_path.stat().st_size:
                     shutil.copy2(support_path, colocated)
@@ -503,8 +518,8 @@ class JobManager:
     ) -> Job:
         if not 1 <= steps <= 50:
             raise ValueError("Inference steps must be from 1 to 50")
-        if use_acceleration_lora and not 4 <= steps <= 8:
-            raise ValueError("Turbo v4 acceleration LoRA supports 4-8 sampling steps")
+        if use_acceleration_lora and steps != 4:
+            raise ValueError("Ref2VA Turbo acceleration LoRA supports exactly 4 sampling steps")
         if not token_ids and not prompt:
             raise ValueError("Provide either prompt or token IDs")
         if not 128 <= width <= 1024 or not 128 <= height <= 1024:
@@ -534,8 +549,6 @@ class JobManager:
                 raise ValueError("Ref2VA references require a prompt")
             if token_ids:
                 raise ValueError("Ref2VA references require prompt text, not token IDs")
-            if use_acceleration_lora:
-                raise ValueError("Ref2VA references are incompatible with Turbo v4 acceleration")
             if temporal_mode != "native":
                 raise ValueError("Ref2VA references require native temporal mode")
             if conditioning_mode != "text" or start_image_path or end_image_path:
@@ -619,8 +632,8 @@ class JobManager:
             raise ValueError("Noise strength must be from 0.0 to 1.0")
         if not 1 <= steps <= 50:
             raise ValueError("Inference steps must be from 1 to 50")
-        if use_acceleration_lora and not 4 <= steps <= 8:
-            raise ValueError("Turbo v4 acceleration LoRA supports 4-8 sampling steps")
+        if use_acceleration_lora and steps != 4:
+            raise ValueError("Ref2VA Turbo acceleration LoRA supports exactly 4 sampling steps")
         if attention_query_chunk not in {32, 64, 128, 256, 512}:
             raise ValueError("Attention query chunk must be one of 32, 64, 128, 256, or 512")
         if not 0 <= l1_prefetch_shards <= 4:
@@ -703,6 +716,59 @@ class JobManager:
                     value = max(job.progress, float(value))
                 setattr(job, key, value)
 
+    def _update_performance(self, job_id: str, record: dict[str, Any]) -> None:
+        """Publish performance samples and periodically mirror a heartbeat to the server log."""
+        self._update(job_id, performance=record)
+        if "performance" not in record:
+            return
+        sequence = int(record.get("sequence", 0))
+        if sequence % 15 != 0:
+            return
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status not in {"queued", "running"}:
+                return
+            activity = dict(job.activity)
+            metrics = record.get("performance")
+            metrics = metrics if isinstance(metrics, dict) else {}
+            gpu = metrics.get("gpu")
+            gpu = gpu if isinstance(gpu, dict) else {}
+            process = metrics.get("process")
+            process = process if isinstance(process, dict) else {}
+            position = ""
+            if activity.get("current") is not None and activity.get("total") is not None:
+                position = f" · {activity['current']}/{activity['total']}"
+            elapsed = record.get("elapsed_seconds", "-")
+            try:
+                elapsed_text = f"{float(elapsed):.0f} 秒"
+            except (TypeError, ValueError):
+                elapsed_text = str(elapsed)
+            resource_parts = []
+            if gpu.get("utilization_percent") is not None:
+                resource_parts.append(f"GPU {gpu['utilization_percent']:.0f}%")
+            if process.get("cpu_percent") is not None:
+                resource_parts.append(f"CPU {process['cpu_percent']:.0f}%")
+            job.message = (
+                f"仍在运行 · {activity.get('module', 'Runtime')} / "
+                f"{activity.get('operation', 'Working')}{position} · 已耗时 {elapsed_text}"
+                f"{' · ' + ' · '.join(resource_parts) if resource_parts else ''}"
+            )
+            logger.info(
+                "job=%s heartbeat status=%s progress=%.1f%% phase=%s module=%s operation=%s position=%s/%s gpu=%s%% vram=%sMiB cpu=%s%% elapsed=%ss",
+                job.id,
+                job.status,
+                job.progress * 100,
+                activity.get("phase", ""),
+                activity.get("module", ""),
+                activity.get("operation", ""),
+                activity.get("current", "-"),
+                activity.get("total", "-"),
+                gpu.get("utilization_percent", "-"),
+                gpu.get("memory_used_mib", "-"),
+                process.get("cpu_percent", "-"),
+                record.get("elapsed_seconds", "-"),
+            )
+
     def performance_log_path(self, job_id: str) -> Path | None:
         job = self.get(job_id)
         if job is None or job.performance_log is None:
@@ -776,6 +842,7 @@ class JobManager:
         l1_prefetch_shards: int,
         destination: Path,
         references: tuple[ReferenceSpec, ...],
+        use_acceleration_lora: bool,
     ) -> None:
         """Run the ordered multimodal Ref2VA path against the virtual base."""
         del token_ids
@@ -790,6 +857,9 @@ class JobManager:
         runtime_profile = profile
         provider_name = "unknown"
         main_dir: Path | None = None
+        ref2va_adapter_dir: Path | None = None
+        ref2va_lora_path: Path | None = None
+        ref2va_adapter_manifest: dict[str, Any] | None = None
         qwen_dir: Path | None = None
         video_onnx = self.output_root / "video_vae"
         audio_onnx = self.output_root / "audio_vae"
@@ -813,7 +883,20 @@ class JobManager:
             details = {"phase": "ref2va", **activity, **context}
             module = str(details.get("module", "Ref2VA"))
             operation = str(details.get("operation", "Running"))
-            self._update(job_id, message=f"{module}: {operation}", activity=details)
+            values: dict[str, object] = {
+                "message": f"{module}: {operation}",
+                "activity": details,
+            }
+            stage_progress = details.get("stage_progress")
+            if (
+                details.get("phase") == "reference_vision"
+                and isinstance(stage_progress, (int, float))
+                and math.isfinite(float(stage_progress))
+            ):
+                # Reserve the visible 8%-22% window for visual loading and
+                # encoding, while the later VAE stage starts at 22%.
+                values["progress"] = 0.08 + 0.12 * min(1.0, max(0.0, float(stage_progress)))
+            self._update(job_id, **values)
 
         try:
             try:
@@ -821,7 +904,7 @@ class JobManager:
                     self.performance_log_path(job_id)
                     or self.workspace / ".h3-workbench" / "performance" / f"h3-{job_id}.jsonl",
                     lambda: self._performance_state(job_id),
-                    lambda record: self._update(job_id, performance=record),
+                    lambda record: self._update_performance(job_id, record),
                 )
                 monitor.start()
             except Exception as exc:
@@ -855,6 +938,12 @@ class JobManager:
             )
             if main_dir is None:
                 raise RuntimeError("No validated Ref2VA virtual model is installed")
+            if use_acceleration_lora:
+                (
+                    ref2va_adapter_dir,
+                    ref2va_lora_path,
+                    ref2va_adapter_manifest,
+                ) = self._ref2va_acceleration_assets(main_dir)
             qwen_dir = resolve_qwen_directory(self.output_root)
             if not tokenizer_files_ready(self.workspace / "qwen_tokenizer"):
                 raise RuntimeError("The H3 tokenizer is not installed")
@@ -884,11 +973,30 @@ class JobManager:
 
             tokenizer = load_tokenizer(self.workspace / "qwen_tokenizer")
             visual_checkpoint = _resolve_qwen_visual_checkpoint(qwen_dir)
+            reference_image_short_edge = resolve_reference_image_short_edge(
+                probe_gpu_memory().total_bytes
+            )
             normalized = normalize_reference_media(
                 references,
                 target_frames,
                 callback=lambda details: report_activity(details, phase="reference_normalize"),
+                image_short_edge=reference_image_short_edge,
             )
+            reference_media_metadata = [
+                {
+                    "kind": item.kind,
+                    "source_width": item.spec.width,
+                    "source_height": item.spec.height,
+                    "source_duration_seconds": item.spec.duration_seconds,
+                    "normalized_shape": list(item.pixels.shape) if item.pixels is not None else None,
+                    "normalized_short_edge": (
+                        min(int(item.pixels.shape[0]), int(item.pixels.shape[1]))
+                        if item.pixels is not None and item.kind == "image"
+                        else None
+                    ),
+                }
+                for item in normalized
+            ]
             update(
                 0.08,
                 "Encoding reference vision",
@@ -897,6 +1005,7 @@ class JobManager:
                     "module": "Qwen Vision",
                     "operation": "Loading visual tower",
                     "checkpoint": str(visual_checkpoint),
+                    "reference_image_short_edge": reference_image_short_edge,
                 },
             )
             vision = encode_reference_vision(
@@ -914,6 +1023,9 @@ class JobManager:
                     "phase": "reference_vae",
                     "module": "Video/Audio VAE",
                     "operation": "Loading staged encoders",
+                    "text_tokens": int(vision.presentation.token_ids.size),
+                    "image_tokens": int(vision.visual_condition["image_mask"].sum()),
+                    "video_tokens": int(vision.visual_condition["video_mask"].sum()),
                 },
             )
             video_encoder = load_video_vae_onnx_encoder(video_onnx)
@@ -1038,6 +1150,8 @@ class JobManager:
                     "phase": "sampling",
                     "module": "Ref2VA",
                     "operation": "Preparing packed reference rows",
+                    "sampler": "res_multistep" if use_acceleration_lora else "euler",
+                    "scheduler": "simple" if use_acceleration_lora else "minimax_h3",
                     "condition_video_rows": layout.num_condition_video_rows,
                     "condition_audio_rows": layout.num_condition_audio_rows,
                     "sequence_tokens": int(layout.token_tags.size),
@@ -1045,7 +1159,20 @@ class JobManager:
             )
 
             def report_main(activity: dict[str, object]) -> None:
-                details = {"phase": "sampling", **activity, "provider": provider_name}
+                details = {
+                    "phase": "sampling",
+                    "sampler": "res_multistep" if use_acceleration_lora else "euler",
+                    "scheduler": "simple" if use_acceleration_lora else "minimax_h3",
+                    **activity,
+                    "provider": provider_name,
+                }
+                module = str(details.get("module", "Ref2VA"))
+                # Loader notifications are auxiliary progress. Keep the last
+                # actual graph operation visible so a long weight wait does
+                # not look like a stalled or failed inference.
+                if module.endswith("Loader"):
+                    self._update(job_id, prefetch=details)
+                    return
                 sampling_step = int(details.get("sampling_step", 1))
                 shard = int(details.get("shard", 0))
                 shards = max(1, int(details.get("shards", 1)))
@@ -1053,13 +1180,26 @@ class JobManager:
                 self._update(
                     job_id,
                     progress=0.46 + 0.34 * fraction,
-                    message=f"{details.get('module', 'Ref2VA')}: {details.get('operation', 'Running')}",
+                    message=f"{module}: {details.get('operation', 'Running')}",
                     activity=details,
                 )
 
             assert main_dir is not None
             assert runner is not None
             assert video is not None and audio is not None and text_states is not None
+
+            def new_ref2va_adapter() -> Ref2VALoraAdapter | None:
+                if not use_acceleration_lora:
+                    return None
+                assert ref2va_adapter_dir is not None
+                assert ref2va_lora_path is not None
+                return Ref2VALoraAdapter(
+                    ref2va_adapter_dir,
+                    ref2va_lora_path,
+                    strength=1.0,
+                    base_model_dir=main_dir,
+                )
+
             runtime = H3MainRuntime(
                 main_dir,
                 runner,
@@ -1067,6 +1207,7 @@ class JobManager:
                 attention_query_chunk,
                 report_main,
                 l1_prefetch_shards,
+                lora_adapter=new_ref2va_adapter(),
             )
             video, audio = sample_ref2va_latents(
                 runtime,
@@ -1089,6 +1230,7 @@ class JobManager:
                         "sampling_steps": total,
                     },
                 ),
+                sampler="res_multistep" if use_acceleration_lora else "euler",
             )
             main_runtime_metrics = runtime.metrics()
             runtime.close()
@@ -1171,7 +1313,8 @@ class JobManager:
                 "sampling": {
                     "seed": seed,
                     "steps": steps,
-                    "scheduler": "minimax_h3",
+                    "sampler": "res_multistep" if use_acceleration_lora else "euler",
+                    "scheduler": "simple" if use_acceleration_lora else "minimax_h3",
                     "video_shift": 12.0,
                     "audio_shift": 3.0,
                     "reference_condition_timestep": 0.999,
@@ -1181,6 +1324,8 @@ class JobManager:
                     "audio_schedule": "dual_clock_time_shift_from_video_12_to_audio_3",
                 },
                 "reference_conditioning": {
+                    "reference_image_short_edge_budget": reference_image_short_edge,
+                    "media": reference_media_metadata,
                     "layout_sequence_tokens": int(layout.token_tags.size),
                     "condition_video_rows": layout.num_condition_video_rows,
                     "condition_audio_rows": layout.num_condition_audio_rows,
@@ -1202,14 +1347,26 @@ class JobManager:
                 "temporal": {"mode": "native", "segments": 1, "profile": runtime_profile.to_dict()},
                 "runtime": {
                     "provider": provider_name,
-                    "main_variant": "base",
-                    "use_acceleration_lora": False,
+                    "main_variant": REF2VA_ADAPTER_VARIANT if use_acceleration_lora else "base",
+                    "use_acceleration_lora": use_acceleration_lora,
                     "attention_query_chunk": attention_query_chunk,
                     "l1_prefetch_shards": l1_prefetch_shards,
                     "segments": [main_runtime_metrics],
                 },
                 "models": {
                     "main": _manifest_identity(main_dir),
+                    "ref2va_adapter": (
+                        {
+                            "directory": str(ref2va_adapter_dir),
+                            "variant": REF2VA_ADAPTER_VARIANT,
+                            "strength": 1.0,
+                            "factor_pairs": ref2va_adapter_manifest.get("factor_pairs"),
+                            "assets": ref2va_adapter_manifest.get("assets"),
+                            "application": "runtime_low_rank_overlay",
+                        }
+                        if ref2va_adapter_manifest is not None
+                        else None
+                    ),
                     "text_encoder": _manifest_identity(qwen_dir),
                     "visual_source": str(visual_checkpoint),
                     "video_vae": _manifest_identity(video_onnx),
@@ -1238,8 +1395,8 @@ class JobManager:
                     "output": str(destination),
                     "metadata": str(metadata_path) if metadata_path is not None else None,
                     "prompt": prompt,
-                    "main_variant": "base",
-                    "use_acceleration_lora": False,
+                    "main_variant": REF2VA_ADAPTER_VARIANT if use_acceleration_lora else "base",
+                    "use_acceleration_lora": use_acceleration_lora,
                     "profile": runtime_profile.to_dict(),
                     "steps": steps,
                     "seed": seed,
@@ -1314,6 +1471,7 @@ class JobManager:
                 l1_prefetch_shards,
                 destination,
                 references,
+                use_acceleration_lora,
             )
             return
         self._update(
@@ -1347,7 +1505,7 @@ class JobManager:
                 self.performance_log_path(job_id)
                 or self.workspace / ".h3-workbench" / "performance" / f"h3-{job_id}.jsonl",
                 lambda: self._performance_state(job_id),
-                lambda record: self._update(job_id, performance=record),
+                lambda record: self._update_performance(job_id, record),
             )
             monitor.start()
         except Exception as exc:
@@ -1365,57 +1523,32 @@ class JobManager:
                 self.workspace,
                 self.output_root,
                 accelerated=False,
-                component="fl2va_transformer" if use_acceleration_lora else None,
+                component="ref2va_transformer" if use_acceleration_lora else None,
             )
             base_ready = base_main_dir is not None
             use_acceleration = use_acceleration_lora
             if not base_ready:
                 if use_acceleration:
                     raise RuntimeError(
-                        "Turbo v4 requires a validated FL2VA base model; "
-                        "the Ref2VA virtual base does not support this adapter."
+                        "Ref2VA Turbo LoRA requires a validated Ref2VA virtual base model"
                     )
                 raise RuntimeError("No validated Ref2VA or FL2VA main model is installed.")
             main_dir = base_main_dir
             assert main_dir is not None
-            turbo_manifest: dict[str, Any] | None = None
-            turbo_adapter_dir: Path | None = None
-            turbo_lora_path: Path | None = None
-            turbo_grid_path: Path | None = None
+            ref2va_manifest: dict[str, Any] | None = None
+            ref2va_adapter_dir: Path | None = None
+            ref2va_lora_path: Path | None = None
             if use_acceleration:
-                turbo_preset = export_preset("fl2va_turbo_v4")
-                turbo_adapter_dir = (self.workspace / turbo_preset.output_dir).resolve()
-                turbo_lora_path = self._existing_source_asset(turbo_preset.source)
-                turbo_grid_path = (
-                    self._existing_source_asset(turbo_preset.support)
-                    if turbo_preset.support is not None
-                    else None
-                )
-                if turbo_lora_path is None or turbo_grid_path is None:
-                    raise RuntimeError(
-                        "Turbo v4 dynamic LoRA assets are missing; install the runtime adapter before using 4-8 steps"
-                    )
-                try:
-                    turbo_manifest = validate_turbo_adapter(
-                        turbo_adapter_dir,
-                        base_model_dir=main_dir,
-                    )
-                except (OSError, ValueError) as exc:
-                    raise RuntimeError(
-                        "Turbo v4 dynamic LoRA is not ready for the installed Base model; "
-                        "rebuild the runtime adapter from the Models page"
-                    ) from exc
+                ref2va_adapter_dir, ref2va_lora_path, ref2va_manifest = self._ref2va_acceleration_assets(main_dir)
 
-            def new_turbo_adapter() -> TurboLoraAdapter | None:
+            def new_ref2va_adapter() -> Ref2VALoraAdapter | None:
                 if not use_acceleration:
                     return None
-                assert turbo_adapter_dir is not None
-                assert turbo_lora_path is not None
-                assert turbo_grid_path is not None
-                return TurboLoraAdapter(
-                    turbo_adapter_dir,
-                    turbo_lora_path,
-                    turbo_grid_path,
+                assert ref2va_adapter_dir is not None
+                assert ref2va_lora_path is not None
+                return Ref2VALoraAdapter(
+                    ref2va_adapter_dir,
+                    ref2va_lora_path,
                     strength=1.0,
                     base_model_dir=main_dir,
                 )
@@ -1427,7 +1560,7 @@ class JobManager:
                 "ref2va_transformer": "Ref2VA Base",
                 "fl2va_transformer": "FL2VA Base",
             }.get(main_component, "Main Base")
-            model_label = "Turbo v4 dynamic LoRA" if use_acceleration else base_label
+            model_label = "Ref2VA Turbo 4-step LoRA" if use_acceleration else base_label
             self._update(
                 job_id,
                 message=f"Selected {model_label}",
@@ -1475,7 +1608,7 @@ class JobManager:
                     attention_query_chunk,
                     None,
                     l1_prefetch_shards,
-                    turbo_adapter=new_turbo_adapter(),
+                    lora_adapter=new_ref2va_adapter(),
                 )
                 warmup_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="h3-warmup")
                 warmup_future = warmup_executor.submit(warm_runtime.warm_fixed_sessions)
@@ -1822,6 +1955,8 @@ class JobManager:
                         "phase": "sampling",
                         "module": "FL2VA",
                         "operation": "Preparing segment",
+                        "sampler": "res_multistep" if use_acceleration else "euler",
+                        "scheduler": "simple" if use_acceleration else "minimax_h3",
                         "segment": segment + 1,
                         "segments": segment_count,
                         "provider": provider_name,
@@ -1876,6 +2011,8 @@ class JobManager:
                 def report_main(activity: dict[str, object], segment: int = segment) -> None:
                     details = {
                         "phase": "sampling",
+                        "sampler": "res_multistep" if use_acceleration else "euler",
+                        "scheduler": "simple" if use_acceleration else "minimax_h3",
                         **activity,
                         "segment": segment + 1,
                         "segments": segment_count,
@@ -1906,7 +2043,7 @@ class JobManager:
                             attention_query_chunk,
                             report_main,
                             l1_prefetch_shards,
-                            turbo_adapter=new_turbo_adapter(),
+                            lora_adapter=new_ref2va_adapter(),
                         )
                 # Keep the persistent host-RAM working set alive across
                 # segmented clips while changing only the progress callback.
@@ -1938,6 +2075,7 @@ class JobManager:
                         ),
                         start_sigma=sampling_start_sigma,
                         video_condition=video_condition,
+                        sampler="res_multistep" if use_acceleration else "euler",
                     )
                     if active_runtime.audio_fallback_reason is not None:
                         audio_warnings.append(active_runtime.audio_fallback_reason)
@@ -2123,7 +2261,8 @@ class JobManager:
                 "sampling": {
                     "seed": seed,
                     "steps": steps,
-                    "scheduler": "minimax_h3",
+                    "sampler": "res_multistep" if use_acceleration else "euler",
+                    "scheduler": "simple" if use_acceleration else "minimax_h3",
                     "video_shift": 12.0,
                     "audio_shift": 3.0,
                     "start_sigma": sampling_start_sigma,
@@ -2186,7 +2325,7 @@ class JobManager:
                 },
                 "runtime": {
                     "provider": provider_name,
-                    "main_variant": TURBO_ADAPTER_VARIANT if use_acceleration else "base",
+                    "main_variant": REF2VA_ADAPTER_VARIANT if use_acceleration else "base",
                     "use_acceleration_lora": use_acceleration,
                     "attention_query_chunk": attention_query_chunk,
                     "l1_prefetch_shards": l1_prefetch_shards,
@@ -2198,17 +2337,16 @@ class JobManager:
                 },
                 "models": {
                     "main": _manifest_identity(main_dir),
-                    "turbo_adapter": (
+                    "ref2va_adapter": (
                         {
-                            "directory": str(turbo_adapter_dir),
-                            "variant": TURBO_ADAPTER_VARIANT,
+                            "directory": str(ref2va_adapter_dir),
+                            "variant": REF2VA_ADAPTER_VARIANT,
                             "strength": 1.0,
-                            "factor_pairs": turbo_manifest.get("factor_pairs"),
-                            "factor_storage_bytes": turbo_manifest.get("factor_storage_bytes"),
-                            "assets": turbo_manifest.get("assets"),
+                            "factor_pairs": ref2va_manifest.get("factor_pairs"),
+                            "assets": ref2va_manifest.get("assets"),
                             "application": "runtime_low_rank_overlay",
                         }
-                        if turbo_manifest is not None
+                        if ref2va_manifest is not None
                         else None
                     ),
                     "text_encoder": _manifest_identity(qwen_dir),
@@ -2250,7 +2388,7 @@ class JobManager:
                     "metadata": str(metadata_path) if metadata_path is not None else None,
                     "prompt": prompt,
                     "token_ids": token_ids,
-                    "main_variant": TURBO_ADAPTER_VARIANT if use_acceleration else "base",
+                    "main_variant": REF2VA_ADAPTER_VARIANT if use_acceleration else "base",
                     "use_acceleration_lora": use_acceleration,
                     "profile": profile.to_dict(),
                     "steps": steps,

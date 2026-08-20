@@ -29,6 +29,11 @@ from h3_workbench.inference_runtime import (
     unpack_audio,
     unpatchify_video,
 )
+from h3_workbench.acceleration import (
+    minimax_h3_denoised,
+    minimax_h3_res_multistep_step,
+    shifted_flow_sigmas,
+)
 from h3_workbench.media_output import (
     ONNXVideoVAEEncoder,
     _assemble_video_vae_tiles,
@@ -647,6 +652,80 @@ def test_sample_ref2va_latents_only_updates_target_latents() -> None:
     np.testing.assert_array_equal(reference_video, np.full_like(reference_video, 7.0))
     np.testing.assert_array_equal(reference_audio, np.full_like(reference_audio, 9.0))
     assert seen[0][2] is marker
+
+
+def test_sample_ref2va_res_multistep_uses_independent_audio_sigma_history() -> None:
+    class Runtime:
+        sampling_step = 0
+        sampling_steps = 0
+        audio_fallback_reason = None
+
+        @staticmethod
+        def prepare_text(states):
+            return states
+
+        @staticmethod
+        def denoise_ref2va_step(
+            video,
+            audio,
+            text_states,
+            sigma,
+            reference_video_latents,
+            reference_audio_latents,
+            layout,
+            text_is_refined=False,
+        ):
+            return np.full_like(video, sigma), np.full_like(audio, sigma)
+
+    def expected_rollout(initial, velocity_values, clock_sigmas):
+        sample = initial.copy()
+        previous_sigma = None
+        previous_sigma_down = None
+        previous_denoised = None
+        for sigma, sigma_next, velocity_value in zip(
+            clock_sigmas[:-1],
+            clock_sigmas[1:],
+            velocity_values,
+            strict=True,
+        ):
+            velocity = np.full_like(sample, velocity_value)
+            current_denoised = minimax_h3_denoised(sample, velocity, sigma)
+            sample = minimax_h3_res_multistep_step(
+                sample,
+                velocity,
+                sigma,
+                sigma_next,
+                previous_sigma,
+                previous_sigma_down,
+                previous_denoised,
+            )
+            previous_sigma = sigma
+            previous_sigma_down = sigma_next
+            previous_denoised = current_denoised
+        return sample
+
+    video = np.zeros((1, 1), dtype=np.float32)
+    audio = np.zeros((1, 1), dtype=np.float32)
+    sampled_video, sampled_audio = sample_ref2va_latents(
+        Runtime(),
+        video,
+        audio,
+        np.zeros((1, 1), dtype=np.float32),
+        [],
+        [],
+        object(),
+        steps=3,
+        sampler="res_multistep",
+    )
+
+    video_expected = expected_rollout(video, shifted_flow_sigmas(3)[:-1], shifted_flow_sigmas(3))
+    audio_sigmas = [time_shift_sigma(sigma, 12.0, 3.0) for sigma in shifted_flow_sigmas(3)]
+    audio_expected = expected_rollout(audio, shifted_flow_sigmas(3)[:-1], audio_sigmas)
+
+    np.testing.assert_allclose(sampled_video, video_expected, rtol=2e-6, atol=2e-6)
+    np.testing.assert_allclose(sampled_audio, audio_expected, rtol=2e-6, atol=2e-6)
+    assert not np.allclose(sampled_audio, video_expected)
+
 
 def test_sample_latents_passes_conditioning_sigma_to_denoiser() -> None:
     class Runtime:

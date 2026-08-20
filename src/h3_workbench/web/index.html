@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#202521">
   <title>MiniMax H3 工作台</title>
-  <link rel="stylesheet" href="/assets/styles.css">
+  <link rel="stylesheet" href="/assets/styles.css?v=heartbeat-1">
 </head>
 <body>
   <header class="topbar">
@@ -79,7 +79,7 @@
           <div class="section-bar">
             <div>
               <h3>验证方案</h3>
-              <p>主模型在本机自动切片；Ref2VA 使用虚拟权重切片，Turbo 只为兼容的 FL2VA 基座生成动态叠加拓扑。</p>
+              <p>主模型在本机自动切片；Ref2VA 使用虚拟权重切片，4-step 加速 LoRA 以动态拓扑叠加，不生成合并主模型。</p>
             </div>
             <button class="text-button" id="checkModelsButton" type="button"><span aria-hidden="true">↻</span>重新检查</button>
           </div>
@@ -205,7 +205,7 @@
                 <label class="toggle-field">
                   <input id="accelerationLoraInput" type="checkbox">
                   <span class="toggle-control" aria-hidden="true"><i></i></span>
-                  <span class="toggle-copy"><strong>加载 Turbo v4 加速 LoRA</strong><small>手动开启，仅支持 4–8 步；仅兼容 FL2VA 基座</small></span>
+                  <span class="toggle-copy"><strong>加载 Ref2VA Turbo 4-step LoRA</strong><small>手动开启，仅支持 4 步；兼容 Ref2VA 虚拟切片基座与参考素材</small></span>
                 </label>
               </fieldset>
             </section>
@@ -291,7 +291,7 @@
                 <label class="toggle-field">
                   <input id="superAccelerationLoraInput" type="checkbox">
                   <span class="toggle-control" aria-hidden="true"><i></i></span>
-                  <span class="toggle-copy"><strong>加载 Turbo v4 加速 LoRA</strong><small>手动开启，仅支持 4–8 步；仅兼容 FL2VA 基座</small></span>
+                  <span class="toggle-copy"><strong>加载 Ref2VA Turbo 4-step LoRA</strong><small>手动开启，仅支持 4 步；兼容 Ref2VA 虚拟切片基座</small></span>
                 </label>
               </fieldset>
             </section>
@@ -394,6 +394,6 @@
   </div>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  <script src="/assets/app.js" defer></script>
+  <script src="/assets/app.js?v=heartbeat-1" defer></script>
 </body>
 </html>

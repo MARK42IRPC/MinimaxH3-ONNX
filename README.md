@@ -2,7 +2,7 @@
 
 Local model inventory, staged ONNX export, numerical validation, and a lightweight WebUI for MiniMax H3 edge experiments.
 
-Small companion assets: [ModelScope](https://www.modelscope.cn/models/Mark42IRPC/Minimax-H3-int8-fl2va-onnx-50CLIPS). The WebUI downloads the H3 tokenizer and Turbo timestep grid from this collection, while the single-file source checkpoints come from [Comfy-Org/MiniMax-H3 files](https://www.modelscope.cn/models/Comfy-Org/MiniMax-H3/files). The architecture and task-family reference was checked against the official [MiniMax/MiniMax-H3 files](https://www.modelscope.cn/models/MiniMax/MiniMax-H3/files). This GitHub repository intentionally does not contain the multi-hundred-gigabyte model artifacts.
+Small companion assets: [ModelScope](https://www.modelscope.cn/models/Mark42IRPC/Minimax-H3-int8-fl2va-onnx-50CLIPS). The WebUI downloads the H3 tokenizer from this collection, while the single-file source checkpoints and the Ref2VA 4-step acceleration LoRA come from [Comfy-Org/MiniMax-H3 files](https://www.modelscope.cn/models/Comfy-Org/MiniMax-H3/files). The architecture and task-family reference was checked against the official [MiniMax/MiniMax-H3 files](https://www.modelscope.cn/models/MiniMax/MiniMax-H3/files). This GitHub repository intentionally does not contain the multi-hundred-gigabyte model artifacts.
 
 The current exporter supports the Comfy-Org H3 VAE, Qwen INT8, and Ref2VA BF16 Transformer checkpoints:
 
@@ -18,7 +18,7 @@ The Ref2VA Transformer is split into input projections, two token-refiner Attent
 
 On Windows, run `install.bat` once. It creates the Python 3.11 environment and installs the locked dependencies, including the official PyTorch CUDA 12.6 wheel. The installer detects a usable NVIDIA device with `nvidia-smi` and adds the optional `gpu` extra (`cuda-python`, CuPy, and CUTLASS) automatically. Set `H3_INSTALL_GPU=0` before running it to skip those optional tools, or `H3_INSTALL_GPU=1` to force them. Installation ends with Torch CUDA and ONNX Runtime provider checks; ONNX Runtime remains the primary sharded graph backend and `CPUExecutionProvider` remains available as a fallback.
 
-The WebUI's `切片` page can reproduce the validated package directly from ModelScope. Large VAE, Qwen INT8, and Ref2VA BF16 source checkpoints are downloaded from the official Comfy-Org ModelScope repository. The old FL2VA FP8 product is optional and is shown only for users who need the legacy Turbo v4 adapter; it is not required for ordinary generation. The tokenizer and validated `h3_silu_temb_grid.safetensors` support file come from the companion collection. The Turbo v4 preset still downloads Larryvrh's custom `minimax_h3_turbo_v4_step600_ema.safetensors` because that exact adapter is not published in the official repository.
+The WebUI's `切片` page can reproduce the validated package directly from ModelScope. Large VAE, Qwen INT8, Ref2VA BF16, and Ref2VA acceleration-LoRA source files are downloaded from the official Comfy-Org ModelScope repository. The optional FL2VA FP8 product remains available for legacy base-model experiments, but ordinary generation and acceleration use the validated Ref2VA virtual base.
 
 ```powershell
 uv sync --locked --extra dev --no-editable
@@ -51,11 +51,11 @@ uv run h3-infer plan
 uv run h3-infer generate --token-ids 1,42,1000,151935 --steps 6 --output output.mp4
 ```
 
-The runtime probes free VRAM before every denoising step and streams the validated Ref2VA virtual product within the available budget. Larryvrh Turbo v4 remains a runtime adapter for the legacy FL2VA FP8 base only; it cannot be applied to the Ref2VA virtual source. The WebUI exposes a manual `加载 Turbo v4 加速 LoRA` switch, which is off by default. When enabled, the request must use 4-8 steps, the FL2VA base must be installed, and the validated adapter must be ready. The workbench does not export or retain a second merged 40GB main model.
+The runtime probes free VRAM before every denoising step and streams the validated Ref2VA virtual product within the available budget. The WebUI exposes a manual `加载 Ref2VA Turbo 4-step LoRA` switch, which is off by default. When enabled, the request must use exactly 4 steps, the validated Ref2VA virtual base must be installed, and the graph-only adapter must be ready. The adapter is applied through resident low-rank factors; the workbench does not export or retain a second merged 40GB main model.
 
 Device support, GPU selection, VRAM tiers, and the first compatibility phase are documented in [docs/DEVICE_COMPATIBILITY_AND_PHASE1.md](docs/DEVICE_COMPATIBILITY_AND_PHASE1.md). Set `H3_CUDA_DEVICE` to a GPU index, UUID, or `auto` when more than one NVIDIA GPU is visible.
 
-The adapter publishes six graph-only ONNX topologies and keeps all 259 LoRA pairs dynamic. Backbone/refiner factors run as FP16 low-rank GEMMs, while 50 DiT AdaLN pairs and the final head pair use FP32 factors with the author's 1025-row full-width SiLU timestep grid. The adapter manifest locks the Base topology, LoRA, and grid identities by SHA-256; no Base weights are copied into the adapter directory.
+The Ref2VA adapter publishes seven graph-only ONNX topologies and keeps all 208 LoRA factor pairs dynamic. The patched graphs cover the shared main-block QKV/output/MLP paths and both token-refiner blocks; the virtual base continues to supply the 50 block weights. Factor inputs are scaled at runtime from the official BF16 checkpoint, and the adapter manifest locks the base product, LoRA identity, and topology hashes by SHA-256. No base weights are copied into the adapter directory.
 
 The WebUI accepts a natural-language prompt and dynamically pads requested output dimensions to multiples of 32. The current edge profile accepts output widths and heights from 128 to 1024 pixels while retaining the 17-frame temporal profile. Main-model sequence length, position IDs, attention memory planning, Video VAE tile layout, and final center crop are derived from the requested dimensions.
 

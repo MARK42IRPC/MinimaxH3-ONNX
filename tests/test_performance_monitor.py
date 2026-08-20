@@ -1,4 +1,5 @@
 import json
+import logging
 import subprocess
 import time
 from types import SimpleNamespace
@@ -6,6 +7,44 @@ from pathlib import Path
 
 from h3_workbench.jobs import Job, JobManager
 from h3_workbench.performance_monitor import LivePerformanceMonitor, PerformanceMonitor, PerformanceSampler, _gpu_sample
+
+
+def test_job_performance_update_publishes_a_throttled_heartbeat(tmp_path: Path, caplog) -> None:
+    manager = JobManager(tmp_path, tmp_path / "onnx")
+    manager._jobs["job"] = Job(
+        id="job",
+        model_id="model",
+        status="running",
+        progress=0.35,
+        activity={
+            "phase": "text",
+            "module": "Qwen",
+            "operation": "MLP",
+            "current": 21,
+            "total": 50,
+        },
+    )
+    record = {
+        "sequence": 15,
+        "elapsed_seconds": 42.0,
+        "performance": {
+            "gpu": {"utilization_percent": 97.0, "memory_used_mib": 3760.0},
+            "process": {"cpu_percent": 88.0},
+        },
+    }
+
+    with caplog.at_level(logging.INFO, logger="h3_workbench.jobs"):
+        manager._update_performance("job", record)
+
+    assert manager.get("job").performance == record
+    assert "仍在运行" in manager.get("job").message
+    assert "21/50" in manager.get("job").message
+    assert "job=job heartbeat" in caplog.text
+    assert "position=21/50" in caplog.text
+
+    caplog.clear()
+    manager._update_performance("job", {**record, "sequence": 16})
+    assert not caplog.records
 
 
 def test_performance_monitor_writes_samples_and_terminal_state(tmp_path: Path) -> None:

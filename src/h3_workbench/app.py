@@ -39,7 +39,7 @@ from h3_workbench.qwen_persistent import resolve_qwen_directory, validated_int8_
 from h3_workbench.shard_cache import default_l2_cache_bytes, default_prefetch_depth
 from h3_workbench.tokenizer import tokenizer_files_ready
 from h3_workbench.source_catalog import EXPORT_PRESETS, ExportPreset, SourceAsset
-from h3_workbench.turbo_lora import validate_turbo_adapter
+from h3_workbench.ref2va_lora import validate_ref2va_adapter
 from h3_workbench.video_vae_persistent import persistent_video_vae_ready, video_vae_block_indices
 
 settings = Settings.from_env()
@@ -93,7 +93,7 @@ def _complete_main_model(directory: Path) -> bool:
 
 def _runtime_adapter_ready(directory: Path, base_model_directory: Path | None = None) -> bool:
     try:
-        validate_turbo_adapter(directory, base_model_dir=base_model_directory)
+        validate_ref2va_adapter(directory, base_model_dir=base_model_directory)
     except Exception:  # noqa: BLE001 - corrupt optional artifacts are reported as not ready
         return False
     return True
@@ -153,8 +153,8 @@ class InferenceRequest(BaseModel):
             raise ValueError("token_ids must contain at most 192 items")
         if self.prompt is not None and len(self.prompt) > 4000:
             raise ValueError("prompt must contain at most 4000 characters")
-        if self.use_acceleration_lora and not 4 <= self.steps <= 8:
-            raise ValueError("Turbo v4 acceleration LoRA supports 4-8 sampling steps")
+        if self.use_acceleration_lora and self.steps != 4:
+            raise ValueError("Ref2VA Turbo acceleration LoRA supports exactly 4 sampling steps")
         if self.attention_query_chunk not in {32, 64, 128, 256, 512}:
             raise ValueError("attention_query_chunk must be one of 32, 64, 128, 256, or 512")
         expected = {
@@ -177,8 +177,6 @@ class InferenceRequest(BaseModel):
                     raise ValueError("Ref2VA references require prompt text")
                 if self.token_ids:
                     raise ValueError("Ref2VA references require prompt text, not token_ids")
-                if self.use_acceleration_lora:
-                    raise ValueError("Ref2VA references are incompatible with Turbo v4 acceleration")
                 if self.temporal_mode != "native":
                     raise ValueError("Ref2VA references require native temporal mode")
                 if self.conditioning_mode != "text":
@@ -227,8 +225,8 @@ class SuperResolutionRequest(BaseModel):
     def validate_runtime_options(self) -> "SuperResolutionRequest":
         if self.prompt is not None and len(self.prompt) > 4000:
             raise ValueError("prompt must contain at most 4000 characters")
-        if self.use_acceleration_lora and not 4 <= self.steps <= 8:
-            raise ValueError("Turbo v4 acceleration LoRA supports 4-8 sampling steps")
+        if self.use_acceleration_lora and self.steps != 4:
+            raise ValueError("Ref2VA Turbo acceleration LoRA supports exactly 4 sampling steps")
         if self.attention_query_chunk not in {32, 64, 128, 256, 512}:
             raise ValueError("attention_query_chunk must be one of 32, 64, 128, 256, or 512")
         return self
@@ -729,8 +727,8 @@ def generation_profiles() -> list[dict[str, object]]:
         accelerated=False,
         component="fl2va_transformer",
     )
-    turbo_preset = next(item for item in EXPORT_PRESETS if item.id == "fl2va_turbo_v4")
-    turbo_directory = _preset_product_directory(turbo_preset)
+    acceleration_preset = next(item for item in EXPORT_PRESETS if item.id == "ref2va_turbo_v0_1")
+    acceleration_directory = _preset_product_directory(acceleration_preset)
     qwen_directory = resolve_qwen_directory(settings.output_dir)
     qwen_manifest = qwen_directory / "manifest.json"
     qwen_ready = (
@@ -738,7 +736,9 @@ def generation_profiles() -> list[dict[str, object]]:
         if qwen_directory.name.endswith("_int8_virtual")
         else _manifest_has_blocks(qwen_manifest, 50)
     )
-    acceleration_ready = fl2va_directory is not None and _runtime_adapter_ready(turbo_directory, fl2va_directory)
+    acceleration_ready = ref2va_directory is not None and _runtime_adapter_ready(
+        acceleration_directory, ref2va_directory
+    )
     main_component: str | None = None
     main_label = "主模型"
     main_capabilities: list[str] = []
@@ -793,8 +793,8 @@ def generation_profiles() -> list[dict[str, object]]:
                 "main_component": main_component,
                 "main_label": main_label,
                 "main_capabilities": main_capabilities,
-                "turbo_base_ready": fl2va_directory is not None,
-                "turbo_base_label": "FL2VA 流式基座（Turbo 专用）",
+                "acceleration_base_ready": ref2va_directory is not None,
+                "acceleration_base_label": "Ref2VA 虚拟切片基座",
                 "acceleration_ready": acceleration_ready,
                 "acceleration_active": False,
                 "tokenizer_ready": tokenizer_ready,

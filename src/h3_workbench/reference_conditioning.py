@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,6 +39,28 @@ from h3_workbench.reference import (
 
 
 ReferenceActivity = Callable[[dict[str, object]], None]
+
+
+def resolve_reference_image_short_edge(total_vram_bytes: int | None = None) -> int:
+    """Choose a reference-image budget that keeps Qwen's text refiner bounded."""
+    configured = os.environ.get("H3_REFERENCE_IMAGE_SHORT_EDGE", "auto").strip().lower()
+    if configured not in {"", "auto"}:
+        try:
+            value = int(configured)
+        except ValueError as exc:
+            raise ValueError("H3_REFERENCE_IMAGE_SHORT_EDGE must be auto or a positive integer") from exc
+        if value < H3_CANVAS_MULTIPLE:
+            raise ValueError(
+                f"H3_REFERENCE_IMAGE_SHORT_EDGE must be at least {H3_CANVAS_MULTIPLE}"
+            )
+        return value
+    if total_vram_bytes is None:
+        return H3_REFERENCE_IMAGE_SHORT_EDGE
+    if total_vram_bytes < 6 * 1024**3:
+        return min(H3_REFERENCE_IMAGE_SHORT_EDGE, 768)
+    if total_vram_bytes < 12 * 1024**3:
+        return min(H3_REFERENCE_IMAGE_SHORT_EDGE, 1024)
+    return H3_REFERENCE_IMAGE_SHORT_EDGE
 
 
 @dataclass(frozen=True)
@@ -93,6 +116,7 @@ def normalize_reference_media(
     references: Sequence[ReferenceSpec],
     target_frames: int,
     callback: ReferenceActivity | None = None,
+    image_short_edge: int = H3_REFERENCE_IMAGE_SHORT_EDGE,
 ) -> tuple[NormalizedReferenceMedia, ...]:
     if target_frames < 1:
         raise ValueError("Ref2VA target frame count must be positive")
@@ -104,8 +128,18 @@ def normalize_reference_media(
         waveform: np.ndarray | None = None
         if spec.kind == "image":
             assert spec.width is not None and spec.height is not None
-            height, width = reference_image_size(spec.width, spec.height)
+            height, width = reference_image_size(spec.width, spec.height, image_short_edge)
             pixels = read_reference_image(Path(spec.path), height, width)
+            _emit(
+                callback,
+                "Reference image resized",
+                index=index,
+                source_width=spec.width,
+                source_height=spec.height,
+                target_width=width,
+                target_height=height,
+                short_edge=image_short_edge,
+            )
         elif spec.kind == "video":
             assert spec.width is not None and spec.height is not None
             height, width = resolve_canvas_size(
@@ -171,7 +205,11 @@ def encode_reference_vision(
     image_token_counts: list[int] = []
     video_token_counts: list[int] = []
     video_timestamps: list[tuple[float, ...]] = []
-    with Qwen3VLVisionEncoder(checkpoint, prefer_cuda=prefer_cuda) as encoder:
+    with Qwen3VLVisionEncoder(
+        checkpoint,
+        prefer_cuda=prefer_cuda,
+        activity_callback=callback,
+    ) as encoder:
         for index, reference in enumerate(references, 1):
             if reference.kind == "audio":
                 continue

@@ -66,6 +66,26 @@ def shifted_flow_sigmas(
     return values
 
 
+def minimax_h3_denoised(
+    sample: np.ndarray,
+    velocity: np.ndarray,
+    sigma: float,
+) -> np.ndarray:
+    """Convert MiniMax-H3's data-ward velocity into a denoised sample."""
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError(f"Denoising sigma must be positive and finite, got {sigma}")
+    sample_values = np.asarray(sample)
+    velocity_values = np.asarray(velocity)
+    if sample_values.shape != velocity_values.shape:
+        raise ValueError(
+            f"Sample and velocity shapes must match, got {sample_values.shape} and {velocity_values.shape}"
+        )
+    result = sample_values.astype(np.float32, copy=False) + (
+        np.float32(sigma) * velocity_values.astype(np.float32, copy=False)
+    )
+    return np.asarray(result, dtype=sample_values.dtype)
+
+
 def minimax_h3_euler_step(
     sample: np.ndarray,
     velocity: np.ndarray,
@@ -95,6 +115,106 @@ def minimax_h3_euler_step(
         )
     result = sample_values.astype(np.float32, copy=False) + (
         np.float32(sigma - sigma_next) * velocity_values.astype(np.float32, copy=False)
+    )
+    return np.asarray(result, dtype=sample_values.dtype)
+
+
+def minimax_h3_res_multistep_step(
+    sample: np.ndarray,
+    velocity: np.ndarray,
+    sigma: float,
+    sigma_next: float,
+    previous_sigma: float | None = None,
+    previous_sigma_down: float | None = None,
+    previous_denoised: np.ndarray | None = None,
+    current_denoised: np.ndarray | None = None,
+) -> np.ndarray:
+    """Apply ComfyUI's ``res_multistep`` update to MiniMax-H3 output.
+
+    The H3 head returns a data-ward velocity, so the solver's denoised value
+    is ``sample + sigma * velocity``. The first step uses Euler because there
+    is no previous denoised value, and the terminal step returns that denoised
+    value directly instead of taking logarithms of zero.
+    """
+    if not np.isfinite(sigma) or not np.isfinite(sigma_next):
+        raise ValueError("Scheduler sigmas must be finite")
+    if sigma <= 0.0 or sigma_next < 0.0 or sigma_next > sigma:
+        raise ValueError(
+            f"MiniMax-H3 res_multistep requires 0 <= sigma_next <= sigma with sigma > 0, "
+            f"got sigma={sigma}, sigma_next={sigma_next}"
+        )
+    sample_values = np.asarray(sample)
+    velocity_values = np.asarray(velocity)
+    if sample_values.shape != velocity_values.shape:
+        raise ValueError(
+            f"Sample and velocity shapes must match, got {sample_values.shape} and {velocity_values.shape}"
+        )
+    if current_denoised is None:
+        current_denoised_values = minimax_h3_denoised(sample_values, velocity_values, sigma).astype(
+            np.float32, copy=False
+        )
+    else:
+        current_denoised_values = np.asarray(current_denoised)
+        if current_denoised_values.shape != sample_values.shape:
+            raise ValueError(
+                "Current denoised shape must match sample, "
+                f"got {current_denoised_values.shape} and {sample_values.shape}"
+            )
+        current_denoised_values = current_denoised_values.astype(np.float32, copy=False)
+
+    if sigma_next == 0.0:
+        return np.asarray(current_denoised_values, dtype=sample_values.dtype)
+
+    history = (previous_sigma, previous_sigma_down, previous_denoised)
+    if all(value is None for value in history):
+        return minimax_h3_euler_step(sample_values, velocity_values, sigma, sigma_next)
+    if any(value is None for value in history):
+        raise ValueError(
+            "res_multistep history must provide previous_sigma, previous_sigma_down, and previous_denoised together"
+        )
+    assert previous_sigma is not None
+    assert previous_sigma_down is not None
+    assert previous_denoised is not None
+    if (
+        not np.isfinite(previous_sigma)
+        or not np.isfinite(previous_sigma_down)
+        or previous_sigma <= 0.0
+        or previous_sigma_down <= 0.0
+        or previous_sigma_down > previous_sigma
+    ):
+        raise ValueError(
+            "res_multistep previous sigmas must be finite, positive, and satisfy "
+            f"previous_sigma_down <= previous_sigma, got {previous_sigma}, {previous_sigma_down}"
+        )
+    previous_values = np.asarray(previous_denoised)
+    if previous_values.shape != sample_values.shape:
+        raise ValueError(
+            f"Previous denoised shape must match sample, got {previous_values.shape} and {sample_values.shape}"
+        )
+
+    # This is the two-step exponential multistep formula used by ComfyUI.
+    # With a degenerate history, fall back to the stable H3 Euler update.
+    t = np.float32(-np.log(np.float32(sigma)))
+    t_old = np.float32(-np.log(np.float32(previous_sigma_down)))
+    t_next = np.float32(-np.log(np.float32(sigma_next)))
+    t_prev = np.float32(-np.log(np.float32(previous_sigma)))
+    h = np.float32(t_next - t)
+    c2 = np.float32((t_prev - t_old) / h) if h != 0.0 else np.float32(np.nan)
+    if not np.isfinite(h) or h <= 0.0 or not np.isfinite(c2) or abs(float(c2)) < 1e-7:
+        return minimax_h3_euler_step(sample_values, velocity_values, sigma, sigma_next)
+
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        phi1 = np.float32(np.expm1(-h) / (-h))
+        phi2 = np.float32((phi1 - np.float32(1.0)) / (-h))
+        phi2_over_c2 = np.float32(phi2 / c2)
+        b1 = np.float32(phi1 - phi2_over_c2)
+        b2 = phi2_over_c2
+    b1 = np.float32(np.nan_to_num(b1, nan=float(phi1), posinf=float(phi1), neginf=float(phi1)))
+    b2 = np.float32(np.nan_to_num(b2, nan=0.0, posinf=0.0, neginf=0.0))
+    if not np.isfinite((b1, b2)).all():
+        return minimax_h3_euler_step(sample_values, velocity_values, sigma, sigma_next)
+    result = np.exp(-h, dtype=np.float32) * sample_values.astype(np.float32, copy=False) + h * (
+        b1 * current_denoised_values + b2 * previous_values.astype(np.float32, copy=False)
     )
     return np.asarray(result, dtype=sample_values.dtype)
 

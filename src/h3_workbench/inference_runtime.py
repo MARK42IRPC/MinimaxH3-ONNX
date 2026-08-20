@@ -19,7 +19,12 @@ import onnxruntime as ort
 import torch
 import torch.nn.functional as torch_functional
 
-from h3_workbench.acceleration import minimax_h3_euler_step, shifted_flow_sigmas
+from h3_workbench.acceleration import (
+    minimax_h3_denoised,
+    minimax_h3_euler_step,
+    minimax_h3_res_multistep_step,
+    shifted_flow_sigmas,
+)
 from h3_workbench.device_profile import selected_device_index, torch_cuda_architecture_supported
 from h3_workbench.fl2va_runtime_graphs import (
     fp16_attention_output_ready,
@@ -2319,6 +2324,12 @@ class VideoLatentCondition:
 from h3_workbench.schedule_runtime import ScheduleMainRuntime as H3MainRuntime  # noqa: E402
 
 
+def _validate_sampler(sampler: str) -> str:
+    if sampler not in {"euler", "res_multistep"}:
+        raise ValueError(f"Unknown sampler {sampler!r}; expected 'euler' or 'res_multistep'")
+    return sampler
+
+
 def sample_latents(
     runtime: H3MainRuntime,
     video: np.ndarray,
@@ -2329,7 +2340,9 @@ def sample_latents(
     checkpoint_callback: Callable[[int, int, np.ndarray, np.ndarray], None] | None = None,
     start_sigma: float = 1.0,
     video_condition: VideoLatentCondition | None = None,
+    sampler: str = "euler",
 ) -> tuple[np.ndarray, np.ndarray]:
+    sampler = _validate_sampler(sampler)
     sigmas = shifted_flow_sigmas(steps, start_sigma=start_sigma)
     if start_sigma == 0.0:
         # A zero-noise super-resolution request is intentionally a pure H3
@@ -2339,6 +2352,12 @@ def sample_latents(
             video_condition.apply_clean(video)
         return video, audio
     refined_text = runtime.prepare_text(text_states)
+    video_previous_sigma: float | None = None
+    video_previous_sigma_down: float | None = None
+    video_previous_denoised: np.ndarray | None = None
+    audio_previous_sigma: float | None = None
+    audio_previous_sigma_down: float | None = None
+    audio_previous_denoised: np.ndarray | None = None
     for index, (sigma, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:], strict=True)):
         if video_condition is not None:
             video_condition.apply_clean(video)
@@ -2361,20 +2380,63 @@ def sample_latents(
             runtime.audio_fallback_reason = (
                 f"Non-finite FL2VA audio velocity at step {index + 1}: {invalid} invalid values"
             )
-        video = minimax_h3_euler_step(video, video_velocity, sigma, sigma_next)
+        if sampler == "res_multistep":
+            current_video_denoised = minimax_h3_denoised(video, video_velocity, sigma)
+            video = minimax_h3_res_multistep_step(
+                video,
+                video_velocity,
+                sigma,
+                sigma_next,
+                video_previous_sigma,
+                video_previous_sigma_down,
+                video_previous_denoised,
+                current_denoised=current_video_denoised,
+            )
+            video_previous_sigma = sigma
+            video_previous_sigma_down = sigma_next
+            video_previous_denoised = current_video_denoised
+        else:
+            video = minimax_h3_euler_step(video, video_velocity, sigma, sigma_next)
         if video_condition is not None:
             video_condition.apply_clean(video)
         if audio_velocity_finite:
             audio_sigma = time_shift_sigma(sigma, 12.0, 3.0)
             audio_sigma_next = time_shift_sigma(sigma_next, 12.0, 3.0)
-            next_audio = minimax_h3_euler_step(audio, audio_velocity, audio_sigma, audio_sigma_next)
+            if sampler == "res_multistep":
+                current_audio_denoised = minimax_h3_denoised(audio, audio_velocity, audio_sigma)
+                next_audio = minimax_h3_res_multistep_step(
+                    audio,
+                    audio_velocity,
+                    audio_sigma,
+                    audio_sigma_next,
+                    audio_previous_sigma,
+                    audio_previous_sigma_down,
+                    audio_previous_denoised,
+                    current_denoised=current_audio_denoised,
+                )
+            else:
+                current_audio_denoised = None
+                next_audio = minimax_h3_euler_step(audio, audio_velocity, audio_sigma, audio_sigma_next)
             if np.isfinite(next_audio).all():
                 audio = next_audio
-            elif runtime.audio_fallback_reason is None:
-                invalid = int((~np.isfinite(next_audio)).sum())
-                runtime.audio_fallback_reason = (
-                    f"Non-finite FL2VA audio latent at step {index + 1}: {invalid} invalid values"
-                )
+                if sampler == "res_multistep":
+                    audio_previous_sigma = audio_sigma
+                    audio_previous_sigma_down = audio_sigma_next
+                    audio_previous_denoised = current_audio_denoised
+            else:
+                if runtime.audio_fallback_reason is None:
+                    invalid = int((~np.isfinite(next_audio)).sum())
+                    runtime.audio_fallback_reason = (
+                        f"Non-finite FL2VA audio latent at step {index + 1}: {invalid} invalid values"
+                    )
+                if sampler == "res_multistep":
+                    audio_previous_sigma = None
+                    audio_previous_sigma_down = None
+                    audio_previous_denoised = None
+        elif sampler == "res_multistep":
+            audio_previous_sigma = None
+            audio_previous_sigma_down = None
+            audio_previous_denoised = None
         if not np.isfinite(video).all():
             invalid = int((~np.isfinite(video)).sum())
             raise FloatingPointError(f"Non-finite FL2VA video latent at step {index + 1}: {invalid} invalid values")
@@ -2396,12 +2458,20 @@ def sample_ref2va_latents(
     steps: int = 4,
     callback: Callable[[int, int], None] | None = None,
     checkpoint_callback: Callable[[int, int, np.ndarray, np.ndarray], None] | None = None,
+    sampler: str = "euler",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Sample target audio/video while keeping all Ref2VA rows immutable."""
+    sampler = _validate_sampler(sampler)
     sigmas = shifted_flow_sigmas(steps)
     refined_text = runtime.prepare_text(text_states)
     reference_video = tuple(np.asarray(value, dtype=np.float32) for value in reference_video_latents)
     reference_audio = tuple(np.asarray(value, dtype=np.float32) for value in reference_audio_latents)
+    video_previous_sigma: float | None = None
+    video_previous_sigma_down: float | None = None
+    video_previous_denoised: np.ndarray | None = None
+    audio_previous_sigma: float | None = None
+    audio_previous_sigma_down: float | None = None
+    audio_previous_denoised: np.ndarray | None = None
     for index, (sigma, sigma_next) in enumerate(zip(sigmas[:-1], sigmas[1:], strict=True)):
         runtime.sampling_step = index + 1
         runtime.sampling_steps = steps
@@ -2424,18 +2494,61 @@ def sample_ref2va_latents(
             runtime.audio_fallback_reason = (
                 f"Non-finite Ref2VA audio velocity at step {index + 1}: {invalid} invalid values"
             )
-        video = minimax_h3_euler_step(video, video_velocity, sigma, sigma_next)
+        if sampler == "res_multistep":
+            current_video_denoised = minimax_h3_denoised(video, video_velocity, sigma)
+            video = minimax_h3_res_multistep_step(
+                video,
+                video_velocity,
+                sigma,
+                sigma_next,
+                video_previous_sigma,
+                video_previous_sigma_down,
+                video_previous_denoised,
+                current_denoised=current_video_denoised,
+            )
+            video_previous_sigma = sigma
+            video_previous_sigma_down = sigma_next
+            video_previous_denoised = current_video_denoised
+        else:
+            video = minimax_h3_euler_step(video, video_velocity, sigma, sigma_next)
         if audio_velocity_finite:
             audio_sigma = time_shift_sigma(sigma, 12.0, 3.0)
             audio_sigma_next = time_shift_sigma(sigma_next, 12.0, 3.0)
-            next_audio = minimax_h3_euler_step(audio, audio_velocity, audio_sigma, audio_sigma_next)
+            if sampler == "res_multistep":
+                current_audio_denoised = minimax_h3_denoised(audio, audio_velocity, audio_sigma)
+                next_audio = minimax_h3_res_multistep_step(
+                    audio,
+                    audio_velocity,
+                    audio_sigma,
+                    audio_sigma_next,
+                    audio_previous_sigma,
+                    audio_previous_sigma_down,
+                    audio_previous_denoised,
+                    current_denoised=current_audio_denoised,
+                )
+            else:
+                current_audio_denoised = None
+                next_audio = minimax_h3_euler_step(audio, audio_velocity, audio_sigma, audio_sigma_next)
             if np.isfinite(next_audio).all():
                 audio = next_audio
-            elif runtime.audio_fallback_reason is None:
-                invalid = int((~np.isfinite(next_audio)).sum())
-                runtime.audio_fallback_reason = (
-                    f"Non-finite Ref2VA audio latent at step {index + 1}: {invalid} invalid values"
-                )
+                if sampler == "res_multistep":
+                    audio_previous_sigma = audio_sigma
+                    audio_previous_sigma_down = audio_sigma_next
+                    audio_previous_denoised = current_audio_denoised
+            else:
+                if runtime.audio_fallback_reason is None:
+                    invalid = int((~np.isfinite(next_audio)).sum())
+                    runtime.audio_fallback_reason = (
+                        f"Non-finite Ref2VA audio latent at step {index + 1}: {invalid} invalid values"
+                    )
+                if sampler == "res_multistep":
+                    audio_previous_sigma = None
+                    audio_previous_sigma_down = None
+                    audio_previous_denoised = None
+        elif sampler == "res_multistep":
+            audio_previous_sigma = None
+            audio_previous_sigma_down = None
+            audio_previous_denoised = None
         if not np.isfinite(video).all():
             invalid = int((~np.isfinite(video)).sum())
             raise FloatingPointError(f"Non-finite Ref2VA video latent at step {index + 1}: {invalid} invalid values")

@@ -153,7 +153,7 @@ def test_ref2va_ops_scatter_modalities_and_extract_only_target_rows() -> None:
     )
     runtime = object.__new__(ScheduleMainRuntime)
     runtime.profile = PROFILE_360P_17F
-    runtime._turbo_adapter = None
+    runtime._lora_adapter = None
     runtime._validate_graph_outputs = False
     external = {
         "video": np.zeros((1, 24, 2, 2, 2), dtype=np.float32),
@@ -673,7 +673,7 @@ def test_persistent_session_recycling_can_be_disabled_independently(tmp_path: Pa
     runtime.close()
 
 
-def test_dynamic_adapter_feeds_are_combined_with_persistent_weights(
+def test_ref2va_lora_feeds_are_combined_with_persistent_weights(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -694,7 +694,6 @@ def test_dynamic_adapter_feeds_are_combined_with_persistent_weights(
     )
 
     state = {"persistent_closed": False, "adapter_closed": False}
-    silu = np.full((2, 2688), 3, dtype=np.float32)
     lora = np.full((2, 2), 5, dtype=np.float16)
 
     class Session:
@@ -702,8 +701,7 @@ def test_dynamic_adapter_feeds_are_combined_with_persistent_weights(
             return [
                 _Argument("hidden_states", [2, 2]),
                 _Argument("base_weight", [2, 2]),
-                _Argument("turbo_lora_fc1_A", [2, 2], "tensor(float16)"),
-                _Argument("silu_timestep_embedding", [2, 2688]),
+                _Argument("lora_fc1_A", [2, 2], "tensor(float16)"),
             ]
 
         def get_outputs(self):
@@ -712,8 +710,7 @@ def test_dynamic_adapter_feeds_are_combined_with_persistent_weights(
         def run(self, output_names, feeds):
             assert output_names == ["hidden_states_out"]
             np.testing.assert_array_equal(feeds["base_weight"], np.eye(2, dtype=np.float32))
-            np.testing.assert_array_equal(feeds["turbo_lora_fc1_A"], lora)
-            np.testing.assert_array_equal(feeds["silu_timestep_embedding"], silu)
+            np.testing.assert_array_equal(feeds["lora_fc1_A"], lora)
             return [feeds["hidden_states"] + 1]
 
     class Persistent:
@@ -766,18 +763,18 @@ def test_dynamic_adapter_feeds_are_combined_with_persistent_weights(
         @staticmethod
         def graph_feeds(graph):
             assert graph == "main_block_00_mlp"
-            return {"turbo_lora_fc1_A": lora}
+            return {"lora_fc1_A": lora}
 
         @staticmethod
         def metrics():
-            return {"kind": "turbo_v4"}
+            return {"variant": "ref2v_turbo_v0.1_dynamic"}
 
         @staticmethod
         def close():
             state["adapter_closed"] = True
 
     monkeypatch.setattr("h3_workbench.persistent_weights.PersistentWeightRuntime", Persistent)
-    runtime = ScheduleMainRuntime(tmp_path, _Runner(), turbo_adapter=Adapter())
+    runtime = ScheduleMainRuntime(tmp_path, _Runner(), lora_adapter=Adapter())
     external = {"hidden": np.ones((2, 2), dtype=np.float32)}
     step = {
         "graph": "main_block_00_mlp",
@@ -788,123 +785,9 @@ def test_dynamic_adapter_feeds_are_combined_with_persistent_weights(
         },
     }
 
-    runtime._run_graph(step, external, {"silu_timestep_embedding": silu}, {}, {})
+    runtime._run_graph(step, external, {}, {}, {})
 
     np.testing.assert_array_equal(external["result"], np.full((2, 2), 2, dtype=np.float32))
-    assert runtime.metrics()["turbo_adapter"] == {"kind": "turbo_v4"}
+    assert runtime.metrics()["lora_adapter"] == {"variant": "ref2v_turbo_v0.1_dynamic"}
     runtime.close()
     assert state == {"persistent_closed": True, "adapter_closed": True}
-
-
-def test_dynamic_adapter_builds_silu_and_head_embeddings(monkeypatch) -> None:
-    calls: list[np.ndarray] = []
-
-    class Adapter:
-        @staticmethod
-        def silu_timestep_embeddings(timesteps):
-            calls.append(np.asarray(timesteps).copy())
-            return np.arange(len(timesteps) * 2688, dtype=np.float32).reshape(-1, 2688)
-
-    runtime = object.__new__(ScheduleMainRuntime)
-    runtime.profile = object()
-    runtime._turbo_adapter = Adapter()
-    runtime._validate_graph_outputs = False
-    conditioned_calls: list[tuple[int, ...]] = []
-
-    def fake_modulation_ids(profile, text_count, sigma, conditioned_video_indices=()):
-        conditioned_calls.append(tuple(conditioned_video_indices))
-        return (
-            np.asarray([0.25, 0.75], dtype=np.float32),
-            np.asarray([0, 1], dtype=np.int64),
-        )
-
-    monkeypatch.setattr(
-        "h3_workbench.inference_runtime.modulation_ids",
-        fake_modulation_ids,
-    )
-    monkeypatch.setattr(
-        "h3_workbench.inference_runtime.patchify_video",
-        lambda value: np.asarray(value),
-    )
-    monkeypatch.setattr(
-        "h3_workbench.inference_runtime.pack_audio",
-        lambda value: np.asarray(value),
-    )
-    monkeypatch.setattr(
-        "h3_workbench.inference_runtime.packed_position_ids",
-        lambda profile, text_count: np.zeros((1, text_count, 3), dtype=np.float32),
-    )
-    monkeypatch.setattr(
-        "h3_workbench.inference_runtime.time_shift_sigma",
-        lambda sigma, shift, scale: 0.25,
-    )
-    constants = {"text_states": np.zeros((3, 4), dtype=np.float16)}
-    denoise_step = {
-        "op": "denoise_inputs",
-        "inputs": {
-            "text_states": {"source": "const", "name": "text_states"},
-            "video_latent": {"source": "external", "name": "video"},
-            "audio_latent": {"source": "external", "name": "audio"},
-            "sigma_video": {"source": "external", "name": "sigma"},
-        },
-        "outputs": {
-            name: {"target": "discard"}
-            for name in (
-                "video_patches",
-                "audio_patches",
-                "embedding_text_padding",
-                "timesteps",
-                "position_ids",
-                "modulation_ids",
-                "sigma_audio",
-            )
-        },
-    }
-    runtime._run_op(
-        denoise_step,
-        {
-            "video": np.zeros((1,), dtype=np.float32),
-            "audio": np.zeros((1,), dtype=np.float32),
-            "sigma": 0.5,
-            "conditioned_video_indices": (0, 4),
-        },
-        constants,
-        {},
-    )
-    assert conditioned_calls == [(0, 4)]
-
-    assert len(calls) == 1
-    assert constants["silu_timestep_embedding"].shape == (2, 2688)
-    head_step = {
-        "op": "select_head_timestep",
-        "inputs": {
-            "timesteps": {"source": "external", "name": "timesteps"},
-            "sigma_video": {"source": "external", "name": "sigma_video"},
-            "sigma_audio": {"source": "external", "name": "sigma_audio"},
-            "timestep_embedding": {"source": "external", "name": "embedding"},
-        },
-        "outputs": {
-            "video_timestep_embedding": {"target": "discard"},
-            "audio_timestep_embedding": {"target": "discard"},
-        },
-    }
-    runtime._run_op(
-        head_step,
-        {
-            "timesteps": calls[0],
-            "sigma_video": 0.25,
-            "sigma_audio": 0.75,
-            "embedding": np.zeros((2, 256), dtype=np.float32),
-        },
-        constants,
-        {},
-    )
-
-    np.testing.assert_array_equal(
-        constants["video_silu_timestep_embedding"],
-        constants["silu_timestep_embedding"][1:2],
-    )
-    np.testing.assert_array_equal(
-        constants["audio_silu_timestep_embedding"],
-        constants["silu_timestep_embedding"][0:1],
-    )

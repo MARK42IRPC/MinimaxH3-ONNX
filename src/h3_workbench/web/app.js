@@ -28,6 +28,7 @@ const state = {
   selectedJobId: null,
   jobEvents: new Map(),
   jobSignatures: new Map(),
+  jobActivitySignatures: new Map(),
   telemetry: [],
   telemetrySource: "none",
   telemetryError: null,
@@ -362,7 +363,7 @@ function renderExportPresets() {
       : preset.product?.ready
         ? `当前产物 ${formatBytes(preset.product.size_bytes)}`
         : status === "source_ready" ? "源文件已缓存" : "HTTP Range 断点续传";
-    const optionalDetail = optional && !preset.product?.ready ? "可选组件，仅用于兼容 Turbo v4" : actionDetail;
+    const optionalDetail = optional && !preset.product?.ready ? "可选组件，仅用于兼容旧版 FL2VA 工作流" : actionDetail;
     return `<article class="preset-row">
       <div class="preset-identity">
         <div class="preset-title-line"><strong>${escapeHtml(preset.label)}</strong><span class="status-pill ${safeClass(status)}">${escapeHtml(statusLabel)}</span></div>
@@ -754,8 +755,7 @@ function renderProfiles() {
     input.disabled = hasReferences && input.value !== "text";
     if (hasReferences && input.value === "text") input.checked = true;
   });
-  $("#accelerationLoraInput").disabled = hasReferences;
-  if (hasReferences) $("#accelerationLoraInput").checked = false;
+  $("#accelerationLoraInput").disabled = false;
   $("#tokenIdsInput").disabled = hasReferences;
   $("#durationInput").min = hasReferences ? "5" : "0.1";
   if (hasReferences && (finite($("#durationInput").value) || 0) < 5) $("#durationInput").value = "5";
@@ -784,14 +784,14 @@ function renderProfiles() {
   const targetFrames = hasReferences ? alignReferenceFrames(rawTargetFrames) : rawTargetFrames;
   const mode = hasReferences ? "native" : temporalMode();
   const segments = mode === "segmented" ? Math.ceil(targetFrames / profile.frames) : 1;
-  const turboSteps = steps >= 4 && steps <= 8;
-  const accelerationRequested = !hasReferences && $("#accelerationLoraInput").checked;
+  const accelerationSteps = steps === 4;
+  const accelerationRequested = $("#accelerationLoraInput").checked;
   const baseReady = Boolean(profile.main_ready);
   const adapterReady = Boolean(profile.acceleration_ready);
-  const turboBaseReady = Boolean(profile.turbo_base_ready);
-  const accelerationActive = Boolean(accelerationRequested && baseReady && turboBaseReady && adapterReady && turboSteps);
+  const accelerationBaseReady = Boolean(profile.acceleration_base_ready);
+  const accelerationActive = Boolean(accelerationRequested && accelerationBaseReady && adapterReady && accelerationSteps);
   const baseLabel = hasReferences ? (profile.ref2va_label || "Ref2VA 虚拟切片基座") : mainModelLabel(profile);
-  const activeBaseLabel = accelerationActive ? (profile.turbo_base_label || "FL2VA 流式基座") : baseLabel;
+  const activeBaseLabel = accelerationActive ? (profile.acceleration_base_label || "Ref2VA 虚拟切片基座") : baseLabel;
   const latentFrames = mode === "native" ? videoLatentFramesForOutput(targetFrames) : profile.video_latent_frames;
   const audioTokens = mode === "native" ? Math.ceil(targetFrames * 40 / profile.fps) * 2 : profile.audio_tokens;
   const videoTokens = latentFrames * (paddedHeight / 32) * (paddedWidth / 32);
@@ -805,8 +805,8 @@ function renderProfiles() {
     ? Boolean(prompt)
     : Boolean(prompt || tokens.values.length) && tokens.valid;
   const tokenizerReady = !prompt || Boolean(profile.tokenizer_ready);
-  const mainReady = hasReferences ? Boolean(profile.ref2va_ready) : baseReady;
-  const stepScheduleReady = !accelerationRequested || (turboSteps && accelerationActive);
+  const mainReady = hasReferences || accelerationRequested ? accelerationBaseReady : baseReady;
+  const stepScheduleReady = !accelerationRequested || (accelerationSteps && accelerationActive);
   const dimensionsReady = width >= 128 && width <= 1024 && height >= 128 && height <= 1024;
   const componentsKnown = state.loaded.presets;
   const mediaReady = !componentsKnown || (videoReady === true && audioReady === true);
@@ -824,7 +824,7 @@ function renderProfiles() {
     ["执行后端", profile.cuda_provider_available ? "CUDAExecutionProvider 可用" : "将使用 CPUExecutionProvider", profile.cuda_provider_available ? "passed" : "warning", profile.cuda_provider_available ? "CUDA" : "CPU"],
     ["Qwen 文本编码器", profile.qwen_ready ? "验证产物可用" : "缺少或未通过验证", profile.qwen_ready ? "passed" : "failed", profile.qwen_ready ? "通过" : "阻塞"],
     [baseLabel, mainReady ? "50 Block 基座产物可用" : "缺少或未通过验证", mainReady ? "passed" : "failed", mainReady ? "通过" : "阻塞"],
-    ["Turbo v4 动态 LoRA", hasReferences ? "全能参考模式自动关闭" : !accelerationRequested ? `手动关闭，使用${baseLabel}` : !turboSteps ? "已开启，但仅支持 4–8 步" : !turboBaseReady ? "当前主基座不兼容，Turbo 仅支持 FL2VA" : adapterReady ? "手动开启，将动态叠加" : "已开启，但运行时适配器未就绪", stepScheduleReady ? "passed" : "failed", accelerationActive ? "启用" : stepScheduleReady ? "未启用" : "阻塞"],
+    ["Ref2VA Turbo 4-step LoRA", !accelerationRequested ? `手动关闭，使用${baseLabel}` : !accelerationSteps ? "已开启，但只支持 4 步" : !accelerationBaseReady ? "Ref2VA 虚拟切片基座未就绪" : adapterReady ? "手动开启，将动态叠加" : "已开启，但运行时适配器未就绪", stepScheduleReady ? "passed" : "failed", accelerationActive ? "启用" : stepScheduleReady ? "未启用" : "阻塞"],
     ["Video / Audio VAE", !componentsKnown ? "组件状态尚未返回" : mediaReady ? "编码与解码组件均可用" : "缺少 Video VAE 或 Audio VAE", !componentsKnown ? "warning" : mediaReady ? "passed" : "failed", !componentsKnown ? "待检查" : mediaReady ? "通过" : "阻塞"],
     ["文本输入", contentReady && tokenizerReady ? (prompt ? "Tokenizer 与提示词可用" : `${tokens.values.length} 个 Token IDs`) : !tokens.valid ? tokens.message : prompt ? "Tokenizer 文件不完整" : "请输入提示词或 Token IDs", contentReady && tokenizerReady ? "passed" : "failed", contentReady && tokenizerReady ? "通过" : "阻塞"],
     [hasReferences ? "全能参考" : "帧条件", hasReferences ? (!references.ready ? "参考素材正在上传或不可用" : referenceLimitsReady ? `${references.count} 项按序参考已就绪` : "超出单类数量限制") : frameCondition.active.length === 0 ? "纯文本模式，不使用图片条件" : frameConditionReady ? `${conditioningModeLabel(frameCondition.mode)}条件已上传` : frameCondition.uploading ? "条件图片正在上传" : `还需 ${frameCondition.active.filter((role) => !state.frameImages[role].path).length} 张条件图片`, hasReferences ? (references.ready && referenceLimitsReady ? "passed" : "failed") : frameConditionReady ? "passed" : "failed", hasReferences ? (references.ready && referenceLimitsReady ? "通过" : "阻塞") : frameConditionReady ? conditioningModeLabel(frameCondition.mode) : "阻塞"],
@@ -838,7 +838,7 @@ function renderProfiles() {
     ["输出", `${width} × ${height} / ${targetFrames} 帧`],
     ["预计时长", `${(targetFrames / profile.fps).toFixed(2)} 秒 @ ${profile.fps} FPS`],
     ["主模型", activeBaseLabel],
-    ["运行时适配", accelerationActive ? "Turbo v4 动态 LoRA" : "未启用"],
+    ["运行时适配", accelerationActive ? "Ref2VA Turbo 4-step LoRA" : "未启用"],
     ["生成模式", hasReferences ? "全能参考 · Ref2VA" : conditioningModeLabel(frameCondition.mode)],
     ["时序", mode === "native" ? `${latentFrames} latent / 整体` : `${segments} 段 / ${segments * steps} 次去噪`],
     ["注意力", `${sequenceTokens} tokens / query ${queryChunk}`],
@@ -851,9 +851,9 @@ function renderProfiles() {
   if (!profile.cuda_provider_available) notices.push("当前 ONNX Runtime 没有 CUDAExecutionProvider，CPU 执行会非常缓慢。");
   if (hasReferences && !profile.ref2va_ready) notices.push("全能参考需要已验证的 Ref2VA 虚拟切片基座。");
   if (hasReferences && !references.ready) notices.push("请等待所有参考素材上传完成，并移除失败项目。");
-  if (accelerationRequested && !turboSteps) notices.push("Turbo v4 加速 LoRA 仅支持 4–8 步，请调整采样步数或关闭加速 LoRA。");
-  if (accelerationRequested && turboSteps && !turboBaseReady) notices.push("当前使用 Ref2VA 虚拟切片基座；Turbo v4 仅兼容 FL2VA 基座，请关闭加速 LoRA或安装 FL2VA 兼容基座。");
-  if (accelerationRequested && turboSteps && turboBaseReady && !adapterReady) notices.push("已手动开启 Turbo v4 加速 LoRA，但适配器未就绪，请先在模型页生成适配器。");
+  if (accelerationRequested && !accelerationSteps) notices.push("Ref2VA Turbo 加速 LoRA 只支持 4 步，请调整采样步数或关闭加速 LoRA。");
+  if (accelerationRequested && accelerationSteps && !accelerationBaseReady) notices.push("Ref2VA 虚拟切片基座未就绪，请先安装并验证 Ref2VA 基座。");
+  if (accelerationRequested && accelerationSteps && accelerationBaseReady && !adapterReady) notices.push("已开启 Ref2VA Turbo 加速 LoRA，但适配器未就绪，请先在模型页生成适配器。");
   if (!baseReady && adapterReady) notices.push("动态 LoRA 不能独立运行，请先完成主基座模型。");
   if (!hasReferences && mode === "segmented" && segments > 1) notices.push("分段模式尚未接入首帧续接，多段画面可能出现跳变。");
   if (frameCondition.mode === "first_last" && mode === "segmented" && segments > 1) notices.push("首尾条件分别作用于第一段和最后一段；整体长序列能提供更强的双端关联。");
@@ -865,7 +865,7 @@ function renderProfiles() {
 
   $("#generateButton").disabled = !canStart;
   $("#submitSummary").textContent = canStart ? `${width} × ${height} · ${targetFrames} 帧 · ${steps} 步` : "预检尚未通过";
-  $("#submitHint").textContent = canStart ? `${accelerationActive ? "基座 + Turbo v4 动态 LoRA" : baseLabel} · ${mode === "native" ? "整体长序列" : "低显存分段"}` : "处理所有阻塞项后即可启动";
+  $("#submitHint").textContent = canStart ? `${accelerationActive ? "基座 + Ref2VA Turbo LoRA" : baseLabel} · ${mode === "native" ? "整体长序列" : "低显存分段"}` : "处理所有阻塞项后即可启动";
 }
 
 function updateResolutionPreset() {
@@ -916,18 +916,18 @@ function renderSuperResolution() {
   const outputWidth = Math.round(info.width * scale);
   const outputHeight = Math.round(info.height * scale);
   const dimensionsReady = outputWidth <= 2048 && outputHeight <= 2048 && outputWidth * outputHeight <= 4194304;
-  const turboSteps = steps >= 4 && steps <= 8;
+  const accelerationSteps = steps === 4;
   const accelerationRequested = $("#superAccelerationLoraInput").checked;
   const adapterReady = Boolean(profile && profile.acceleration_ready);
   const baseReady = Boolean(profile && profile.main_ready);
-  const turboBaseReady = Boolean(profile && profile.turbo_base_ready);
+  const accelerationBaseReady = Boolean(profile && profile.acceleration_base_ready);
   const baseLabel = mainModelLabel(profile);
   const promptReady = Boolean(prompt || info.prompt);
   const videoReady = Boolean(profile && profile.video_vae_ready) && presetProductReady("video_vae");
   const tokenizerReady = Boolean(profile && profile.tokenizer_ready);
   const componentsKnown = state.loaded.profiles && state.loaded.presets;
   const contentReady = promptReady && tokenizerReady;
-  const accelerationReady = !accelerationRequested || (turboSteps && turboBaseReady && adapterReady);
+  const accelerationReady = !accelerationRequested || (accelerationSteps && accelerationBaseReady && adapterReady);
   const processingReady = processingMode !== "direct" || info.frames <= 360;
   const canStart = Boolean(
     componentsKnown && profile && baseReady && videoReady && contentReady && dimensionsReady && accelerationReady && processingReady,
@@ -953,7 +953,7 @@ function renderSuperResolution() {
     ["条件提示词", contentReady ? (prompt ? "使用手动提示词" : "使用视频 metadata prompt") : tokenizerReady ? "未找到 prompt" : "Tokenizer 文件不完整", contentReady ? "passed" : "failed", contentReady ? "通过" : "阻塞"],
     ["输出规格", dimensionsReady ? outputWidth + " × " + outputHeight : "超过 2048 px 或 4 MP 限制", dimensionsReady ? "passed" : "failed", dimensionsReady ? "通过" : "阻塞"],
     ["处理方式", processingReady ? (processingMode === "direct" ? "完整视频直接推理" : "17 帧分片推理") : "直接推理最多支持 360 帧", processingReady ? "passed" : "failed", processingReady ? "通过" : "阻塞"],
-    ["Turbo v4 LoRA", !accelerationRequested ? "手动关闭" : !turboSteps ? "仅支持 4–8 步" : !turboBaseReady ? "当前主基座不兼容，Turbo 仅支持 FL2VA" : adapterReady ? "手动开启，适配器可用" : "适配器未就绪", accelerationReady ? "passed" : "failed", accelerationReady && accelerationRequested ? "启用" : accelerationReady ? "关闭" : "阻塞"],
+    ["Ref2VA Turbo 4-step LoRA", !accelerationRequested ? "手动关闭" : !accelerationSteps ? "只支持 4 步" : !accelerationBaseReady ? "Ref2VA 虚拟切片基座未就绪" : adapterReady ? "手动开启，适配器可用" : "适配器未就绪", accelerationReady ? "passed" : "failed", accelerationReady && accelerationRequested ? "启用" : accelerationReady ? "关闭" : "阻塞"],
   ];
   $("#superPreflightList").innerHTML = checks.map((row) => preflightRow(...row)).join("");
   $("#superPreflightSummary").textContent = checks.filter((row) => row[2] === "passed").length + " / " + checks.length + " 通过";
@@ -969,9 +969,9 @@ function renderSuperResolution() {
   if (outputWidth * outputHeight > 1048576) warnings.push("当前输出超过 1 MP，任务会把输入帧驻留主内存。");
   if (processingMode === "direct") warnings.push("直接推理会把完整视频放入一个主模型时间序列，显存和注意力开销显著增加。");
   if (!processingReady) warnings.push("直接推理最多支持 360 帧，请切换到视频分片。");
-  if (accelerationRequested && !turboSteps) warnings.push("Turbo v4 加速 LoRA 仅支持 4–8 步。");
-  if (accelerationRequested && turboSteps && !turboBaseReady) warnings.push("当前使用 Ref2VA 虚拟切片基座；Turbo v4 仅兼容 FL2VA 基座。");
-  if (accelerationRequested && turboSteps && turboBaseReady && !adapterReady) warnings.push("已开启 Turbo v4，但适配器尚未就绪。");
+  if (accelerationRequested && !accelerationSteps) warnings.push("Ref2VA Turbo 加速 LoRA 只支持 4 步。");
+  if (accelerationRequested && accelerationSteps && !accelerationBaseReady) warnings.push("Ref2VA 虚拟切片基座未就绪。");
+  if (accelerationRequested && accelerationSteps && accelerationBaseReady && !adapterReady) warnings.push("已开启 Ref2VA Turbo，但适配器尚未就绪。");
   const warning = $("#superRuntimeWarning");
   warning.classList.toggle("hidden", warnings.length === 0);
   warning.textContent = warnings.join(" ");
@@ -1084,7 +1084,47 @@ function activitySummary(job) {
   const activity = job.activity || {};
   const module = activity.module || jobKindLabel(job);
   const operation = activity.operation || job.message || jobStatusLabel(job.status);
-  return `${module} · ${operation}`;
+  const position = activity.current !== undefined && activity.total !== undefined
+    ? ` (${activity.current}/${activity.total}${activity.stage_progress !== undefined ? `, ${Math.round(Number(activity.stage_progress) * 100)}%` : ""})`
+    : "";
+  return `${module} · ${operation}${position}`;
+}
+
+function jobHeartbeatKey(job) {
+  if (!isActiveJob(job)) return null;
+  const performance = job.performance || {};
+  const sequence = finite(performance.sequence);
+  if (sequence !== null) return Math.floor(sequence / 5);
+  const timestamp = Date.parse(performance.timestamp || job.updated_at || "");
+  return Number.isFinite(timestamp) ? Math.floor(timestamp / 5000) : null;
+}
+
+function performanceHeartbeatSummary(job) {
+  const performance = job.performance?.performance || {};
+  const gpu = performance.gpu || {};
+  const process = performance.process || {};
+  const metrics = [];
+  if (finite(gpu.utilization_percent) !== null) metrics.push(`GPU ${formatPercent(gpu.utilization_percent)}`);
+  if (finite(gpu.memory_used_mib) !== null) metrics.push(`显存 ${formatBytes(gpu.memory_used_mib * 1024 ** 2)}`);
+  if (finite(process.cpu_percent) !== null) metrics.push(`CPU ${formatPercent(process.cpu_percent)}`);
+  const elapsed = job.performance?.elapsed_seconds !== undefined
+    ? `${Number(job.performance.elapsed_seconds).toFixed(0)} 秒`
+    : jobElapsed(job);
+  return `仍在运行 · ${activitySummary(job)} · 已运行 ${elapsed}${metrics.length ? ` · ${metrics.join(" · ")}` : ""}`;
+}
+
+function jobActivityStatus(job) {
+  const rawTimestamp = job.performance?.timestamp || job.updated_at || job.started_at || job.created_at;
+  const timestamp = Date.parse(rawTimestamp || "");
+  if (!Number.isFinite(timestamp)) return { className: "idle", label: "等待活动时间" };
+  const age = Math.max(0, Date.now() - timestamp);
+  if (isActiveJob(job) && age < 7000) {
+    return { className: "live", label: `实时 · ${shortTime(rawTimestamp)}` };
+  }
+  if (isActiveJob(job)) {
+    return { className: "idle", label: `最近活动 ${Math.floor(age / 1000)} 秒前 · ${shortTime(rawTimestamp)}` };
+  }
+  return { className: "idle", label: `最后活动 · ${shortTime(rawTimestamp)}` };
 }
 
 function rememberJobEvents(jobs) {
@@ -1100,12 +1140,22 @@ function rememberJobEvents(jobs) {
       activity.operation,
       activity.current,
       activity.total,
+      activity.bytes_loaded,
+      activity.bytes_total,
+      activity.stage_progress,
+      activity.tensor,
       prefetch.operation,
     ]);
-    if (state.jobSignatures.get(job.id) === signature) continue;
-    state.jobSignatures.set(job.id, signature);
+    const heartbeatKey = jobHeartbeatKey(job);
+    const eventSignature = JSON.stringify([signature, heartbeatKey]);
+    if (state.jobSignatures.get(job.id) === eventSignature) continue;
+    const activityChanged = state.jobActivitySignatures.get(job.id) !== signature;
+    state.jobSignatures.set(job.id, eventSignature);
+    state.jobActivitySignatures.set(job.id, signature);
     const events = state.jobEvents.get(job.id) || [];
-    let message = activitySummary(job);
+    let message = activityChanged || heartbeatKey === null
+      ? activitySummary(job)
+      : performanceHeartbeatSummary(job);
     if (prefetch.operation) message += `；预取：${prefetch.operation}`;
     events.push({
       time: new Date().toISOString(),
@@ -1177,6 +1227,14 @@ function activityItems(job) {
   push("当前模块", activity.module);
   push("当前操作", activity.operation);
   if (activity.current !== undefined && activity.total !== undefined) push("执行位置", `${activity.current} / ${activity.total}`);
+  if (activity.bytes_loaded !== undefined && activity.bytes_total !== undefined) {
+    push("权重加载", `${formatBytes(Number(activity.bytes_loaded))} / ${formatBytes(Number(activity.bytes_total))}`);
+  }
+  if (activity.stage_progress !== undefined) push("阶段进度", `${(Number(activity.stage_progress) * 100).toFixed(1)}%`);
+  if (activity.reference_image_short_edge !== undefined) push("参考图短边", `${activity.reference_image_short_edge} px`);
+  if (activity.text_tokens !== undefined) push("多模态文本 token", Number(activity.text_tokens).toLocaleString("zh-CN"));
+  if (activity.image_tokens !== undefined) push("图像 token", Number(activity.image_tokens).toLocaleString("zh-CN"));
+  if (activity.video_tokens !== undefined) push("视频 token", Number(activity.video_tokens).toLocaleString("zh-CN"));
   if (activity.sampling_step) push("采样步数", `${activity.sampling_step} / ${activity.sampling_steps}`);
   if (activity.segment) push("视频片段", `${activity.segment} / ${activity.segments}`);
   if (activity.shard) push("当前分片", `${activity.shard} / ${activity.shards}`);
@@ -1221,6 +1279,7 @@ function renderJobInspector() {
   const items = activityItems(job);
   const events = state.jobEvents.get(job.id) || [];
   const links = artifactLinks(job);
+  const activityStatus = jobActivityStatus(job);
   const eventHtml = events.length
     ? events.map((event) => `<div class="log-line ${event.error ? "error" : ""}"><span class="log-time">${escapeHtml(shortTime(event.time))}</span><span>${escapeHtml(event.message)}</span></div>`).join("")
     : '<div class="log-line"><span class="log-time">--:--:--</span><span>等待任务状态更新</span></div>';
@@ -1228,6 +1287,7 @@ function renderJobInspector() {
     <header class="inspector-header">
       <div class="inspector-title"><h4 title="${escapeHtml(job.model_id)}">${escapeHtml(job.model_id)}</h4><span class="status-pill ${safeClass(job.status)}">${escapeHtml(jobStatusLabel(job.status))}</span></div>
       <p>${escapeHtml(job.message || activitySummary(job))}</p>
+      <div class="inspector-live"><div class="live-indicator ${activityStatus.className}"><i></i><span>${escapeHtml(activityStatus.label)}</span></div></div>
       <div class="inspector-progress"><div class="progress-track"><div class="progress-bar ${job.status === "failed" ? "failed" : ""}" style="width:${(progress * 100).toFixed(1)}%"></div></div><strong class="job-progress-value">${Math.round(progress * 100)}%</strong></div>
     </header>
     <div class="inspector-meta">
@@ -1666,7 +1726,7 @@ async function startInference(event) {
         prompt: prompt || null,
         token_ids: references.count || prompt ? null : tokens.values,
         steps: Number($("#stepsInput").value),
-        use_acceleration_lora: references.count ? false : $("#accelerationLoraInput").checked,
+        use_acceleration_lora: $("#accelerationLoraInput").checked,
         seed: Number($("#seedInput").value),
         width: Number($("#widthInput").value),
         height: Number($("#heightInput").value),

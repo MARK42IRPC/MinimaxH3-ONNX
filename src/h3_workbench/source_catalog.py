@@ -5,13 +5,8 @@ from urllib.parse import quote, urlencode
 
 
 OFFICIAL_REPO = "Comfy-Org/MiniMax-H3"
-TURBO_REPO = "larryvrh/MiniMax-H3-Turbo-Lora"
 SUPPORT_REPO = "Mark42IRPC/Minimax-H3-int8-fl2va-onnx-50CLIPS"
 TOKENIZER_REPO = SUPPORT_REPO
-
-
-def _hugging_face_url(repo_id: str, path: str) -> str:
-    return f"https://huggingface.co/{repo_id}/resolve/main/{quote(path, safe='/')}?download=true"
 
 
 def _modelscope_url(repo_id: str, path: str) -> str:
@@ -161,7 +156,7 @@ EXPORT_PRESETS: tuple[ExportPreset, ...] = (
     ),
     ExportPreset(
         "fl2va_streaming",
-        "FL2VA 流式基座（Turbo 专用）",
+        "FL2VA 流式基座（可选）",
         "fl2va_transformer",
         SourceAsset(
             OFFICIAL_REPO,
@@ -171,32 +166,25 @@ EXPORT_PRESETS: tuple[ExportPreset, ...] = (
         ),
         "onnx_models/minimax_h3_fl2va_pruned_fp8_scaled_streaming",
         40764106323,
-        "可选的 pruned FP8 scaled 基座，仅用于兼容现有 Turbo v4 动态 LoRA；普通生成不再需要",
+        "可选的 pruned FP8 scaled 基座，用于旧版 FL2VA 工作流；普通生成不再需要",
         required_for_generation=False,
     ),
     ExportPreset(
-        "fl2va_turbo_v4",
-        "Turbo v4 动态 LoRA",
+        "ref2va_turbo_v0_1",
+        "Ref2VA Turbo 4-step 动态 LoRA",
         "acceleration_lora",
         SourceAsset(
-            TURBO_REPO,
-            "minimax_h3_turbo_v4_step600_ema.safetensors",
-            779849816,
-            _hugging_face_url(TURBO_REPO, "minimax_h3_turbo_v4_step600_ema.safetensors"),
+            OFFICIAL_REPO,
+            "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+            1956193000,
+            _modelscope_url(OFFICIAL_REPO, "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"),
             role="lora",
         ),
-        ".h3-workbench/accelerators/turbo_v4",
-        1048576,
-        "运行时叠加 v4 step600 EMA 与 SiLU 时间步网格，完整覆盖 259/259 LoRA，推荐 4-8 步；不会生成合并的 40GB 主模型",
-        support=SourceAsset(
-            SUPPORT_REPO,
-            "export_support/h3_silu_temb_grid.safetensors",
-            5510600,
-            _modelscope_url(SUPPORT_REPO, "export_support/h3_silu_temb_grid.safetensors"),
-            role="silu_timestep_grid",
-        ),
+        ".h3-workbench/accelerators/ref2va_turbo",
+        1542000000,
+        "官方 Ref2VA 4-step BF16 LoRA，运行时动态叠加到虚拟权重切片；覆盖 50 个主块与 2 个 token-refiner 块，不会生成合并的 40GB 主模型",
         product_type="runtime_adapter",
-        depends_on=("fl2va_streaming",),
+        depends_on=("ref2va",),
         required_for_generation=False,
     ),
 )

@@ -43,7 +43,7 @@ def test_export_presets_only_expose_validated_variants() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert {item["id"] for item in payload["presets"]} == {
-        "tokenizer", "audio_vae", "video_vae", "qwen", "ref2va", "fl2va_streaming", "fl2va_turbo_v4"
+        "tokenizer", "audio_vae", "video_vae", "qwen", "ref2va", "fl2va_streaming", "ref2va_turbo_v0_1"
     }
     ref2va = next(item for item in payload["presets"] if item["id"] == "ref2va")
     assert ref2va["component"] == "ref2va_transformer"
@@ -53,24 +53,23 @@ def test_export_presets_only_expose_validated_variants() -> None:
     assert ref2va["output_size_bytes"] < 4 * 1024**3
     fl2va = next(item for item in payload["presets"] if item["id"] == "fl2va_streaming")
     assert fl2va["required_for_generation"] is False
-    turbo = next(item for item in payload["presets"] if item["id"] == "fl2va_turbo_v4")
-    assert turbo["label"] == "Turbo v4 动态 LoRA"
+    turbo = next(item for item in payload["presets"] if item["id"] == "ref2va_turbo_v0_1")
+    assert turbo["label"] == "Ref2VA Turbo 4-step 动态 LoRA"
     assert turbo["component"] == "acceleration_lora"
     assert turbo["product_type"] == "runtime_adapter"
-    assert turbo["depends_on"] == ["fl2va_streaming"]
-    assert turbo["source"]["path"] == "minimax_h3_turbo_v4_step600_ema.safetensors"
+    assert turbo["depends_on"] == ["ref2va"]
+    assert turbo["source"]["path"] == "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
     assert turbo["source"]["role"] == "lora"
+    assert turbo["source"]["url"].startswith("https://www.modelscope.cn/")
     assert turbo["lora"] is None
-    assert turbo["support"]["path"] == "export_support/h3_silu_temb_grid.safetensors"
-    assert turbo["support"]["role"] == "silu_timestep_grid"
-    assert turbo["source"]["url"].startswith("https://huggingface.co/")
-    assert turbo["download_size_bytes"] == 779849816 + 5510600
-    assert turbo["output_size_bytes"] < 16 * 1024**2
-    assert turbo["required_space_bytes"] < 1024**3
+    assert turbo["support"] is None
+    assert turbo["download_size_bytes"] == 1_956_193_000
+    assert turbo["output_size_bytes"] == 1_542_000_000
+    assert turbo["required_space_bytes"] == 3_498_193_000
     assert "40GB" in turbo["description"]
 
 
-def test_turbo_adapter_preset_exposes_base_dependency(monkeypatch, tmp_path) -> None:
+def test_ref2va_adapter_preset_exposes_base_dependency(monkeypatch, tmp_path) -> None:
     from h3_workbench import app as app_module
 
     models = tmp_path / "onnx_models"
@@ -82,17 +81,17 @@ def test_turbo_adapter_preset_exposes_base_dependency(monkeypatch, tmp_path) -> 
 
     turbo = next(
         item for item in TestClient(app_module.app).get("/api/export-presets").json()["presets"]
-        if item["id"] == "fl2va_turbo_v4"
+        if item["id"] == "ref2va_turbo_v0_1"
     )
 
     assert turbo["status"] == "dependency_required"
     assert turbo["dependencies_ready"] is False
     assert turbo["dependencies"] == [
         {
-            "id": "fl2va_streaming",
-            "label": "FL2VA 流式基座（Turbo 专用）",
+            "id": "ref2va",
+            "label": "Ref2VA 虚拟切片基座",
             "ready": False,
-            "path": str((models / "minimax_h3_fl2va_pruned_fp8_scaled_streaming").resolve()),
+            "path": str((models / "minimax_h3_ref2va_pruned_bf16_virtual").resolve()),
         }
     ]
 
@@ -121,11 +120,11 @@ def test_webui_contains_live_job_elapsed_timer() -> None:
     assert "执行参数" in response.text
     assert "job-progress-value" in response.text
     assert "/performance" in response.text
-    assert "Turbo v4 动态 LoRA" in response.text
+    assert "Ref2VA Turbo 4-step LoRA" in response.text
     assert "手动开启" in response.text
-    assert "仅兼容 FL2VA 基座" in response.text
+    assert "Ref2VA Turbo 加速 LoRA 只支持 4 步" in response.text
     assert "use_acceleration_lora" in response.text
-    assert "Turbo v4 尚未就绪，将使用流式基座模型" not in response.text
+    assert "只支持 4 步" in response.text
 
 
 def test_webui_uri_encodes_upload_filenames() -> None:
@@ -381,33 +380,23 @@ def test_main_model_resolver_accepts_workspace_root_product(tmp_path) -> None:
     assert resolved == product.resolve()
 
 
-def test_generation_profile_detects_turbo_capability(monkeypatch, tmp_path) -> None:
+def test_generation_profile_detects_ref2va_acceleration_capability(monkeypatch, tmp_path) -> None:
     from h3_workbench import app as app_module
 
     models = tmp_path / "onnx_models"
-    base = models / "minimax_h3_fl2va_pruned_fp8_scaled_streaming"
-    turbo = tmp_path / ".h3-workbench" / "accelerators" / "turbo_v4"
-    qwen = models / "qwen3vl_32b_minimax_h3_nvfp4_awq"
+    base = models / "minimax_h3_ref2va_pruned_bf16_virtual"
+    turbo = tmp_path / ".h3-workbench" / "accelerators" / "ref2va_turbo"
     base.mkdir(parents=True)
     turbo.mkdir(parents=True)
-    qwen.mkdir(parents=True)
     blocks = list(range(50))
     (base / "manifest.json").write_text(
         json.dumps(
             {
-                "validation_passed": True,
-                "build_complete": True,
-                "schedule_format": "h3-schedule-v2",
-                "schedule": "schedule.json",
+                "component": "ref2va_transformer",
                 "blocks": blocks,
                 "graphs": [],
             }
         ),
-        encoding="utf-8",
-    )
-    (base / "schedule.json").write_text("{}", encoding="utf-8")
-    (qwen / "manifest.json").write_text(
-        json.dumps({"validation_passed": True, "blocks": blocks}),
         encoding="utf-8",
     )
     monkeypatch.setattr(
@@ -416,7 +405,12 @@ def test_generation_profile_detects_turbo_capability(monkeypatch, tmp_path) -> N
         replace(app_module.settings, workspace=tmp_path, output_dir=models, state_dir=tmp_path / ".h3-workbench"),
     )
     monkeypatch.setattr(app_module, "tokenizer_files_ready", lambda _: True)
-    monkeypatch.setattr(app_module, "validate_turbo_adapter", lambda *_, **__: {})
+    monkeypatch.setattr(app_module, "validate_ref2va_adapter", lambda *_, **__: {})
+    monkeypatch.setattr(
+        app_module,
+        "resolve_main_model_directory",
+        lambda *_args, component=None, **_kwargs: base if component in {None, "ref2va_transformer"} else None,
+    )
 
     profile = TestClient(app_module.app).get("/api/profiles").json()[0]
 
@@ -492,6 +486,20 @@ def test_inference_request_accepts_explicit_acceleration_lora() -> None:
     assert request.use_acceleration_lora is True
 
 
+def test_inference_request_allows_acceleration_lora_with_references() -> None:
+    request = InferenceRequest(
+        prompt="Use the supplied subject",
+        steps=4,
+        duration_seconds=5.0,
+        temporal_mode="native",
+        use_acceleration_lora=True,
+        references=[{"kind": "image", "path": "subject.png"}],
+    )
+
+    assert request.use_acceleration_lora is True
+    assert request.references == [{"kind": "image", "path": "subject.png"}]
+
+
 @pytest.mark.parametrize(
     ("mode", "start", "end"),
     (
@@ -523,9 +531,10 @@ def test_inference_request_rejects_missing_frame_condition_input() -> None:
         InferenceRequest(prompt="snowfall", conditioning_mode="first_last", start_image_path="start.png")
 
 
-def test_inference_request_rejects_acceleration_lora_outside_supported_steps() -> None:
-    with pytest.raises(ValidationError, match="supports 4-8"):
-        InferenceRequest(prompt="snowfall", steps=3, use_acceleration_lora=True)
+@pytest.mark.parametrize("steps", (3, 5))
+def test_inference_request_rejects_acceleration_lora_outside_supported_steps(steps: int) -> None:
+    with pytest.raises(ValidationError, match="exactly 4"):
+        InferenceRequest(prompt="snowfall", steps=steps, use_acceleration_lora=True)
 
 
 def test_super_resolution_request_exposes_manual_processing_mode() -> None:

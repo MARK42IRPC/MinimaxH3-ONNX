@@ -4,6 +4,10 @@ import numpy as np
 import pytest
 
 from h3_workbench.media_input import AudioInfo, ImageInfo, VideoInfo
+from h3_workbench.reference_conditioning import (
+    reference_image_size,
+    resolve_reference_image_short_edge,
+)
 from h3_workbench.reference import (
     ReferenceSpec,
     build_ref2va_packed_layout,
@@ -29,6 +33,21 @@ class _Tokenizer:
 
     def convert_tokens_to_ids(self, token):
         return self.special[token]
+
+
+def test_low_vram_reference_images_use_a_bounded_visual_token_budget(monkeypatch) -> None:
+    monkeypatch.delenv("H3_REFERENCE_IMAGE_SHORT_EDGE", raising=False)
+
+    short_edge = resolve_reference_image_short_edge(4 * 1024**3)
+
+    assert short_edge == 768
+    assert reference_image_size(2880, 1440, short_edge) == (768, 1536)
+
+
+def test_reference_image_short_edge_allows_an_explicit_override(monkeypatch) -> None:
+    monkeypatch.setenv("H3_REFERENCE_IMAGE_SHORT_EDGE", "1280")
+
+    assert resolve_reference_image_short_edge(4 * 1024**3) == 1280
 
 
 def test_reference_labels_preserve_request_order_and_number_per_modality() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import math
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, Sequence
@@ -363,6 +364,7 @@ class Qwen3VLVisionEncoder:
         dtype: torch.dtype | None = None,
         config: Any | None = None,
         loader: Callable[[Any, Path, torch.device, torch.dtype], None] | None = None,
+        activity_callback: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         self.checkpoint = checkpoint.resolve()
         if not self.checkpoint.is_file():
@@ -372,14 +374,26 @@ class Qwen3VLVisionEncoder:
         self.config = config or qwen_vision_config()
         self._model: Any | None = None
         self._loader = loader
+        self._activity_callback = activity_callback
 
     @property
     def loaded(self) -> bool:
         return self._model is not None
 
+    def _report_activity(self, operation: str, **details: object) -> None:
+        if self._activity_callback is not None:
+            self._activity_callback({"module": "Qwen Vision", "operation": operation, **details})
+
     def _load_model(self) -> Any:
         from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
 
+        started = time.perf_counter()
+        self._report_activity(
+            "Preparing visual tower",
+            device=str(self.device),
+            dtype=str(self.dtype),
+            depth=QWEN_VISION_DEPTH,
+        )
         config = self.config
         # Reference images are encoded at a 2048-pixel short edge. Eager
         # attention materializes the full score matrix at that resolution
@@ -395,7 +409,9 @@ class Qwen3VLVisionEncoder:
             if buffer.device.type == "meta":
                 buffer.data = torch.empty(buffer.shape, device=self.device, dtype=self.dtype)
         if self._loader is not None:
+            self._report_activity("Loading visual tower weights", stage_progress=0.0)
             self._loader(model, self.checkpoint, self.device, self.dtype)
+            self._report_activity("Visual tower weights loaded", stage_progress=1.0)
         else:
             self._load_checkpoint_tensors(model)
         # ``inv_freq`` is a non-persistent buffer and therefore is not present in
@@ -408,6 +424,11 @@ class Qwen3VLVisionEncoder:
             rotary.inv_freq = values
         model.eval().requires_grad_(False)
         self._model = model
+        self._report_activity(
+            "Visual tower ready",
+            stage_progress=1.0,
+            elapsed_seconds=round(time.perf_counter() - started, 3),
+        )
         return model
 
     def _load_checkpoint_tensors(self, model: Any) -> None:
@@ -417,6 +438,28 @@ class Qwen3VLVisionEncoder:
         targets = {**dict(model.named_parameters()), **dict(model.named_buffers())}
         expected = set(targets)
         found: set[str] = set()
+        visual_entries = [
+            (key, entry)
+            for key, entry in reader._entries.items()
+            if key.startswith("visual.")
+        ]
+        total = len(visual_entries)
+        total_bytes = sum(
+            int(entry["data_offsets"][1]) - int(entry["data_offsets"][0])
+            for _, entry in visual_entries
+        )
+        loaded = 0
+        loaded_bytes = 0
+        started = time.perf_counter()
+        last_report = 0.0
+        self._report_activity(
+            "Loading visual tower weights",
+            current=0,
+            total=total,
+            bytes_loaded=0,
+            bytes_total=total_bytes,
+            stage_progress=0.0,
+        )
         for key in reader._entries:
             if not key.startswith("visual."):
                 continue
@@ -431,16 +474,48 @@ class Qwen3VLVisionEncoder:
                 raise ValueError(f"Qwen visual tensor shape mismatch for {name}: {tensor.shape} != {target.shape}")
             target.data.copy_(tensor)
             found.add(name)
+            entry = reader._entries[key]
+            loaded += 1
+            loaded_bytes += int(entry["data_offsets"][1]) - int(entry["data_offsets"][0])
+            now = time.perf_counter()
+            if loaded == total or loaded == 1 or now - last_report >= 0.75:
+                last_report = now
+                self._report_activity(
+                    "Loading visual tower weights",
+                    current=loaded,
+                    total=total,
+                    bytes_loaded=loaded_bytes,
+                    bytes_total=total_bytes,
+                    stage_progress=loaded / max(1, total),
+                    tensor=name,
+                    elapsed_seconds=round(now - started, 3),
+                )
             del source, converted, tensor
         missing = sorted(expected - found - {"rotary_pos_emb.inv_freq"})
         if missing:
             raise ValueError(f"Qwen visual checkpoint is missing tensors: {missing[:8]}")
+        self._report_activity(
+            "Visual tower weights loaded",
+            current=loaded,
+            total=total,
+            bytes_loaded=loaded_bytes,
+            bytes_total=total_bytes,
+            stage_progress=1.0,
+            elapsed_seconds=round(time.perf_counter() - started, 3),
+        )
 
     def _ensure_model(self) -> Any:
         return self._model if self._model is not None else self._load_model()
 
     def _run(self, patches: np.ndarray, grid: tuple[int, int, int], geometry: VisionGeometry) -> VisionEncoding:
+        started = time.perf_counter()
         model = self._ensure_model()
+        self._report_activity(
+            "Running visual tower",
+            kind=geometry.kind,
+            grid_thw=list(grid),
+            merged_tokens=geometry.merged_tokens,
+        )
         pixel_values = torch.from_numpy(np.ascontiguousarray(patches)).to(device=self.device, dtype=torch.float32)
         grid_thw = torch.tensor([grid], dtype=torch.long, device=self.device)
         with torch.inference_mode():
@@ -449,6 +524,13 @@ class Qwen3VLVisionEncoder:
             deepstack = output.deepstack_features if hasattr(output, "deepstack_features") else output[2]
             features = np.asarray(merged.float().cpu().numpy(), dtype=np.float32)
             deep = tuple(np.asarray(value.float().cpu().numpy(), dtype=np.float32) for value in (deepstack or ()))
+        self._report_activity(
+            "Visual reference encoded",
+            kind=geometry.kind,
+            grid_thw=list(grid),
+            merged_tokens=geometry.merged_tokens,
+            elapsed_seconds=round(time.perf_counter() - started, 3),
+        )
         return VisionEncoding(features=features, deepstack_features=deep, geometry=geometry)
 
     def encode_image(self, image: np.ndarray) -> VisionEncoding:
@@ -532,7 +614,11 @@ def encode_reference_vision(
     callback: Callable[[dict[str, object]], None] | None = None,
 ) -> VisionEncoding:
     """Encode one reference and release the visual tower before returning."""
-    encoder = Qwen3VLVisionEncoder(checkpoint, prefer_cuda=prefer_cuda)
+    encoder = Qwen3VLVisionEncoder(
+        checkpoint,
+        prefer_cuda=prefer_cuda,
+        activity_callback=callback,
+    )
     try:
         if callback is not None:
             callback({"module": "Qwen Vision", "operation": "Encoding reference", "kind": kind})

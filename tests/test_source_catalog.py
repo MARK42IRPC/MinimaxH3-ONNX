@@ -20,12 +20,24 @@ def test_large_checkpoint_sources_use_official_modelscope() -> None:
 def test_ref2va_is_the_required_main_generation_base() -> None:
     ref2va = next(preset for preset in EXPORT_PRESETS if preset.id == "ref2va")
     fl2va = next(preset for preset in EXPORT_PRESETS if preset.id == "fl2va_streaming")
+    turbo = next(preset for preset in EXPORT_PRESETS if preset.id == "ref2va_turbo_v0_1")
 
     assert ref2va.component == "ref2va_transformer"
     assert ref2va.required_for_generation is True
     assert ref2va.source.size_bytes == 40225724176
     assert ref2va.output_dir.endswith("minimax_h3_ref2va_pruned_bf16_virtual")
     assert fl2va.required_for_generation is False
+    assert turbo.component == "acceleration_lora"
+    assert turbo.product_type == "runtime_adapter"
+    assert turbo.depends_on == ("ref2va",)
+    assert turbo.source.repo_id == OFFICIAL_REPO
+    assert turbo.source.path == "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
+    assert turbo.source.size_bytes == 1_956_193_000
+    assert turbo.source.role == "lora"
+    assert turbo.support is None
+    assert turbo.lora is None
+    assert turbo.download_size_bytes == turbo.source.size_bytes
+    assert "4-step" in turbo.description
 
 
 def test_small_support_assets_use_private_modelscope_collection() -> None:
@@ -44,8 +56,3 @@ def test_small_support_assets_use_private_modelscope_collection() -> None:
         parsed = urlparse(asset.url)
         assert parsed.path == "/api/v1/models/Mark42IRPC/Minimax-H3-int8-fl2va-onnx-50CLIPS/repo"
         assert parse_qs(parsed.query) == {"Revision": ["master"], "FilePath": [asset.path]}
-
-    turbo = next(preset for preset in EXPORT_PRESETS if preset.id == "fl2va_turbo_v4")
-    assert turbo.support is not None
-    assert turbo.support.repo_id == SUPPORT_REPO
-    assert turbo.support.path == "export_support/h3_silu_temb_grid.safetensors"

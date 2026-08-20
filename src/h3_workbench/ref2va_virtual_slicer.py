@@ -363,7 +363,14 @@ def _graph_kind(graph: str) -> str | None:
 class Ref2VASourceWeights:
     """Runtime weight provider for BF16 Ref2VA virtual block slices."""
 
-    def __init__(self, directory: Path, runner: Any, graph_paths: dict[str, Path]) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        runner: Any,
+        graph_paths: dict[str, Path],
+        *,
+        topology_paths: dict[str, Path] | None = None,
+    ) -> None:
         self.directory = directory.resolve()
         if not ref2va_virtual_ready(self.directory):
             raise ValueError(f"Ref2VA virtual product is stale or incomplete: {self.directory}")
@@ -384,6 +391,15 @@ class Ref2VASourceWeights:
             kind: self.directory / str(self.kinds[kind]["graph"])
             for kind in VIRTUAL_KINDS
         }
+        if topology_paths is not None:
+            unexpected = set(topology_paths) - set(VIRTUAL_KINDS)
+            if unexpected:
+                raise ValueError(f"Unsupported Ref2VA topology overrides: {sorted(unexpected)}")
+            for kind, path in topology_paths.items():
+                resolved = Path(path).resolve()
+                if not resolved.is_file():
+                    raise FileNotFoundError(resolved)
+                self._topology_paths[kind] = resolved
         self._sessions: dict[str, Any] = {}
         self._active: dict[str, dict[str, np.ndarray]] = {}
         self._load_seconds: dict[str, float] = {}

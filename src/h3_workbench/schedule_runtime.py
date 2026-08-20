@@ -39,7 +39,7 @@ class ScheduleMainRuntime:
         attention_query_chunk: int = 512,
         activity_callback: Callable[[dict[str, object]], None] | None = None,
         l1_prefetch_shards: int = 2,
-        turbo_adapter: Any | None = None,
+        lora_adapter: Any | None = None,
     ) -> None:
         self.directory = directory.resolve()
         self.runner = runner
@@ -47,7 +47,7 @@ class ScheduleMainRuntime:
         self.attention_query_chunk = attention_query_chunk
         self.l1_prefetch_shards = l1_prefetch_shards
         self.activity_callback = activity_callback
-        self._turbo_adapter = turbo_adapter
+        self._lora_adapter = lora_adapter
         self.sampling_step = 0
         self.sampling_steps = 0
         self.audio_fallback_reason: str | None = None
@@ -112,20 +112,34 @@ class ScheduleMainRuntime:
             virtual_ready = ref2va_virtual_ready(self.directory)
         except (ImportError, OSError, ValueError, TypeError):
             virtual_ready = False
-        if virtual_ready and self._turbo_adapter is not None:
+        if virtual_ready and self._lora_adapter is not None and getattr(
+            self._lora_adapter, "base_component", None
+        ) != "ref2va_transformer":
             raise RuntimeError(
-                "Turbo LoRA is tied to the FL2VA FP8 base and cannot be applied to a Ref2VA virtual product"
+                "The selected acceleration LoRA is not compatible with the Ref2VA virtual base"
             )
+        if not virtual_ready and getattr(self._lora_adapter, "base_component", None) == "ref2va_transformer":
+            raise RuntimeError("Ref2VA acceleration LoRA requires a validated Ref2VA virtual base")
         if virtual_ready:
             graph_paths = {
                 graph: self.directory / shard["file"]
                 for shard in self.schedule["shards"]
                 for graph in shard["graphs"]
             }
-            virtual_weights = Ref2VASourceWeights(self.directory, runner, graph_paths)
+            virtual_kwargs = (
+                {"topology_paths": self._lora_adapter.topology_paths}
+                if self._lora_adapter is not None
+                else {}
+            )
+            virtual_weights = Ref2VASourceWeights(
+                self.directory,
+                runner,
+                graph_paths,
+                **virtual_kwargs,
+            )
             self._persistent_weights = virtual_weights
             self._ram_cache_prime = virtual_weights.prime_ram_cache()
-        elif self._turbo_adapter is not None or (
+        elif self._lora_adapter is not None or (
             getattr(runner, "provider", "CPUExecutionProvider") == "CUDAExecutionProvider"
             and os.environ.get("H3_PERSISTENT_WEIGHTS", "1") != "0"
         ):
@@ -151,8 +165,8 @@ class ScheduleMainRuntime:
                 prefetch_depth=prefetch_depth,
                 prefetch_workers=prefetch_workers,
                 topology_paths=(
-                    self._turbo_adapter.topology_paths
-                    if self._turbo_adapter is not None
+                    self._lora_adapter.topology_paths
+                    if self._lora_adapter is not None
                     else None
                 ),
             )
@@ -171,9 +185,9 @@ class ScheduleMainRuntime:
                         "ram_cache_scheduled": 0,
                     }
                 )
-            elif self._turbo_adapter is not None:
+            elif self._lora_adapter is not None:
                 persistent.close()
-                raise RuntimeError("Turbo LoRA adapter has no usable persistent topologies")
+                raise RuntimeError("Acceleration LoRA adapter has no usable persistent topologies")
         if not hasattr(self, "_ram_cache_prime"):
             self._ram_cache_prime = {
                 "ram_cache_enabled": False,
@@ -307,7 +321,9 @@ class ScheduleMainRuntime:
             shards=len(self.shards),
         )
         started = time.perf_counter()
-        session = self.runner.session(self.directory / shard["file"])
+        session_paths = getattr(self._lora_adapter, "session_paths", {})
+        path = session_paths.get(shard_id, self.directory / shard["file"])
+        session = self.runner.session(path)
         elapsed = time.perf_counter() - started
         self._metrics["session_builds"] += 1
         self._metrics["session_build_seconds"] += elapsed
@@ -333,8 +349,8 @@ class ScheduleMainRuntime:
         if self._ort_streamed_attention is not None:
             self._ort_streamed_attention.close()
         self._ort_streamed_attention = None
-        adapter = self._turbo_adapter
-        self._turbo_adapter = None
+        adapter = self._lora_adapter
+        self._lora_adapter = None
         if adapter is not None:
             adapter.close()
 
@@ -396,10 +412,10 @@ class ScheduleMainRuntime:
             "attention_chunk_last_free_bytes": self._attention_chunk_free_bytes,
             **(
                 {
-                    "turbo_adapter_active": True,
-                    "turbo_adapter": self._turbo_adapter.metrics(),
+                    "lora_adapter_active": True,
+                    "lora_adapter": self._lora_adapter.metrics(),
                 }
-                if self._turbo_adapter is not None
+                if self._lora_adapter is not None
                 else {}
             ),
         }
@@ -652,13 +668,17 @@ class ScheduleMainRuntime:
             for port, binding in step["inputs"].items()
         }
         adapter_feeds = (
-            self._turbo_adapter.graph_feeds(step["graph"])
-            if self._turbo_adapter is not None
+            self._lora_adapter.graph_feeds(step["graph"])
+            if self._lora_adapter is not None
             else {}
         )
-        if adapter_feeds and persistent is None:
+        embedded_weights = bool(
+            self._lora_adapter is not None
+            and getattr(self._lora_adapter, "uses_embedded_weights", lambda _graph: False)(step["graph"])
+        )
+        if adapter_feeds and persistent is None and not embedded_weights:
             raise RuntimeError(
-                f"Turbo LoRA graph {step['graph']} has no persistent topology"
+                f"Acceleration LoRA graph {step['graph']} has no persistent topology"
             )
         if step["graph"] == self._capture_graph:
             if self._capture_graph_path is None:
@@ -679,7 +699,7 @@ class ScheduleMainRuntime:
         collisions = feed_names.intersection(adapter_feeds)
         if collisions:
             raise RuntimeError(
-                f"Turbo LoRA feed collision in {step['graph']}: {sorted(collisions)}"
+                f"Acceleration LoRA feed collision in {step['graph']}: {sorted(collisions)}"
             )
         feeds: dict[str, Any] = {**selected, **persistent_feeds, **adapter_feeds}
         shard_graphs = self.shards[step["shard"]]["graphs"]
@@ -693,15 +713,14 @@ class ScheduleMainRuntime:
             elif argument.name in constants and "silu_timestep_embedding" in argument.name:
                 feeds[argument.name] = constants[argument.name]
             elif (
-                self._turbo_adapter is not None
+                self._lora_adapter is not None
                 and argument.name not in feeds
                 and (
-                    argument.name.startswith(("lora_", "turbo_lora_"))
-                    or "silu_timestep_embedding" in argument.name
+                    argument.name.startswith("lora_")
                 )
             ):
                 raise RuntimeError(
-                    f"Turbo LoRA graph {step['graph']} is missing feed {argument.name!r}"
+                    f"Acceleration LoRA graph {step['graph']} is missing feed {argument.name!r}"
                 )
             elif argument.name not in feeds:
                 feeds[argument.name] = self._placeholder(argument, context)
@@ -877,18 +896,6 @@ class ScheduleMainRuntime:
                     "modulation_ids": modulation,
                     "sigma_audio": np.asarray(sigma_audio, dtype=np.float32),
                 }
-            if self._turbo_adapter is not None:
-                silu_timestep_embedding = np.ascontiguousarray(
-                    self._turbo_adapter.silu_timestep_embeddings(times),
-                    dtype=np.float32,
-                )
-                expected_shape = (int(times.shape[0]), 2688)
-                if silu_timestep_embedding.shape != expected_shape:
-                    raise RuntimeError(
-                        "Turbo LoRA SiLU timestep embedding shape mismatch: "
-                        f"{silu_timestep_embedding.shape} != {expected_shape}"
-                    )
-                constants["silu_timestep_embedding"] = silu_timestep_embedding
         elif op == "concat_hidden":
             ref2va_layout = external.get("ref2va_layout")
             if ref2va_layout is None:
@@ -966,24 +973,29 @@ class ScheduleMainRuntime:
                 "video_timestep_embedding": values["timestep_embedding"][video_index : video_index + 1],
                 "audio_timestep_embedding": values["timestep_embedding"][audio_index : audio_index + 1],
             }
-            if op.endswith("turbo") or self._turbo_adapter is not None:
+            if op.endswith("_turbo"):
                 silu_timestep_embedding = values.get(
                     "silu_timestep_embedding",
                     constants.get("silu_timestep_embedding"),
                 )
                 if silu_timestep_embedding is None:
-                    raise RuntimeError("Turbo head selection requires SiLU timestep embeddings")
-                silu_outputs = {
-                    "video_silu_timestep_embedding": silu_timestep_embedding[
-                        video_index : video_index + 1
-                    ],
-                    "audio_silu_timestep_embedding": silu_timestep_embedding[
-                        audio_index : audio_index + 1
-                    ],
-                }
-                constants.update(silu_outputs)
-                if op.endswith("turbo"):
-                    outputs.update(silu_outputs)
+                    raise RuntimeError("Accelerated head selection requires SiLU timestep embeddings")
+                constants.update(
+                    {
+                        "video_silu_timestep_embedding": silu_timestep_embedding[
+                            video_index : video_index + 1
+                        ],
+                        "audio_silu_timestep_embedding": silu_timestep_embedding[
+                            audio_index : audio_index + 1
+                        ],
+                    }
+                )
+                outputs.update(
+                    {
+                        "video_silu_timestep_embedding": constants["video_silu_timestep_embedding"],
+                        "audio_silu_timestep_embedding": constants["audio_silu_timestep_embedding"],
+                    }
+                )
         elif op == "unpack_velocity":
             from h3_workbench.inference_runtime import unpack_audio, unpatchify_video
 

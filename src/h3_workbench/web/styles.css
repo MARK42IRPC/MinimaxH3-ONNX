@@ -2124,6 +2124,15 @@ input:disabled {
   line-height: 1.5;
 }
 
+.inspector-live {
+  margin-top: 8px;
+}
+
+.inspector-live .live-indicator {
+  justify-content: flex-start;
+  font: 9px Consolas, "Microsoft YaHei", monospace;
+}
+
 .inspector-progress {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

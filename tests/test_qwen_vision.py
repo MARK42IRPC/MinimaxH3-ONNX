@@ -36,6 +36,41 @@ def test_qwen_vision_model_uses_memory_efficient_sdpa(
     encoder.close()
 
 
+def test_qwen_vision_model_reports_loading_lifecycle(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from transformers.models.qwen3_vl import modeling_qwen3_vl
+
+    checkpoint = tmp_path / "qwen-vision.safetensors"
+    checkpoint.write_bytes(b"test checkpoint")
+    events: list[dict[str, object]] = []
+
+    class FakeVisionModel(torch.nn.Module):
+        def __init__(self, config) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(modeling_qwen3_vl, "Qwen3VLVisionModel", FakeVisionModel)
+    encoder = Qwen3VLVisionEncoder(
+        checkpoint,
+        prefer_cuda=False,
+        config=qwen_vision_config(),
+        loader=lambda model, path, device, dtype: None,
+        activity_callback=events.append,
+    )
+
+    encoder._load_model()
+
+    assert [event["operation"] for event in events] == [
+        "Preparing visual tower",
+        "Loading visual tower weights",
+        "Visual tower weights loaded",
+        "Visual tower ready",
+    ]
+    assert events[-1]["stage_progress"] == 1.0
+    encoder.close()
+
+
 def test_qwen_mrope_keeps_video_temporal_blocks_separate() -> None:
     token_ids = np.asarray(
         [10, 101, 101, 101, 101, 11, 102, 102, 12, 102, 102, 13],
